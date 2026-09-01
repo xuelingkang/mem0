@@ -120,21 +120,19 @@ DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-emb
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
-        "provider": "pgvector",
+        "provider": "qdrant",
         "config": {
-            "host": POSTGRES_HOST,
-            "port": int(POSTGRES_PORT),
-            "dbname": POSTGRES_DB,
-            "user": POSTGRES_USER,
-            "password": POSTGRES_PASSWORD,
-            "collection_name": POSTGRES_COLLECTION_NAME,
+            "host": os.environ.get("QDRANT_HOST", "qdrant"),
+            "port": int(os.environ.get("QDRANT_PORT", "6333")),
+            "collection_name": os.environ.get("QDRANT_COLLECTION_NAME", "memories"),
+            "embedding_model_dims": int(os.environ.get("QDRANT_EMBEDDING_DIMS", "2048")),
         },
     },
     "llm": {
         "provider": "openai",
         "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
     },
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}},
+    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": 4096}},
     "history_db_path": HISTORY_DB_PATH,
 }
 
@@ -404,7 +402,14 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
 
 def _list_all_memories(limit: int = ALL_MEMORIES_LIMIT) -> Dict[str, Any]:
     results = get_memory_instance().vector_store.list(top_k=limit)
-    rows = results[0] if results and isinstance(results, list) and isinstance(results[0], list) else results or []
+    rows = results[0] if results and isinstance(results, (list, tuple)) and isinstance(results[0], list) else results or []
+    rows = list(rows)
+    # Admin all-memory listing (dashboard browsing) is presentation-oriented: sort newest-first.
+    # The vector-search path (/search) is untouched, so retrieval semantics stay similarity-based.
+    rows.sort(
+        key=lambda r: (getattr(r, "payload", None) or {}).get("created_at") or "",
+        reverse=True,
+    )
     return {"results": [_serialize_memory(row) for row in rows]}
 
 
