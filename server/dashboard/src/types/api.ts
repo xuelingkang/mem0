@@ -5,6 +5,7 @@ export interface Memory {
   agent_id?: string;
   created_at?: string;
   updated_at?: string;
+  score?: number;
 }
 
 export interface ApiKey {

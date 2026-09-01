@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Trash2, Search } from "lucide-react";
 import { format } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -18,42 +18,114 @@ import {
   SheetTitle,
   SheetDescription,
 } from "@/components/ui/sheet";
-import { UpgradeBanner } from "@/components/self-hosted/upgrade-banner";
 import { toast } from "@/components/ui/use-toast";
 import { getErrorMessage } from "@/lib/error-message";
 import { api } from "@/utils/api";
 import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
-import { useApiQuery } from "@/hooks/use-api-query";
 import { Memory } from "@/types/api";
 
-const PAGE_SIZE = 20;
-// Keep in sync with ALL_MEMORIES_LIMIT in server/main.py.
-const MEMORY_FETCH_LIMIT = 1000;
+// Page size for cursor pagination. The backend returns { results, next_cursor } —
+// we keep a page buffer and append further pages as the user navigates.
+const PAGE_SIZE = 10;
+const CURSOR_FETCH_LIMIT = 10;
 
 export default function MemoriesPage() {
-  const [userId, setUserId] = useState("");
+  const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] = useState(false);
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [memoryToDelete, setMemoryToDelete] = useState<Memory | null>(null);
+  // Cursor pagination state: keep all fetched rows so the table can page both ways
+  // without re-fetching older data (server-side keyset cursor only moves forward).
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [totalCount, setTotalCount] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [page, setPage] = useState(0);
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
 
-  const {
-    data: memories = [],
-    isLoading,
-    refetch,
-  } = useApiQuery<Memory[]>(
-    async () => {
-      const params = userId.trim()
-        ? { user_id: userId.trim(), top_k: MEMORY_FETCH_LIMIT }
-        : { top_k: MEMORY_FETCH_LIMIT };
-      const res = await api.get(MEMORY_ENDPOINTS.BASE, { params });
-      const raw = res.data?.results ?? res.data ?? [];
-      return Array.isArray(raw) ? raw : [];
-    },
-    { errorToast: "Failed to load memories", initialData: [] },
-  );
+  // Browse mode: cursor-paginated GET /memories (newest first).
+  const fetchBrowsePage = async (cursor: string | null) => {
+    const params: Record<string, string | number> = {
+      top_k: CURSOR_FETCH_LIMIT,
+    };
+    if (cursor) params.cursor = cursor;
+    const res = await api.get(MEMORY_ENDPOINTS.BASE, { params });
+    const raw = res.data?.results ?? res.data ?? [];
+    const rows: Memory[] = Array.isArray(raw) ? raw : [];
+    setNextCursor(res.data?.next_cursor ?? null);
+    setHasMore(res.data?.has_more === true || !!res.data?.next_cursor);
+    if (typeof res.data?.total === "number") setTotalCount(res.data.total);
+    return rows;
+  };
 
-  const totalPages = Math.ceil(memories.length / PAGE_SIZE);
+  // Search mode: semantic (vector) recall via POST /search over the whole collection.
+  const fetchSearchPage = async (q: string) => {
+    const res = await api.post(MEMORY_ENDPOINTS.SEARCH, {
+      query: q,
+      top_k: 50,
+      filters: { user_id: "*" },
+    });
+    const raw = res.data?.results ?? res.data ?? [];
+    return (Array.isArray(raw) ? raw : []) as Memory[];
+  };
+
+  const loadInitial = async () => {
+    setIsLoading(true);
+    try {
+      const q = query.trim();
+      const isSearch = q.length > 0;
+      setSearchMode(isSearch);
+      if (isSearch) {
+        setMemories(await fetchSearchPage(q));
+        setTotalCount(null);
+        // Search results are a one-shot ranked list — no server-side pagination.
+        setNextCursor(null);
+        setHasMore(false);
+      } else {
+        setMemories(await fetchBrowsePage(null));
+      }
+      setPage(0);
+    } catch (error) {
+      toast({
+        title: "Failed to load memories",
+        description: getErrorMessage(error),
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const loadMore = async () => {
+    if (searchMode || !nextCursor || isLoadingMore) return;
+    setIsLoadingMore(true);
+    try {
+      const more = await fetchBrowsePage(nextCursor);
+      setMemories((prev: Memory[]) => [...prev, ...more]);
+    } catch (error) {
+      toast({
+        title: "Failed to load more memories",
+        description: getErrorMessage(error),
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // Load first page on mount.
+  useEffect(() => {
+    void loadInitial();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") void loadInitial();
+  };
+
+  const totalPages = Math.max(1, Math.ceil(memories.length / PAGE_SIZE));
   const paginatedMemories = memories.slice(
     page * PAGE_SIZE,
     (page + 1) * PAGE_SIZE,
@@ -66,7 +138,7 @@ export default function MemoriesPage() {
       toast({ title: "Memory deleted", variant: "success" });
       if (selectedMemory?.id === memoryToDelete.id) setSelectedMemory(null);
       setMemoryToDelete(null);
-      void refetch();
+      void loadInitial();
     } catch (error) {
       toast({
         title: "Failed to delete memory",
@@ -85,6 +157,17 @@ export default function MemoriesPage() {
         <span className="line-clamp-2 text-sm">{value}</span>
       ),
     },
+    ...(searchMode
+      ? [
+          {
+            key: "score" as keyof Memory,
+            label: "Score",
+            width: 80,
+            render: (value: number | undefined) =>
+              typeof value === "number" ? value.toFixed(3) : "--",
+          },
+        ]
+      : []),
     { key: "user_id" as keyof Memory, label: "User", width: 100 },
     { key: "agent_id" as keyof Memory, label: "Agent", width: 100 },
     {
@@ -100,42 +183,47 @@ export default function MemoriesPage() {
     <div className="space-y-4">
       <h1 className="text-xl font-semibold font-fustat">Memories</h1>
 
-      {memories.length >= MEMORY_FETCH_LIMIT && (
-        <UpgradeBanner
-          id="memories-1k"
-          message="1,000+ memories stored. Categories can help organize them."
-          ctaLabel="Explore Cloud"
-          ctaUrl="https://app.mem0.ai?utm_source=oss&utm_medium=dashboard-memories"
-          variant="cloud"
-        />
-      )}
-
       <div className="flex gap-3">
         <Input
-          placeholder="Filter by User ID (optional)"
-          value={userId}
-          onChange={(e) => setUserId(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              setPage(0);
-              refetch();
-            }
-          }}
-          className="w-64"
+          placeholder="Search memories (semantic)…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={handleSearchKeyDown}
+          className="w-96"
         />
+        <Button variant="outline" size="sm" onClick={loadInitial}>
+          <Search className="size-3.5 mr-1" />
+          {searchMode ? "Re-search" : "Search"}
+        </Button>
+        {searchMode && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setQuery("");
+              void loadInitial();
+            }}
+          >
+            Clear
+          </Button>
+        )}
       </div>
 
       {isLoading ? (
         <TableSkeleton rows={5} columns={4} />
       ) : memories.length === 0 ? (
         <EmptyState
-          title="No memories yet"
-          description="Create your first memory by sending a POST /memories request."
+          title={searchMode ? "No matches" : "No memories yet"}
+          description={
+            searchMode
+              ? "No memories matched your search query."
+              : "Create your first memory by sending a POST /memories request."
+          }
         >
           <pre className="text-xs text-left bg-surface-default-secondary p-3 rounded font-mono overflow-x-auto mt-3 max-w-lg">
-            {`curl -X POST ${apiUrl}/memories \\
-  -H "X-API-Key: <your-key>" \\
-  -H "Content-Type: application/json" \\
+            {`curl -X POST ${apiUrl}/memories \\\\
+  -H "X-API-Key: *** \\\\
+  -H "Content-Type: application/json" \\\\
   -d '{"messages": [{"role": "user", "content": "I like hiking"}], "user_id": "alice"}'`}
           </pre>
           <a
@@ -162,12 +250,15 @@ export default function MemoriesPage() {
               }
             />
           </Card>
-          {totalPages > 1 && (
+          {!searchMode && (
             <div className="flex items-center justify-between text-sm text-onSurface-default-tertiary">
               <span>
-                {page * PAGE_SIZE + 1}–
-                {Math.min((page + 1) * PAGE_SIZE, memories.length)} of{" "}
-                {memories.length}
+                {memories.length === 0
+                  ? "0 memories"
+                  : `${page * PAGE_SIZE + 1}–${Math.min(
+                      (page + 1) * PAGE_SIZE,
+                      memories.length,
+                    )} of ${totalCount ?? `${memories.length}+`}`}
               </span>
               <div className="flex gap-2">
                 <Button
@@ -181,10 +272,17 @@ export default function MemoriesPage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={page >= totalPages - 1}
-                  onClick={() => setPage((p) => p + 1)}
+                  disabled={page >= totalPages - 1 && !nextCursor}
+                  onClick={() => {
+                    if (page < totalPages - 1) {
+                      setPage((p) => p + 1);
+                    } else if (nextCursor && !isLoadingMore) {
+                      void loadMore();
+                      setPage((p) => p + 1);
+                    }
+                  }}
                 >
-                  Next
+                  {isLoadingMore ? "Loading…" : "Next"}
                 </Button>
               </div>
             </div>
