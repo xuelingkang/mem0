@@ -400,17 +400,34 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
     }
 
 
-def _list_all_memories(limit: int = ALL_MEMORIES_LIMIT) -> Dict[str, Any]:
-    results = get_memory_instance().vector_store.list(top_k=limit)
+def _list_all_memories(limit: int = ALL_MEMORIES_LIMIT, cursor: Optional[str] = None) -> Dict[str, Any]:
+    results = get_memory_instance().vector_store.list(top_k=limit, cursor=cursor)
     rows = results[0] if results and isinstance(results, (list, tuple)) and isinstance(results[0], list) else results or []
     rows = list(rows)
     # Admin all-memory listing (dashboard browsing) is presentation-oriented: sort newest-first.
     # The vector-search path (/search) is untouched, so retrieval semantics stay similarity-based.
+    # Qdrant now returns them newest-first via order_by; sort defensively (stable, cheap).
     rows.sort(
         key=lambda r: (getattr(r, "payload", None) or {}).get("created_at") or "",
         reverse=True,
     )
-    return {"results": [_serialize_memory(row) for row in rows]}
+    next_cursor = None
+    if rows:
+        last = (getattr(rows[-1], "payload", None) or {}).get("created_at")
+        if last:
+            next_cursor = str(last)
+    # Exact total across the collection (admin all-memory listing is unfiltered).
+    total = None
+    try:
+        vs = get_memory_instance().vector_store
+        total = vs.client.count(collection_name=vs.collection_name, exact=True).count
+    except Exception:
+        pass
+    return {
+        "results": [_serialize_memory(row) for row in rows],
+        "next_cursor": next_cursor,
+        "total": total,
+    }
 
 
 @app.get("/memories", summary="Get memories")
@@ -420,17 +437,22 @@ def get_all_memories(
     run_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
+    cursor: Optional[str] = Query(None),
     show_expired: bool = Query(False),
     _auth=Depends(verify_auth),
 ):
-    """Retrieve stored memories. Lists all memories when no identifier is provided (admin only)."""
+    """Retrieve stored memories. Lists all memories when no identifier is provided (admin only).
+
+    Pagination (admin listing): pass `top_k` (default 1000) plus `cursor` (opaque value
+    from the previous response's `next_cursor`) to walk the full history page by page.
+    """
     try:
         if not any([user_id, run_id, agent_id]):
             auth_type = getattr(request.state, "auth_type", "none")
             if _auth is not None and _auth.role != "admin" and auth_type not in {"admin_api_key", "disabled"}:
                 raise HTTPException(status_code=403, detail="Admin role required to list all memories.")
             # Admin all-memory listing is intentionally raw; scoped get_all below applies expiry visibility.
-            return _list_all_memories(limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT)
+            return _list_all_memories(limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT, cursor=cursor)
         filters = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
         }

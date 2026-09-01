@@ -135,6 +135,14 @@ _SENSITIVE_SUFFIXES = (
 ENTITY_PARAMS = frozenset({"user_id", "agent_id", "run_id"})
 DELETE_ALL_BATCH_SIZE = 1000
 
+# UPDATE/DELETE in the additive extraction pipeline only apply to candidates whose
+# semantic similarity to the new conversation is at least this high. Measured from
+# real evolution pairs: genuine old->new evolutions sit at 0.88+ (cluster-level
+# complementary facts cluster at 0.4-0.85); a conversation-vs-memory score is
+# inherently lower than memory-vs-memory, so 0.8 keeps margin while staying
+# conservative against merging complementary facts.
+UPDATE_MIN_SCORE = 0.8
+
 # Tenant-scoping fields that caller-supplied metadata must never set, on either the
 # creation or the update path (issues #4490, #6277, #6655).
 _IDENTITY_KEYS = ENTITY_PARAMS | {"actor_id"}
@@ -926,16 +934,22 @@ class Memory(MemoryBase):
         existing_results = self.vector_store.search(
             query=parsed_messages,
             vectors=query_embedding,
-            top_k=10,
+            top_k=20,
             filters=search_filters,
         )
 
-        # Map UUIDs to integers (anti-hallucination)
+        # Candidate map for UPDATE/DELETE validation: real memory id -> score/text.
+        # Only candidates that were actually retrieved (same user scope) can be
+        # touched, and only if their similarity clears UPDATE_MIN_SCORE.
         existing_memories = []
-        uuid_mapping = {}
-        for idx, mem in enumerate(existing_results):
-            uuid_mapping[str(idx)] = mem.id
-            existing_memories.append({"id": str(idx), "text": mem.payload.get("data", "")})
+        candidate_scores = {}
+        for mem in existing_results:
+            mid = mem.id
+            score = float(getattr(mem, "score", 0.0) or 0.0)
+            candidate_scores[mid] = score
+            existing_memories.append(
+                {"id": mid, "text": mem.payload.get("data", ""), "score": round(score, 4)}
+            )
 
         # Phase 2: LLM extraction (single call)
         is_agent_scoped = bool(filters.get("agent_id")) and not filters.get("user_id")
@@ -1010,9 +1024,52 @@ class Memory(MemoryBase):
             if h:
                 existing_hashes.add(h)
 
+        # Resolve UPDATE/DELETE events against the real candidate set.
+        # An operation is only applied when:
+        #   - the referenced id is a genuine retrieved candidate (same user scope), AND
+        #   - its similarity clears UPDATE_MIN_SCORE (same fact's evolution, not a
+        #     complementary fact), AND
+        #   - the target memory still exists (skip if deleted earlier in this batch).
+        events = []  # (event, memory_id, text_or_None)
+        processed_upserts = set()  # ids already updated/deleted this batch
+        for mem in extracted_memories:
+            evt = mem.get("event") or "ADD"
+            if evt not in ("ADD", "UPDATE", "DELETE"):
+                logger.warning(f"Unknown extraction event {evt!r}, treating as ADD")
+                evt = "ADD"
+            if evt == "ADD":
+                continue
+            target = mem.get("update_memory_id") or mem.get("delete_memory_id")
+            if not target or target not in candidate_scores:
+                logger.debug(
+                    f"Rejecting {evt} on id {target!r}: not a retrieved candidate (anti-hallucination)"
+                )
+                continue
+            if candidate_scores[target] < UPDATE_MIN_SCORE:
+                logger.debug(
+                    f"Rejecting {evt} on {target}: score {candidate_scores[target]:.3f} < {UPDATE_MIN_SCORE}"
+                )
+                continue
+            if target in processed_upserts:
+                logger.debug(f"Rejecting duplicate {evt} on already-touched {target}")
+                continue
+            processed_upserts.add(target)
+            if evt == "DELETE":
+                events.append(("DELETE", target, None))
+            else:
+                text = mem.get("text")
+                if not text:
+                    logger.debug(f"Rejecting UPDATE on {target}: no new text")
+                    continue
+                events.append(("UPDATE", target, text))
+
         records = []  # (memory_id, text, embedding, payload)
         seen_hashes = set()  # dedup within the current batch
         for mem in extracted_memories:
+            evt = mem.get("event") or "ADD"
+            if evt != "ADD":
+                # Non-ADD events are handled above; never create new records for them.
+                continue
             text = mem.get("text")
             if not text or text not in embed_map:
                 continue
@@ -1037,6 +1094,18 @@ class Memory(MemoryBase):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
+
+        # Apply UPDATE/DELETE events (independent of new ADD records). These are
+        # guarded upstream by candidate-existence + UPDATE_MIN_SCORE checks, so a
+        # touch here always targets a genuine, sufficiently-similar memory.
+        for evt, mid, text in events:
+            try:
+                if evt == "UPDATE":
+                    self._update_memory(mid, text, embed_map)
+                else:
+                    self._delete_memory(mid)
+            except Exception as e:
+                logger.error(f"Failed to apply {evt} on {mid}: {e}")
 
         if not records:
             self.db.save_messages(messages, session_scope)

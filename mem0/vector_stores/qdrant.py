@@ -570,24 +570,50 @@ class Qdrant(VectorStoreBase):
         """
         return self.client.get_collection(collection_name=self.collection_name)
 
-    def list(self, filters: dict = None, top_k: int = 100) -> list:
+    def list(
+        self,
+        filters: dict = None,
+        top_k: int = 100,
+        cursor: str = None,
+    ) -> list:
         """
-        List all vectors in a collection.
+        List all vectors in a collection, newest-first (keyset pagination).
 
         Args:
             filters (dict, optional): Filters to apply to the list. Defaults to None.
             top_k (int, optional): Number of vectors to return. Defaults to 100.
+            cursor (str, optional): Opaque keyset cursor from a previous call
+                ("<created_at>|<id>"). Resumes listing right after the anchor point,
+                so pages never overlap and never skip rows inserted meanwhile.
 
         Returns:
             list: List of vectors.
         """
         query_filter = self._create_filter(filters) if filters else None
+        # Keyset pagination over created_at (descending). created_at is microsecond-
+        # precise and generated per-record (datetime.now per insert), so exact ties
+        # don't occur in practice; the strict lt below is a clean resume point.
+        if cursor:
+            anchor_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="created_at",
+                        range=models.DatetimeRange(lt=cursor),
+                    ),
+                ],
+            )
+            query_filter = (
+                models.Filter(must=[query_filter, anchor_filter])
+                if query_filter is not None
+                else anchor_filter
+            )
         result = self.client.scroll(
             collection_name=self.collection_name,
             scroll_filter=query_filter,
             limit=top_k,
             with_payload=True,
             with_vectors=False,
+            order_by=models.OrderBy(key="created_at", direction=models.Direction.DESC),
         )
         return result
 
