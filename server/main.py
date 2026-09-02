@@ -113,9 +113,17 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
 POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
 DEFAULT_LLM_MODEL = os.environ.get("MEM0_DEFAULT_LLM_MODEL", "gpt-5-mini")
 DEFAULT_EMBEDDER_MODEL = os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL", "text-embedding-3-small")
+
+# LLM 与 embedder 可分别对接不同 provider（各自独立 key/base_url）。
+# 未单独设置时回落到 OPENAI_*，保持旧行为。
+LLM_API_KEY = os.environ.get("LLM_API_KEY", OPENAI_API_KEY)
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", OPENAI_BASE_URL)
+EMBEDDER_API_KEY = os.environ.get("EMBEDDER_API_KEY", OPENAI_API_KEY)
+EMBEDDER_BASE_URL = os.environ.get("EMBEDDER_BASE_URL", OPENAI_BASE_URL)
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -130,9 +138,9 @@ DEFAULT_CONFIG = {
     },
     "llm": {
         "provider": "openai",
-        "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
+        "config": {"api_key": LLM_API_KEY, "openai_base_url": LLM_BASE_URL, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
     },
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": 4096}},
+    "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": int(os.environ.get("EMBEDDER_EMBEDDING_DIMS", "4096"))}},
     "history_db_path": HISTORY_DB_PATH,
 }
 
