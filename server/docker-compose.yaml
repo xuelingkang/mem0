@@ -15,15 +15,16 @@ services:
     volumes:
       - mem0_history:/app/history
       - .:/app
+      - ../mem0:/opt/mem0-src
     depends_on:
       postgres:
         condition: service_healthy
     command: >
-      sh -c "rm -rf /app/packages && pip install -q --force-reinstall --no-deps mem0ai && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "rm -rf /usr/local/lib/python3.12/site-packages/mem0 && cp -r /opt/mem0-src /usr/local/lib/python3.12/site-packages/mem0 && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
-      - PYTHONPATH=
+      - PYTHONPATH=/app
       - DASHBOARD_URL=http://localhost:3000
       - APP_DB_NAME=mem0_app
       - JWT_SECRET=${JWT_SECRET}
