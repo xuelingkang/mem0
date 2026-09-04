@@ -20,7 +20,7 @@ services:
       postgres:
         condition: service_healthy
     command: >
-      sh -c "rm -rf /usr/local/lib/python3.12/site-packages/mem0 && cp -r /opt/mem0-src /usr/local/lib/python3.12/site-packages/mem0 && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "rm -rf /usr/local/lib/python3.12/site-packages/mem0 && cp -r /opt/mem0-src /usr/local/lib/python3.12/site-packages/mem0 && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"
     environment:
       - PYTHONDONTWRITEBYTECODE=1
       - PYTHONUNBUFFERED=1
