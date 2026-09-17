@@ -34,11 +34,14 @@ from mem0.exceptions import LLMError
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from mem0.memory.base import MemoryBase
 from mem0.memory.graph_sync import (
+    GRAPH_STATUS_DISABLED,
+    GRAPH_STATUS_ERROR,
+    GRAPH_STATUS_SKIPPED,
     GraphBridgeClient,
     GraphSync,
     compute_graph_boosts,
     derive_group_id,
-    search_graph_facts,
+    search_graph_facts_with_status,
 )
 from mem0.memory.notices import (
     PERFORMANCE_SLOW_QUERY_THRESHOLD_SECONDS,
@@ -1060,16 +1063,18 @@ def _graph_hits(
     """取回一次图检索并按候选池折算加分（设计 §6.1–6.2）。
 
     Returns:
-        `(graph_boosts, graph_facts)`，或 `(None, None)` 表示图能力关闭——调用方把 None
-        原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致。
+        `(graph_boosts, graph_facts, status)`。`graph_boosts` 为 None 表示图能力关闭——
+        调用方把 None 原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致；
+        否则为本次的加分映射（可能为空），`status` 为本次图分支的状态（`GRAPH_STATUS_*`，
+        由调用方随检索结果发布）。
     """
     config = _graph_config_of(memory)
     if config is None or not config.enabled:
-        return None, None
+        return None, None, GRAPH_STATUS_DISABLED
     group_id = derive_group_id(filters)
     if not group_id or not candidates:
-        return {}, {}
-    facts = search_graph_facts(
+        return {}, {}, GRAPH_STATUS_SKIPPED
+    facts, status = search_graph_facts_with_status(
         _graph_client(memory),
         group_id,
         query,
@@ -1077,21 +1082,27 @@ def _graph_hits(
         config.timeout_seconds,
     )
     candidate_ids = [str(candidate["id"]) for candidate in candidates if candidate.get("id") is not None]
-    return compute_graph_boosts(
+    boosts, fact_counts = compute_graph_boosts(
         facts,
         candidate_ids,
         config.weight,
         config.include_invalidated,
     )
+    return boosts, fact_counts, status
 
 
 def _compute_graph_hits(memory, query: str, candidates: List[Dict[str, Any]], filters) -> tuple:
-    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。"""
+    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。
+
+    Returns:
+        `(graph_boosts, graph_facts, status)`；本层任何异常都降级为「本次无图信号」并把
+        状态标为 `GRAPH_STATUS_ERROR`（图侧异常不得外溢到主检索）。
+    """
     try:
         return _graph_hits(memory, query, candidates, filters)
     except Exception as exc:  # noqa: BLE001 - 图侧异常不得外溢到主检索
         logger.warning(f"Graph boost computation failed: {exc}")
-        return {}, {}
+        return {}, {}, GRAPH_STATUS_ERROR
 
 
 setup_config()
@@ -2445,7 +2456,7 @@ class Memory(MemoryBase):
         # Step 8: Score and rank
         # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
         # 图分支与 BM25 / 实体加分的取数并列：超时或异常一律按「本次无图信号」处理。
-        graph_boosts, graph_facts = _compute_graph_hits(self, query, candidates, filters)
+        graph_boosts, graph_facts, graph_status = _compute_graph_hits(self, query, candidates, filters)
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -2492,6 +2503,11 @@ class Memory(MemoryBase):
                 memory_item_dict["metadata"].update(additional_metadata)
             if explain and "score_details" in scored:
                 memory_item_dict["score_details"] = scored["score_details"]
+
+            # 图分支的本次状态随结果条目发布（设计 §6.4、§8）：调用方据此区分「图确实没
+            # 贡献」（`ok` 但加分为 0）与「图没答上来」（`timeout` / `error`），并在关闭态
+            # 直接读到 `disabled`，不必靠键缺失去猜。
+            memory_item_dict["graph_status"] = graph_status
 
             original_memories.append(memory_item_dict)
 
@@ -4226,7 +4242,7 @@ class AsyncMemory(MemoryBase):
         # Step 8: Score and rank
         # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
         # 图分支走 to_thread（同步 HTTP + 硬超时），不阻塞事件循环（设计 §6.1）。
-        graph_boosts, graph_facts = await asyncio.to_thread(
+        graph_boosts, graph_facts, graph_status = await asyncio.to_thread(
             _compute_graph_hits, self, query, candidates, filters
         )
         scored_results = score_and_rank(
@@ -4274,6 +4290,11 @@ class AsyncMemory(MemoryBase):
                 memory_item_dict["metadata"].update(additional_metadata)
             if explain and "score_details" in scored:
                 memory_item_dict["score_details"] = scored["score_details"]
+
+            # 图分支的本次状态随结果条目发布（设计 §6.4、§8）：调用方据此区分「图确实没
+            # 贡献」（`ok` 但加分为 0）与「图没答上来」（`timeout` / `error`），并在关闭态
+            # 直接读到 `disabled`，不必靠键缺失去猜。
+            memory_item_dict["graph_status"] = graph_status
 
             original_memories.append(memory_item_dict)
 

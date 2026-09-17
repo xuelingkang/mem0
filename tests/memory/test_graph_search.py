@@ -11,6 +11,7 @@ Two concerns are covered here:
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from mem0.configs.base import GraphConfig, MemoryConfig
@@ -123,14 +124,18 @@ class TestGraphHitsWiring:
         return memory
 
     def test_disabled_returns_none(self):
-        boosts, facts = memory_main._compute_graph_hits(self._memory(enabled=False), "q", [{"id": "a"}], {"user_id": "u"})
+        boosts, facts, status = memory_main._compute_graph_hits(
+            self._memory(enabled=False), "q", [{"id": "a"}], {"user_id": "u"}
+        )
         assert boosts is None and facts is None
+        assert status == "disabled"
 
     def test_enabled_without_scope_returns_empty(self):
         memory = self._memory(enabled=True)
         memory._graph_bridge_client = MagicMock()
-        boosts, facts = memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {})
+        boosts, facts, status = memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {})
         assert boosts == {} and facts == {}
+        assert status == "skipped"
         memory._graph_bridge_client.search.assert_not_called()
 
     def test_enabled_maps_facts_to_boosts(self, monkeypatch):
@@ -138,11 +143,12 @@ class TestGraphHitsWiring:
         client = MagicMock()
         client.search.return_value = {"facts": [{"episodes": ["a"], "invalid_at": None}]}
         memory._graph_bridge_client = client
-        boosts, facts = memory_main._compute_graph_hits(
+        boosts, facts, status = memory_main._compute_graph_hits(
             memory, "q", [{"id": "a"}, {"id": "b"}], {"user_id": "test_graph_a"}
         )
         assert boosts == {"a": pytest.approx(0.5)}
         assert facts == {"a": 1}
+        assert status == "ok"
         payload, timeout = client.search.call_args[0]
         assert payload["group_ids"] == ["mem0_test_graph_a"]
         assert payload["query"] == "q"
@@ -152,7 +158,19 @@ class TestGraphHitsWiring:
         client = MagicMock()
         client.search.side_effect = RuntimeError("bridge down")
         memory._graph_bridge_client = client
-        assert memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {"user_id": "u"}) == ({}, {})
+        assert memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {"user_id": "u"}) == ({}, {}, "error")
+
+    def test_budget_timeout_is_reported_not_swallowed(self):
+        """[AC-3] 预算内超时必须作为显式状态出现，不得与「图答了但没命中」同形。"""
+        memory = self._memory(enabled=True, timeout_seconds=0.001)
+        client = MagicMock()
+        client.search.side_effect = httpx.ReadTimeout("budget exceeded")
+        memory._graph_bridge_client = client
+        boosts, facts, status = memory_main._compute_graph_hits(
+            memory, "q", [{"id": "a"}], {"user_id": "test_graph_a"}
+        )
+        assert (boosts, facts) == ({}, {})
+        assert status == "timeout"
 
     def test_dispatch_skipped_when_disabled(self):
         memory = self._memory(enabled=False)

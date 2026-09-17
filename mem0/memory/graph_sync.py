@@ -8,13 +8,19 @@
 | 作用域 → 图键 | `derive_group_id` | 纯函数，写入派发与检索查询共用同一来源 |
 | 事实入图 | `GraphSync.dispatch` / `GraphSync` 的串行 worker | 内存队列投递 O(1) 且不抛异常；失败重试、连续失败熔断 |
 | 图检索与折算 | `search_graph_facts` / `compute_graph_boosts` | 硬超时预算；纯函数折算，不依赖 LLM |
+| 图分支状态 | `search_graph_facts_with_status` 的状态值 | 超时 / 故障 / 未命中 / 关闭互不同形，随检索结果发布 |
 
 两条不变量：
 
-* **降级**：图桥不可用时写入与检索照常，图分支静默跳过——派发失败只记计数器，
-  图检索异常/超时一律按「本次无图信号」返回。
+* **降级**：图桥不可用时写入与检索照常，图分支按「本次无图信号」处理——派发失败只记
+  计数器，图检索异常/超时一律返回空事实。降级本身的可见面是状态值、计数器与日志：
+  调用方从响应里的 `graph_status` 就能区分「图确实没贡献」与「图没答上来」。
 * **写路径零阻塞**：`dispatch` 只做一次内存入队；HTTP 调用发生在独立线程的事件循环里，
   与 FastAPI 的请求线程池互不占用。
+
+图分支状态常量（`GRAPH_STATUS_*`）：`disabled`（能力关闭）、`skipped`（无作用域键或候选
+池为空，未发起调用）、`ok`（预算内返回，命中数可能为 0）、`timeout`（未在预算内返回）、
+`error`（预算内失败：连接失败 / 非 2xx / 畸形响应）。
 """
 
 from __future__ import annotations
@@ -45,6 +51,15 @@ _GROUP_ID_INVALID = re.compile(r"[^0-9A-Za-z_-]")
 
 # 图检索事实的排序权重：w(k) = 1 / (1 + 0.5 × (k − 1))，k 从 1 起。
 _RANK_DECAY_STEP = 0.5
+
+# 本次图分支的状态，随检索结果一起发布（设计 §6.4、§8）。此前「图桥没答上来」与
+# 「图桥答了但没命中」在响应上完全同形，「预算内超时」于调用方不可见、无法诊断；
+# 状态值把两者分开，并让「能力关闭」也成为一个显式取值。
+GRAPH_STATUS_DISABLED = "disabled"  # 能力关闭，未发起任何图调用
+GRAPH_STATUS_SKIPPED = "skipped"  # 能力开启，但本次无作用域键或候选池为空，未发起调用
+GRAPH_STATUS_OK = "ok"  # 图桥在预算内返回了结果（命中数可能为 0）
+GRAPH_STATUS_TIMEOUT = "timeout"  # 图桥未在预算内返回，本次按无图信号处理
+GRAPH_STATUS_ERROR = "error"  # 图桥在预算内失败（连接失败 / 非 2xx / 畸形响应）
 
 # 入队的最大尝试次数：队列被并发排空时的兜底上界，保证派发是 O(1) 且必然返回。
 _QUEUE_PUSH_ATTEMPTS = 8
@@ -175,6 +190,51 @@ class GraphBridgeClient:
         self._client.close()
 
 
+def search_graph_facts_with_status(
+    client: Any,
+    group_id: Optional[str],
+    query: str,
+    max_facts: int,
+    timeout_seconds: float,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """取回一次图检索的事实列表，并回报本次的状态（设计 §6.4、§8）。
+
+    降级语义不变：任何失败（含超时、畸形响应）都按「本次无图信号」返回空列表，本函数
+    **不抛异常**。区别在于状态可被调用方带走——「预算内超时」因此不再与「图桥答了但
+    没命中」同形，而是作为显式状态进入检索响应。
+
+    Args:
+        client: 图桥客户端（`GraphBridgeClient` 或测试替身）。
+        group_id: 作用域派生的图键；为空时不发起调用。
+        query: 检索文本；为空时不发起调用。
+        max_facts: 取用的事实条数上限。
+        timeout_seconds: 本次调用的硬超时预算。
+
+    Returns:
+        `(facts, status)`。`status` 取 `GRAPH_STATUS_OK` / `GRAPH_STATUS_TIMEOUT` /
+        `GRAPH_STATUS_ERROR` / `GRAPH_STATUS_SKIPPED`。
+    """
+    if not group_id or not query:
+        return [], GRAPH_STATUS_SKIPPED
+    try:
+        payload = client.search(
+            {"group_ids": [group_id], "query": query, "max_facts": max_facts},
+            timeout_seconds,
+        )
+    except httpx.TimeoutException as exc:
+        logger.debug("Graph search exceeded its %.3fs budget (status=timeout): %s", timeout_seconds, exc)
+        return [], GRAPH_STATUS_TIMEOUT
+    except Exception as exc:  # noqa: BLE001 - 图侧任何异常都不得外溢到主检索
+        logger.debug("Graph search skipped (bridge unavailable, status=error): %s", exc)
+        return [], GRAPH_STATUS_ERROR
+
+    facts = payload.get("facts") if isinstance(payload, dict) else None
+    if not isinstance(facts, list):
+        logger.debug("Graph search returned a malformed payload (status=error): %r", payload)
+        return [], GRAPH_STATUS_ERROR
+    return [fact for fact in facts if isinstance(fact, dict)], GRAPH_STATUS_OK
+
+
 def search_graph_facts(
     client: Any,
     group_id: Optional[str],
@@ -184,24 +244,11 @@ def search_graph_facts(
 ) -> List[Dict[str, Any]]:
     """取回一次图检索的事实列表；任何失败（含超时、畸形响应）都返回空列表。
 
-    检索缺图信号按「无信号」打分，因此本函数**不抛异常**：图侧故障的可见面是日志与
-    计数器，而不是响应内容或响应时延（设计 §6.4）。
+    本次状态见 `search_graph_facts_with_status`（本函数是它的薄封装，保留只需要事实
+    列表的调用形状）。
     """
-    if not group_id or not query:
-        return []
-    try:
-        payload = client.search(
-            {"group_ids": [group_id], "query": query, "max_facts": max_facts},
-            timeout_seconds,
-        )
-    except Exception as exc:  # noqa: BLE001 - 图侧任何异常都不得外溢到主检索
-        logger.debug("Graph search skipped (bridge unavailable): %s", exc)
-        return []
-
-    facts = payload.get("facts") if isinstance(payload, dict) else None
-    if not isinstance(facts, list):
-        return []
-    return [fact for fact in facts if isinstance(fact, dict)]
+    facts, _status = search_graph_facts_with_status(client, group_id, query, max_facts, timeout_seconds)
+    return facts
 
 
 class GraphSync:

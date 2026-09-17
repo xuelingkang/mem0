@@ -12,6 +12,7 @@ import queue as queue_module
 import time
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from mem0.configs.base import GraphConfig, MemoryConfig
@@ -21,6 +22,7 @@ from mem0.memory.graph_sync import (
     derive_group_id,
     sanitize_group_id,
     search_graph_facts,
+    search_graph_facts_with_status,
 )
 
 
@@ -50,6 +52,13 @@ class _CountingClient:
 
     def close(self):
         self.closed = True
+
+
+class _TimeoutClient:
+    """Stand-in that always exceeds the per-call budget."""
+
+    def search(self, _payload, _timeout_seconds):
+        raise httpx.ReadTimeout("budget exceeded")
 
 
 def _memory(**graph_overrides):
@@ -151,6 +160,30 @@ class TestSearchDegradation:
         client = _CountingClient()
         assert search_graph_facts(client, None, "q", 5, 0.4) == []
         assert search_graph_facts(client, "mem0_test_graph_a", "", 5, 0.4) == []
+        assert client.calls == []
+
+    def test_status_is_ok_when_the_bridge_answers(self):
+        """答了但没命中仍是 `ok`：与「没答上来」必须区分（设计 §8）。"""
+        facts, status = search_graph_facts_with_status(_CountingClient(), "mem0_test_graph_a", "q", 5, 0.4)
+        assert facts == [] and status == "ok"
+
+    def test_status_marks_a_budget_timeout(self):
+        """[AC-3] 预算内超时是显式状态，不再与「无命中」同形。"""
+        facts, status = search_graph_facts_with_status(_TimeoutClient(), "mem0_test_graph_a", "q", 5, 0.4)
+        assert facts == [] and status == "timeout"
+
+    def test_status_marks_a_bridge_failure_and_a_malformed_payload(self):
+        facts, status = search_graph_facts_with_status(_CountingClient(failures=1), "mem0_test_graph_a", "q", 5, 0.4)
+        assert facts == [] and status == "error"
+
+        client = SimpleNamespace(search=lambda payload, timeout: {"facts": "nope"})
+        facts, status = search_graph_facts_with_status(client, "mem0_test_graph_a", "q", 5, 0.4)
+        assert facts == [] and status == "error"
+
+    def test_status_marks_a_skipped_lookup(self):
+        client = _CountingClient()
+        facts, status = search_graph_facts_with_status(client, None, "q", 5, 0.4)
+        assert facts == [] and status == "skipped"
         assert client.calls == []
 
 
