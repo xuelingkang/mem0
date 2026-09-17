@@ -1406,17 +1406,17 @@ index 00000000..ef6b8c8b
 +points_count=3612  indexed_vectors_count=3606  vectors.size=2048  sparse=bm25(idf)  on_disk_payload=true
 diff --git a/docs/design/graph-memory.md b/docs/design/graph-memory.md
 new file mode 100644
-index 00000000..dcbdc633
+index 00000000..3c2e51dd
 --- /dev/null
 +++ b/docs/design/graph-memory.md
 @@ -0,0 +1,606 @@
-+# graph-memory 设计（mem0 自托管记忆·阶段 3：Graphiti 旁路图检索）
++# graph-memory 设计（mem0 自托管记忆：Graphiti 旁路图检索）
 +
 +| 项 | 值 |
 +| --- | --- |
 +| 目标仓库 | `/Users/xuelingkang/Documents/Containers/mem0`（`main`） |
 +| 基线 commit | `63fa9116`（memory-decay 文档收口后） |
-+| 前置阶段 | 阶段 1（bi-temporal 事实模型）、阶段 2（Ebbinghaus 衰减 + 访问强化）均已交付并核验通过 |
++| 依赖机制 | bi-temporal 事实模型、Ebbinghaus 衰减 + 访问强化，均已交付并核验通过 |
 +| 前置文档 | `docs/design/bitemporal-fact-model.md`、`docs/design/memory-decay.md` |
 +| 生效面 | 写入路径（事实入图）与检索排序层（`/search` 路径）；事实主存仍在 Qdrant |
 +| 存储 | Qdrant 1.19.0 集合 `memories_2048`（3612 点 / 向量 2048 维 + `bm25` sparse）；新增 FalkorDB 图库（图键按作用域隔离） |
@@ -1439,7 +1439,7 @@ index 00000000..dcbdc633
 +
 +## 1.1 背景
 +
-+`/search` 当前按混合打分排序：语义相似度 + BM25 + 实体加权，再乘时间因子（阶段 2）：
++`/search` 当前按混合打分排序：语义相似度 + BM25 + 实体加权，再乘时间因子（衰减）：
 +
 +```
 +combined   = min((semantic + bm25 + entity_boost) / max_possible, 1.0)
@@ -1459,7 +1459,7 @@ index 00000000..dcbdc633
 +3. **图不可用时主链路不受影响**：写入照常、检索照常，图分支静默跳过（第 6.4 节逐条）。
 +4. 同步是异步的：入图不阻塞主写入响应，失败可重试。
 +5. 图与事实主存通过**构造性 join key**（episode uuid = memory id）双向可追溯，图上不另存映射表。
-+6. 与阶段 2 的时间因子共存：两个机制作用面不同（关联维 vs 时间维），复合顺序固定，各自有界（第 6.3 节）。
++6. 与衰减的时间因子共存：两个机制作用面不同（关联维 vs 时间维），复合顺序固定，各自有界（第 6.3 节）。
 +7. 全部能力由一个开关控制；关闭时检索与写入行为与引入本机制之前逐位一致。
 +
 +## 1.3 范围
@@ -1659,7 +1659,7 @@ index 00000000..dcbdc633
 +
 +- 队列为**进程内有界队列**（默认容量 1000），满时丢弃最旧任务并累加 `graph_dropped` 计数；
 +- 投递是 O(1) 的内存操作，被 `try/except` 包裹，任何异常记计数器后返回，不改变写入结果；
-+- worker 为**单线程 + 独立事件循环**：串行调用图桥 `/episodes`，与 FastAPI 的请求线程池互不占用（与阶段 2 的强化写入派发同构）。
++- worker 为**单线程 + 独立事件循环**：串行调用图桥 `/episodes`，与 FastAPI 的请求线程池互不占用（与衰减的强化写入派发同构）。
 +
 +## 5.2 重试与熔断
 +
@@ -1747,7 +1747,7 @@ index 00000000..dcbdc633
 +
 +## 6.3 与 Decay 的共存方式
 +
-+| 项 | 阶段 2 时间因子 | 本阶段图信号 |
++| 项 | 衰减时间因子 | 图信号 |
 +| --- | --- | --- |
 +| 作用维度 | 时间（龄 + 召回足迹） | 关联（实体与关系路径） |
 +| 组合位置 | 乘性系数，作用于 `combined` 之后 | 加性分量，进入 `combined` 分子 |
@@ -1860,8 +1860,8 @@ index 00000000..dcbdc633
 +
 +| 文件 | 本地既有改动 | 本方案新增改动 | 冲突风险 |
 +| --- | --- | --- | --- |
-+| `mem0/memory/main.py` | 阶段 0/1/2 改动（bi-temporal、衰减、中文提示词） | 派发调用、图检索分支、两份实现 | **高**（上游 V3 管道核心） |
-+| `mem0/utils/scoring.py` | 阶段 2 的衰减分量 | 图分量与分母条件增长 | 中 |
++| `mem0/memory/main.py` | 既有改动（bi-temporal、衰减、中文提示词） | 派发调用、图检索分支、两份实现 | **高**（上游 V3 管道核心） |
++| `mem0/utils/scoring.py` | 衰减分量 | 图分量与分母条件增长 | 中 |
 +| `mem0/configs/base.py` | 衰减配置段 | 图配置段 | 低 |
 +| `server/main.py` | 分页、独立 provider、导出、衰减配置 | 图配置透传与 `score_details` | 低 |
 +| `server/docker-compose.yaml` | 衰减开关透传 | 两个新服务与图环境变量 | 低 |
@@ -1954,7 +1954,7 @@ index 00000000..dcbdc633
 +| [AC-26] | 关闭时零图调用：`enabled=false` 下连续 20 次写入与 10 次检索，图桥访问日志计数与关闭前相同（增量为 0） | 图桥访问日志 |
 +| [AC-27] | 开关可运行时切换：以配置通道切换 关→开→关，检索行为随之变化，无需重启容器 | 三次 `POST /search` + `GET /configure` 复核 |
 +| [AC-28] | 存储面不变：变更前后 Qdrant 集合的 `payload_schema` 键集合相同；不存在新增集合；无新增 payload 字段 | 直接查 Qdrant REST |
-+| [AC-29] | 既有资产可用：阶段 2 的验收用例（衰减函数、足迹写入、开关回退、存量兼容）复跑通过；bi-temporal 的 `as_of` / `include_invalidated` 行为与阶段 1 一致 | 复跑既有用例 |
++| [AC-29] | 既有资产可用：衰减的验收用例（衰减函数、足迹写入、开关回退、存量兼容）复跑通过；bi-temporal 的 `as_of` / `include_invalidated` 行为保持一致 | 复跑既有用例 |
 +| [AC-30] | 接口契约不变：`GET /memories` 顺序仍为 `created_at` 降序且 `total` 与基线一致；`GET /memories/{id}` 与导出的字段集合与基线相同（`explain` 之外的响应不含新键） | 端点对比 |
 +| [AC-31] | `explain` 只增键：`score_details` 含 `graph_boost` / `graph_facts`，且既有键（`semantic_score` / `bm25_score` / `entity_boost` / `raw_score` / `max_possible_score` / `final_score` / `threshold`）取值语义不变 | 读取响应 JSON 的键集合与取值 |
 +
@@ -2015,19 +2015,19 @@ index 00000000..dcbdc633
 +| Kuzu 项目状态公告（`kuzudb/kuzu` README、`kuzudb.com` 解析状态） | 4.3 载体可持续性 |
 +| mem0 v3 云平台图记忆说明（`docs`：无外部图库、实体节点与共享实体连接、排序阶段提分） | 本方案的融合位置与「补充信号」定位 |
 +| `FalkorDB/mem0-falkordb`（provider `falkordb`）与 `Nerfherder16/System-Recall`（Mem0 + Neo4j + Qdrant + Graphiti 自托管，README 建议 8GB+ RAM） | 生态一致性与资源量级对照 |
-+| 阶段 2 文档 `docs/design/memory-decay.md` | 时间因子定义、复合顺序、开关与回退形态 |
++| 衰减设计 `docs/design/memory-decay.md` | 时间因子定义、复合顺序、开关与回退形态 |
 diff --git a/docs/design/memory-decay.md b/docs/design/memory-decay.md
 new file mode 100644
-index 00000000..8e3c14cf
+index 00000000..66c982d7
 --- /dev/null
 +++ b/docs/design/memory-decay.md
 @@ -0,0 +1,553 @@
-+# memory-decay 设计（mem0 自托管记忆·阶段 2：Ebbinghaus 衰减 + 访问强化）
++# memory-decay 设计（mem0 自托管记忆：Ebbinghaus 衰减 + 访问强化）
 +
 +| 项 | 值 |
 +| --- | --- |
 +| 目标仓库 | `/Users/xuelingkang/Documents/Containers/mem0` |
-+| 前置阶段 | 阶段 0（村规废弃、纯 ADD）与阶段 1（bi-temporal 事实模型）均已交付并核验通过 |
++| 依赖机制 | 纯 ADD 写入（已无写入期收敛）、bi-temporal 事实模型，均已交付并核验通过 |
 +| 前置文档 | `docs/design/bitemporal-fact-model.md`（事实模型与 `valid_at` / `invalid_at` 语义） |
 +| 生效面 | 检索排序层（`/search` 路径），不新增存储、不新增 LLM 调用 |
 +| 存储 | Qdrant 1.19.0，集合 `memories_2048`（2048 维 + `bm25` sparse 槽位） |
@@ -2269,7 +2269,7 @@ index 00000000..8e3c14cf
 +
 +依据（第 10 节 E1）：全库 3545 条全部具备 `created_at`，`last_accessed` / `access_count` 命中数均为 0；因此上线首日全库走第二行语义，全库时间因子分布落在 [0.9185, 1.0000]（实测：min 0.9185、p25 0.9241、p50 0.9369、p75 0.9724）。
 +
-+不做回填的理由与阶段 1 的 `valid_at` 同理：**`created_at` 是存量记录唯一真实可信的「上次使用」证据**；写入推测值等于伪造一条访问历史，且会让「从未被召回」与「很久以前被召回」两种不同状态不可区分。云平台对 decay 上线前的存量记忆同样采用「无足迹 → 用事件时间兜底」的降级路径。
++不做回填的理由与 bi-temporal 的 `valid_at` 同理：**`created_at` 是存量记录唯一真实可信的「上次使用」证据**；写入推测值等于伪造一条访问历史，且会让「从未被召回」与「很久以前被召回」两种不同状态不可区分。云平台对 decay 上线前的存量记忆同样采用「无足迹 → 用事件时间兜底」的降级路径。
 +
 +后续行为：新写入记录在首次被检索返回时获得足迹；存量记录在被检索返回后自然积累足迹，此后与其它记录行为一致。
 +
@@ -2430,7 +2430,7 @@ index 00000000..8e3c14cf
 +
 +| 文件 | 本地既有改动 | 本方案新增改动 | 冲突风险 |
 +| --- | --- | --- | --- |
-+| `mem0/memory/main.py` | 阶段 0/1 改动（+ 常量收敛） | 衰减纯函数、两份检索实现、结果格式化 | **高**（上游 V3 管道核心，改动频繁） |
++| `mem0/memory/main.py` | 既有改动（+ 常量收敛） | 衰减纯函数、两份检索实现、结果格式化 | **高**（上游 V3 管道核心，改动频繁） |
 +| `mem0/utils/scoring.py` | 无 | 打分器签名与 `score_details` | 低（上游近期未动） |
 +| `mem0/vector_stores/qdrant.py` | 游标分页 + payload 索引按字段声明 | 批量足迹写入方法、索引字段追加 | 中 |
 +| `server/main.py` | 游标分页 / 独立 provider / 导出 | 配置段、序列化、导出列 | 中（均为小改） |
@@ -2524,7 +2524,7 @@ index 00000000..8e3c14cf
 +| [AC-30] | 导出同步：`GET /memories/export?format=json` 中每条记录的 `metadata` 不含两个足迹字段；`format=csv` 的表头含两列 | 导出文件检查 |
 +| [AC-31] | 管理列表不受影响：`GET /memories` 的顺序仍为 `created_at` 降序、`total` 与基线一致；两次连续调用返回的首屏 id 序相同（足迹字段变化不改变该端点的排序键） | 端到端两次调用对比 |
 +| [AC-32] | 写入路径不受影响：`POST /memories`（`infer=true`）仍返回 `event=ADD`；写入管道 Phase 1 的候选检索结果与改动前一致（不受时间因子影响） | 隔离 `user_id` 端到端 + 候选集对比 |
-+| [AC-33] | point-in-time 与 bi-temporal 语义保持：`as_of` / `include_invalidated` 行为与改动前一致，失效记录仍不出现在默认读 | 端到端复跑阶段 1 的验收用例 |
++| [AC-33] | point-in-time 与 bi-temporal 语义保持：`as_of` / `include_invalidated` 行为与改动前一致，失效记录仍不出现在默认读 | 端到端复跑 bi-temporal 的验收用例 |
 +| [AC-34] | 索引存在：`GET /collections/memories_2048` 的 `payload_schema` 含 `last_accessed: datetime` | 直接查 Qdrant REST |
 +
 +## 11.7 验证纪律与工程
@@ -2536,7 +2536,7 @@ index 00000000..8e3c14cf
 +| [AC-37] | 容器内可见新符号（重启后生效）：`docker exec mem0-dev-mem0-1 python -c "from mem0.memory.main import <新符号>"` 成功 |
 +| [AC-38] | `make lint`（ruff，line length 120）对 `mem0/`、`server/` 改动零告警 |
 +| [AC-39] | 实现完成后 `bash patches/generate-patch.sh` 成功刷新 `patches/mem0-local.patch`，覆盖本次全部改动文件 |
-+| [AC-40] | 变更不夺取既有资产：bi-temporal 三段式、中文提示词、游标翻页、dashboard 改造、维度单一来源均保持可用（阶段 1 的验收用例可复跑通过） |
++| [AC-40] | 变更不夺取既有资产：bi-temporal 三段式、中文提示词、游标翻页、dashboard 改造、维度单一来源均保持可用（bi-temporal 的验收用例可复跑通过） |
 +
 +---
 +
@@ -2574,7 +2574,7 @@ index 00000000..8e3c14cf
 +| Ebbinghaus 原始标定数据（20 分钟 58%、1 小时 44%、1 天 33%、31 天 21%） | 衰减曲线形状的经验来源 |
 +| PowerMem（OceanBase，Apache-2.0）：`decay = −ln(0.44)` 标定 + 保留下限 + `combined_score = similarity × retention` | 3.3 依据 B 的标定方法、5.1 的融合形态（相乘而非相加） |
 +| mem0 云平台 Memory Decay 文档：缩放因子区间 0.3×–1.5×、地板保证「只重排不淘汰」、每次召回最多保留最近 20 次触摸、存量记录降级用事件时间兜底、`threshold` 在衰减之前应用 | 3.4 区间形态与 4.5 存量降级路径、8 观测项、5.3 `threshold` 语义 |
-+| mem0 云平台 Temporal Reasoning 文档：检索参考时刻 `reference_date` | 阶段 3 的接口位（不在本方案范围） |
++| mem0 云平台 Temporal Reasoning 文档：检索参考时刻 `reference_date` | — |
 diff --git a/docs/design/memory-dream-baseline.json b/docs/design/memory-dream-baseline.json
 new file mode 100644
 index 00000000..2f81683c
@@ -2729,7 +2729,7 @@ index 00000000..2f81683c
 +}
 diff --git a/docs/design/memory-dream.md b/docs/design/memory-dream.md
 new file mode 100644
-index 00000000..1f5be2bc
+index 00000000..53085993
 --- /dev/null
 +++ b/docs/design/memory-dream.md
 @@ -0,0 +1,1036 @@
@@ -2781,7 +2781,7 @@ index 00000000..1f5be2bc
 +- `server/main.py` / `server/models.py` / `server/alembic/versions/`：运行记账表、序列化一等字段、检索参数。
 +- `tests/memory/test_dream.py`、`tests/test_dream_router.py`（新增）。
 +
-+不包含（见第 9 节职责边界）：检索排序的任何改动、源事实的任何失效/合并处置、图结构、跨作用域整合、实时整合。
++职责边界见第 9 节。
 +
 +---
 +
