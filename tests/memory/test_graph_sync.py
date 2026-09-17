@@ -175,10 +175,13 @@ class TestDispatchQueue:
         finally:
             sync.close()
 
-    def test_queue_overflow_drops_oldest_and_counts(self):
+    def test_queue_overflow_drops_oldest_and_counts(self, monkeypatch):
         client = _CountingClient()
-        # worker 不启动：只验证入队路径的有界性。
         sync = GraphSync(GraphConfig(enabled=True, queue_size=2), client=client)
+        # worker 不启动：只验证入队路径的有界性。`dispatch()` 末行会惰性启动 worker 并
+        # 排空队列，「投递与排空的交错」取决于线程调度（同一命令连跑 10 次曾 5 次得到
+        # dropped=2），因此必须把 `start()` 显式置为空操作，断言才只覆盖入队路径。
+        monkeypatch.setattr(sync, "start", lambda: None)
         for index in range(5):
             sync.dispatch(f"m{index}", "text", None, "mem0_test_graph_a")
         stats = sync.stats()
