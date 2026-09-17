@@ -12,7 +12,7 @@ import telemetry
 from auth import ADMIN_API_KEY, AUTH_DISABLED, JWT_SECRET, require_admin, verify_auth
 from db import SessionLocal
 from dotenv import load_dotenv
-from dream_scheduler import DreamScheduler, configure_scheduler
+from dream_scheduler import DreamScheduler, SqlRunObserver, configure_scheduler
 from errors import (
     UpstreamError,
     install_request_id_logging,
@@ -221,7 +221,11 @@ async def _lifespan(_app: FastAPI):
     调度器只在 `dream.enabled=true` 时真正启动周期线程；关闭态下 `start()` 立即返回，
     `POST /dream/*` 由端点翻译成 409。关停信号置位后线程在单簇边界处退出。
     """
-    scheduler = DreamScheduler(get_config=get_current_config, get_memory=get_memory_instance)
+    scheduler = DreamScheduler(
+        get_config=get_current_config,
+        get_memory=get_memory_instance,
+        observer=SqlRunObserver(),
+    )
     configure_scheduler(scheduler)
     scheduler.start()
     try:

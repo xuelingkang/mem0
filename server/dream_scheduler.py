@@ -419,11 +419,14 @@ class DreamScheduler:
                 observer=observer,
                 scopes=scopes,
             )
-            report_path = write_report(report, settings.report_dir)
+            # 报告文件名由 run_id 决定，因此在落盘之前就能把路径写进报告本体——这样
+            # 落盘内容与 `POST /dream/preview` 的响应体逐字段相等（设计 §10.6 [AC-29]）。
+            report_path = os.path.join(settings.report_dir, f"{report['run_id']}.json")
             report["report_path"] = report_path
+            report["trigger"] = trigger
+            write_report(report, settings.report_dir)
             if observer is not None:
                 observer.attach_report(report["run_id"], report_path)
-            report["trigger"] = trigger
             return report
         finally:
             self._lock.release()
