@@ -557,6 +557,41 @@ async def test_async_search_reinforces_hits(monkeypatch):
     assert set(memory.vector_store.update_payload_batch.call_args.args[0]) == {"hit"}
 
 
+class TestQdrantFootprintWrite:
+    """[AC-18]/[AC-17] 批量足迹写入的请求体必须能被 qdrant-client 的模型接受。
+
+    这里刻意不 mock 掉请求体构造：`batch_update_points` 要的是 *操作包装*（SetPayloadOperation），
+    传裸操作体会通不过客户端的 UpdateOperations 校验，写入在进程内就被拒（且只有日志可见）。
+    """
+
+    def _store(self):
+        from mem0.vector_stores.qdrant import Qdrant
+
+        store = Qdrant.__new__(Qdrant)
+        store.collection_name = "memories_test"
+        store.client = MagicMock()
+        return store
+
+    def test_operations_validate_against_the_client_models(self):
+        from qdrant_client import models
+
+        store = self._store()
+        store.update_payload_batch(
+            {"a": {"last_accessed": "2026-09-17T00:00:00+00:00", "access_count": 1}, "b": {"access_count": 2}}
+        )
+        operations = store.client.batch_update_points.call_args.kwargs["update_operations"]
+        # 真正的回归断言：请求体必须通过客户端自身的 pydantic 校验。
+        models.UpdateOperations(operations=operations)
+        assert len(operations) == 2
+        assert all(isinstance(op, models.SetPayloadOperation) for op in operations)
+        assert store.client.batch_update_points.call_args.kwargs["collection_name"] == "memories_test"
+
+    def test_empty_updates_send_no_request(self):
+        store = self._store()
+        store.update_payload_batch({})
+        assert store.client.batch_update_points.call_count == 0
+
+
 class TestConfigWiring:
     def test_memory_config_declares_the_decay_section(self):
         """[AC-5]/E7：配置段必须显式声明，否则被静默忽略。"""
@@ -578,6 +613,30 @@ class TestConfigWiring:
     def test_footprint_keys_are_first_class_read_fields(self):
         """[AC-29] 两个足迹字段是可提升的一等字段，不得落进 metadata。"""
         assert set(memory_main.DECAY_PAYLOAD_KEYS) <= set(memory_main.BI_TEMPORAL_PAYLOAD_KEYS)
+        assert set(memory_main.DECAY_PAYLOAD_KEYS) <= set(memory_main.READ_ALWAYS_PRESENT_FIELDS)
+
+    def test_single_read_always_exposes_the_footprint_keys(self, monkeypatch):
+        """[AC-29]/F7：单条读取的顶层始终含两个足迹字段，未写过时为 null。"""
+        memory = Memory.__new__(Memory)
+        memory.config = MemoryConfig()
+        row = MagicMock()
+        row.id = "m1"
+        row.payload = {
+            "data": "x",
+            "hash": "h",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "user_id": "u1",
+        }
+        memory.vector_store = MagicMock()
+        memory.vector_store.get.return_value = row
+        monkeypatch.setattr(memory_main, "capture_event", MagicMock())
+        monkeypatch.setattr(memory_main, "display_first_run_notice", MagicMock())
+
+        result = memory.get("m1")
+
+        assert result["last_accessed"] is None
+        assert result["access_count"] is None
+        assert not set(memory_main.DECAY_PAYLOAD_KEYS) & set(result.get("metadata") or {})
 
     def test_parse_timestamp_accepts_z_suffix_and_rejects_garbage(self):
         assert _parse_decay_timestamp("2026-09-17T00:00:00Z") == datetime(2026, 9, 17, tzinfo=timezone.utc)

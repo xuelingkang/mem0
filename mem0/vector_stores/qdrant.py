@@ -559,8 +559,13 @@ class Qdrant(VectorStoreBase):
         """
         if not updates:
             return
+        # `batch_update_points` takes the *operation* wrappers (SetPayloadOperation), not the
+        # bare operation bodies: the bare form fails the client's UpdateOperations validation
+        # and the write never leaves the process.
         operations = [
-            models.SetPayload(payload=payload, points=[point_id])
+            models.SetPayloadOperation(
+                set_payload=models.SetPayload(payload=payload, points=[point_id])
+            )
             for point_id, payload in updates.items()
         ]
         self.client.batch_update_points(

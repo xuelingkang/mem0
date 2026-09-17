@@ -494,6 +494,11 @@ BI_TEMPORAL_PAYLOAD_KEYS = [
 # Bi-temporal fields, surfaced top-level on every read result (null when not set).
 BI_TEMPORAL_FIELDS = ("valid_at", "invalid_at", "superseded_by", "invalid_reason")
 
+# Fields every read result carries at the top level, null when the record has no value.
+# The access footprint belongs here for the same reason the bi-temporal quartet does: a
+# client must be able to tell "never accessed" from "this endpoint does not report it".
+READ_ALWAYS_PRESENT_FIELDS = (*BI_TEMPORAL_FIELDS, *DECAY_PAYLOAD_KEYS)
+
 
 def _coerce_bitemporal_date(value: Any) -> Optional[str]:
     """Normalize a date-like value to `YYYY-MM-DD`, or None when it is not a date.
@@ -1807,8 +1812,8 @@ class Memory(MemoryBase):
             if key in memory.payload:
                 result_item[key] = memory.payload[key]
 
-        # Bi-temporal fields are first-class: always top-level, null when unset.
-        for key in BI_TEMPORAL_FIELDS:
+        # 一等字段：始终在顶层出现，未赋值时为 null（与 bi-temporal 四字段同规则，设计 F7）。
+        for key in READ_ALWAYS_PRESENT_FIELDS:
             result_item.setdefault(key, None)
 
         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
@@ -1934,7 +1939,7 @@ class Memory(MemoryBase):
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
 
-            for key in BI_TEMPORAL_FIELDS:
+            for key in READ_ALWAYS_PRESENT_FIELDS:
                 memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
@@ -2298,7 +2303,7 @@ class Memory(MemoryBase):
                 if key in payload:
                     memory_item_dict[key] = payload[key]
 
-            for key in BI_TEMPORAL_FIELDS:
+            for key in READ_ALWAYS_PRESENT_FIELDS:
                 memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
@@ -3558,8 +3563,8 @@ class AsyncMemory(MemoryBase):
             if key in memory.payload:
                 result_item[key] = memory.payload[key]
 
-        # Bi-temporal fields are first-class: always top-level, null when unset.
-        for key in BI_TEMPORAL_FIELDS:
+        # 一等字段：始终在顶层出现，未赋值时为 null（与 bi-temporal 四字段同规则，设计 F7）。
+        for key in READ_ALWAYS_PRESENT_FIELDS:
             result_item.setdefault(key, None)
 
         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
@@ -3687,7 +3692,7 @@ class AsyncMemory(MemoryBase):
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
 
-            for key in BI_TEMPORAL_FIELDS:
+            for key in READ_ALWAYS_PRESENT_FIELDS:
                 memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
@@ -4056,7 +4061,7 @@ class AsyncMemory(MemoryBase):
                 if key in payload:
                     memory_item_dict[key] = payload[key]
 
-            for key in BI_TEMPORAL_FIELDS:
+            for key in READ_ALWAYS_PRESENT_FIELDS:
                 memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
