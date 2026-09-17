@@ -1,7 +1,10 @@
 import asyncio
+import csv
+import io
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import telemetry
@@ -18,7 +21,7 @@ from errors import (
 )
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from models import RequestLog, User
 from pydantic import BaseModel, Field
 from rate_limit import limiter
@@ -469,6 +472,71 @@ def get_all_memories(
             params["top_k"] = top_k
         params["show_expired"] = show_expired
         return get_memory_instance().get_all(**params)
+    except HTTPException:
+        raise
+    except Exception:
+        raise upstream_error()
+
+
+MAX_EXPORT_PAGES = 200
+EXPORT_CSV_COLUMNS = [
+    "id",
+    "memory",
+    "user_id",
+    "agent_id",
+    "run_id",
+    "hash",
+    "created_at",
+    "updated_at",
+]
+
+
+@app.get("/memories/export", summary="Export all memories")
+def export_memories(
+    format: str = Query("json", pattern="^(json|csv)$"),
+    _auth=Depends(verify_auth),
+):
+    """Download the whole collection as one JSON or CSV file.
+
+    Walks the same cursor-paginated listing the dashboard browses, so the export
+    covers every memory rather than only the newest page.
+    """
+    try:
+        rows: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        for _ in range(MAX_EXPORT_PAGES):
+            page = _list_all_memories(limit=ALL_MEMORIES_LIMIT, cursor=cursor)
+            batch = page["results"]
+            if not batch:
+                break
+            rows.extend(batch)
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        if format == "csv":
+            buffer = io.StringIO()
+            writer = csv.DictWriter(
+                buffer, fieldnames=EXPORT_CSV_COLUMNS, extrasaction="ignore"
+            )
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+            return Response(
+                content=buffer.getvalue(),
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f'attachment; filename="mem0-memories-{stamp}.csv"'
+                },
+            )
+
+        return JSONResponse(
+            content={"memories": rows, "total": len(rows), "exported_at": stamp},
+            headers={
+                "Content-Disposition": f'attachment; filename="mem0-memories-{stamp}.json"'
+            },
+        )
     except HTTPException:
         raise
     except Exception:

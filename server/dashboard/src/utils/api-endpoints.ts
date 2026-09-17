@@ -12,6 +12,7 @@ export const MEMORY_ENDPOINTS = {
   BASE: "/memories",
   BY_ID: (memoryId: string) => `/memories/${memoryId}`,
   HISTORY: (memoryId: string) => `/memories/${memoryId}/history`,
+  EXPORT: "/memories/export",
   SEARCH: "/search",
   CONFIGURE: "/configure",
   CONFIGURE_PROVIDERS: "/configure/providers",
@@ -26,6 +27,7 @@ export const API_KEY_ENDPOINTS = {
 
 export const REQUEST_ENDPOINTS = {
   BASE: "/requests",
+  STATS: "/requests/stats",
 } as const;
 
 export const ENTITY_ENDPOINTS = {

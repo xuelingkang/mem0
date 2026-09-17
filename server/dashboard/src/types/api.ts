@@ -34,6 +34,35 @@ export interface ApiRequestLog {
   auth_type: string;
 }
 
+export interface RequestStatsDay {
+  date: string;
+  total: number;
+  errors: number;
+  avg_latency_ms: number;
+}
+
+export interface RequestStatsStatus {
+  status_code: number;
+  count: number;
+}
+
+export interface RequestStatsPath {
+  path: string;
+  count: number;
+  avg_latency_ms: number;
+}
+
+export interface RequestStats {
+  total: number;
+  success_rate: number;
+  avg_latency_ms: number;
+  p95_latency_ms: number;
+  window_days: number;
+  by_day: RequestStatsDay[];
+  by_status: RequestStatsStatus[];
+  top_paths: RequestStatsPath[];
+}
+
 export type EntityType = "user" | "agent" | "run";
 
 export interface Entity {
