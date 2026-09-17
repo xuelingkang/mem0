@@ -1,0 +1,9 @@
+# graph-bridge 运行时依赖。图引擎与抽取管道全部来自 graphiti-core 的 PyPI 发行版，
+# 本仓库不携带其源码副本，也不对其打补丁（方案 §4.3、[AC-37]）。
+#
+# `falkordb` extra 提供 FalkorDriver 所需的客户端（官方 `zepai/graphiti` 镜像缺该驱动，
+# 启动即 ImportError，实测见方案 §4.2 G1）。
+graphiti-core[falkordb]==0.30.2
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0

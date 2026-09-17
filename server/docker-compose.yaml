@@ -19,6 +19,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Soft dependency: the graph capability degrades silently when the bridge is down,
+      # so mem0 must start regardless of the bridge's health (`required: false` only
+      # affects ordering when the bridge was explicitly requested).
+      graph-bridge:
+        condition: service_started
+        required: false
     command: >
       sh -c "rm -rf /usr/local/lib/python3.12/site-packages/mem0 && cp -r /opt/mem0-src /usr/local/lib/python3.12/site-packages/mem0 && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"
     environment:
@@ -47,6 +53,54 @@ services:
       - DREAM_RUN_TIMEOUT_SECONDS=${DREAM_RUN_TIMEOUT_SECONDS:-}
       - DREAM_PER_CLUSTER_TIMEOUT_SECONDS=${DREAM_PER_CLUSTER_TIMEOUT_SECONDS:-}
       - DREAM_REPORT_DIR=${DREAM_REPORT_DIR:-}
+      # Graph memory (Graphiti side-car graph). Off by default: no dispatch, no graph
+      # query, no boost -- retrieval stays byte-identical to pre-graph releases.
+      - MEM0_GRAPH_ENABLED=${MEM0_GRAPH_ENABLED:-false}
+      - MEM0_GRAPH_ENDPOINT=${MEM0_GRAPH_ENDPOINT:-http://graph-bridge:8000}
+      - MEM0_GRAPH_WEIGHT=${MEM0_GRAPH_WEIGHT:-}
+      - MEM0_GRAPH_MAX_FACTS=${MEM0_GRAPH_MAX_FACTS:-}
+      - MEM0_GRAPH_TIMEOUT_SECONDS=${MEM0_GRAPH_TIMEOUT_SECONDS:-}
+      - MEM0_GRAPH_INCLUDE_INVALIDATED=${MEM0_GRAPH_INCLUDE_INVALIDATED:-}
+      - MEM0_GRAPH_QUEUE_SIZE=${MEM0_GRAPH_QUEUE_SIZE:-}
+      - MEM0_GRAPH_MAX_RETRIES=${MEM0_GRAPH_MAX_RETRIES:-}
+      - MEM0_GRAPH_RETRY_BACKOFF_SECONDS=${MEM0_GRAPH_RETRY_BACKOFF_SECONDS:-}
+      - MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES=${MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES:-}
+      - MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS=${MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS:-}
+      - MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=${MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS:-}
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    restart: unless-stopped
+    networks:
+      - mem0_network
+    # Internal-only: no host port published (the graph is reached through the bridge).
+    mem_limit: 384m
+    volumes:
+      - falkordb_data:/data
+
+  graph-bridge:
+    build: ./graph-bridge
+    restart: unless-stopped
+    networks:
+      - mem0_network
+    mem_limit: 512m
+    env_file:
+      - .env
+    environment:
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      # 抽取管道按 /responses 结构化输出通道装配（官方镜像的 json_schema 通道被本机
+      # 网关 422 拒绝，实测见方案 §4.2）；LLM_MODEL 缺省跟随后端默认 LLM 模型。
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${GRAPH_LLM_MODEL:-${MEM0_DEFAULT_LLM_MODEL:-gpt-5-mini}}
+      - EMBEDDER_API_KEY=${EMBEDDER_API_KEY:-}
+      - EMBEDDER_BASE_URL=${EMBEDDER_BASE_URL:-}
+      - EMBEDDER_MODEL=${MEM0_DEFAULT_EMBEDDER_MODEL:-text-embedding-3-small}
+      - EMBEDDER_DIMS=${EMBEDDER_EMBEDDING_DIMS:-2048}
+      - SEMAPHORE_LIMIT=1
+    depends_on:
+      - falkordb
 
   postgres:
       image: pgvector/pgvector:pg17
@@ -103,6 +157,7 @@ volumes:
   postgres_db:
   mem0_history:
   qdrant_data:
+  falkordb_data:
 
 networks:
   mem0_network:
