@@ -1,0 +1,134 @@
+[setup] build_indices_and_constraints 0.01s
+[ingest 0] 24.67s nodes=5 edges=4 communities=0 rss=153MB
+[ingest 1] 36.65s nodes=4 edges=1 communities=0 rss=154MB
+[ingest 2] 15.71s nodes=3 edges=2 communities=0 rss=155MB
+[ingest 3] 14.24s nodes=1 edges=0 communities=0 rss=155MB
+[ingest 4] 20.52s nodes=2 edges=1 communities=0 rss=155MB
+[search] 0.14s '薛用什么语言写后端？' -> 5 facts
+    fact='薛的主力语言包括 Java' valid_at=2026-09-17 07:06:21.975553+00:00 invalid_at=None
+    fact='薛的主力语言包括 Spring' valid_at=2026-09-17 07:06:21.975553+00:00 invalid_at=None
+    fact='薛是学科网基础应用中心的后端工程师' valid_at=2026-09-17 07:06:21.975553+00:00 invalid_at=None
+[search] 0.23s 'mem0 的记忆衰减用什么曲线？' -> 5 facts
+    fact='mem0 的记忆衰减机制由 Ebbinghaus 遗忘曲线实现，时间因子的下界是 0.90。' valid_at=2026-09-17 07:07:53.243232+00:00 invalid_at=None
+    fact='mem0 记忆服务的主存储是 Qdrant。' valid_at=2026-09-17 07:07:23.289471+00:00 invalid_at=None
+    fact='学科网基础应用中心有一个自托管的 mem0 记忆服务。' valid_at=2026-09-17 07:07:23.289471+00:00 invalid_at=None
+[search] 0.12s 'docker 虚拟机多少内存？' -> 5 facts
+    fact='薛的机器上跑着一个 lima docker 虚拟机，配置为 2 CPU / 8GiB。' valid_at=2026-09-17 07:06:46.645144+00:00 invalid_at=None
+    fact='mem0 记忆服务的主存储是 Qdrant。' valid_at=2026-09-17 07:07:23.289471+00:00 invalid_at=None
+    fact='学科网基础应用中心有一个自托管的 mem0 记忆服务。' valid_at=2026-09-17 07:07:23.289471+00:00 invalid_at=None
+[_search RRF] 0.23s edges=5 nodes=0
+[graph] entity_nodes=11
+    node='薛' labels=['Entity']
+    node='mem0' labels=['Entity']
+    node='Java' labels=['Entity']
+    node='docker' labels=['Entity']
+    node='lima docker 虚拟机' labels=['Entity']
+    node='Spring' labels=['Entity']
+    node='学科网基础应用中心' labels=['Entity']
+    node='lima' labels=['Entity']
+    node='Ebbinghaus 遗忘曲线' labels=['Entity']
+    node='Qdrant' labels=['Entity']
+    node='学科网' labels=['Entity']
+[graph] entity_edges=8
+    edge name='PRIMARY_LANGUAGE_IS' fact='薛的主力语言包括 Spring'
+    edge name='HOSTS_SERVICE' fact='学科网基础应用中心有一个自托管的 mem0 记忆服务。'
+    edge name='PART_OF' fact='学科网基础应用中心是学科网的一个中心'
+    edge name='USES_PRIMARY_STORAGE' fact='mem0 记忆服务的主存储是 Qdrant。'
+    edge name='PRIMARY_LANGUAGE_IS' fact='薛的主力语言包括 Java'
+    edge name='RUNS_ON_MACHINE' fact='薛的机器上跑着一个 lima docker 虚拟机，配置为 2 CPU / 8GiB。'
+    edge name='IMPLEMENTED_BY' fact='mem0 的记忆衰减机制由 Ebbinghaus 遗忘曲线实现，时间因子的下界是 0.90。'
+    edge name='WORKS_AT' fact='薛是学科网基础应用中心的后端工程师'
+[stats] ingest latency min/med/max = 14.24/20.52/36.65s  peak_rss=155MB
+Error executing FalkorDB query: Connection closed by server.
+CREATE INDEX FOR (n:Episodic) ON (n.uuid, n.group_id, n.created_at, n.valid_at)
+{}
+Error executing FalkorDB query: Connection closed by server.
+CREATE INDEX FOR ()-[e:RELATES_TO]-() ON (e.uuid, e.group_id, e.name, e.created_at, e.expired_at, e.valid_at, e.invalid_at)
+{}
+Task exception was never retrieved
+future: <Task finished name='Task-210' coro=<FalkorDriver.build_indices_and_constraints() done, defined at /Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py:324> exception=network:ConnectionError>
+Traceback (most recent call last):
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py", line 329, in build_indices_and_constraints
+    await self.execute_query(query)
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py", line 246, in execute_query
+    result = await graph.query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/falkordb/asyncio/graph.py", line 114, in query
+    return await self._query(q, params=params, timeout=timeout, read_only=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/falkordb/asyncio/graph.py", line 84, in _query
+    response = await self.execute_command(*command)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 946, in execute_command
+    result = await conn.retry.call_with_retry(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/retry.py", line 81, in call_with_retry
+    raise error
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/retry.py", line 69, in call_with_retry
+    return await do()
+           ^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 871, in _send_command_parse_response
+    return await self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 993, in parse_response
+    response = await connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/connection.py", line 1299, in read_response
+    response = await self._read_response_from_parser(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/connection.py", line 1338, in _read_response_from_parser
+    return await self._parser.read_response(disable_decoding=disable_decoding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/resp2.py", line 89, in read_response
+    response = await self._read_response(disable_decoding=disable_decoding)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/resp2.py", line 97, in _read_response
+    raw = await self._readline()
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/base.py", line 589, in _readline
+    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+redis.exceptions.ConnectionError: Connection closed by server.
+Task exception was never retrieved
+future: <Task finished name='Task-211' coro=<FalkorDriver.build_indices_and_constraints() done, defined at /Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py:324> exception=network:ConnectionError>
+Traceback (most recent call last):
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py", line 329, in build_indices_and_constraints
+    await self.execute_query(query)
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/graphiti_core/driver/falkordb_driver.py", line 246, in execute_query
+    result = await graph.query(cypher_query_, params)  # type: ignore[reportUnknownArgumentType]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/falkordb/asyncio/graph.py", line 114, in query
+    return await self._query(q, params=params, timeout=timeout, read_only=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/falkordb/asyncio/graph.py", line 84, in _query
+    response = await self.execute_command(*command)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 946, in execute_command
+    result = await conn.retry.call_with_retry(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/retry.py", line 81, in call_with_retry
+    raise error
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/retry.py", line 69, in call_with_retry
+    return await do()
+           ^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 871, in _send_command_parse_response
+    return await self.parse_response(conn, command_name, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/client.py", line 993, in parse_response
+    response = await connection.read_response()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/connection.py", line 1299, in read_response
+    response = await self._read_response_from_parser(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/asyncio/connection.py", line 1338, in _read_response_from_parser
+    return await self._parser.read_response(disable_decoding=disable_decoding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/resp2.py", line 89, in read_response
+    response = await self._read_response(disable_decoding=disable_decoding)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/resp2.py", line 97, in _read_response
+    raw = await self._readline()
+          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/xuelingkang/.hermes/kanban/boards/mem0/workspaces/t_d6c9e0a5/.venv-gm/lib/python3.11/site-packages/redis/_parsers/base.py", line 589, in _readline
+    raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+redis.exceptions.ConnectionError: Connection closed by server.
+EXIT=0

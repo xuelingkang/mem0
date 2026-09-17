@@ -1,0 +1,42 @@
+# 资源实测原始输出（2026-09-17，VM docker 实例，macOS 宿主 vz）
+
+$ limactl list
+NAME      STATUS     SSH                VMTYPE    ARCH       CPUS    MEMORY    DISK     DIR
+docker    Running    127.0.0.1:55696    vz        aarch64    2       8GiB      64GiB    ~/.lima/docker
+
+$ limactl shell docker -- free -m            # mem0 四服务在线
+               total        used        free      shared  buff/cache   available
+Mem:            7922         981        3949          17        3215        6941
+Swap:              0           0           0
+
+$ limactl shell docker -- df -h /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda1        61G   20G   42G  32% /
+
+$ limactl shell docker -- sudo docker stats --no-stream --format '{{.Name}}	{{.MemUsage}}	{{.CPUPerc}}'
+gm-probe-neo4j	507.1MiB / 7.737GiB	0.97%
+gm-probe-falkordb	67.49MiB / 7.737GiB	0.40%
+gm-probe-graphiti	145.3MiB / 7.737GiB	0.23%
+mem0-dev-mem0-dashboard-1	106.5MiB / 7.737GiB	0.00%
+mem0-dev-mem0-1	278.4MiB / 7.737GiB	0.28%
+mem0-dev-postgres-1	67.03MiB / 7.737GiB	0.02%
+mem0-dev-qdrant-1	247MiB / 7.737GiB	0.11%
+
+# 分步启动观测（vm_before 为空载基线，vm_after 为图库在册）
+gm-probe-falkordb	62.43MiB / 7.737GiB      ->  gm-probe-falkordb	63.1MiB / 7.737GiB
+
+$ sudo docker exec gm-probe-neo4j cypher-shell -u neo4j -p *** "CALL dbms.listConfig() YIELD name, value WHERE name STARTS WITH 'server.memory' RETURN name, value"
+"server.memory.heap.initial_size", NULL
+"server.memory.heap.max_size", NULL
+"server.memory.pagecache.size", "512.00MiB"
+"server.memory.off_heap.transaction_max_size", "2.00GiB"
+...
+
+$ sudo docker images --format '{{.Repository}}:{{.Tag}}	{{.Size}}'
+falkordb/falkordb:latest	570MB
+zepai/graphiti:latest	582MB
+neo4j:5.26-community	660MB
+qdrant/qdrant:latest	202MB
+
+$ Qdrant GET /collections/memories_2048
+points_count=3612  indexed_vectors_count=3606  vectors.size=2048  sparse=bm25(idf)  on_disk_payload=true

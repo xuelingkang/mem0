@@ -1,0 +1,22 @@
+$ ./.venv-gm/bin/python measure/joinkey_probe.py     # 2026-09-17，FalkorDB 容器 127.0.0.1:16379
+[pre-create] uuid=9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6 db=gm-joinkey-probe2
+[add#1] uuid=9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6 same_as_mid=True nodes=5 edges=4
+[search] fact='薛的 mem0 记忆服务部署在 docker 虚拟机上。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+[search] fact='薛的 mem0 记忆服务部署在一台 lima docker 虚拟机上。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+[search] fact='部署 mem0 记忆服务的 lima docker 虚拟机由 vz 驱动。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+[search] fact='薛拥有一个 mem0 记忆服务。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+[edges total] 4
+    OWNS :: '薛拥有一个 mem0 记忆服务。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+    DRIVEN_BY :: '部署 mem0 记忆服务的 lima docker 虚拟机由 vz 驱动。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+    DEPLOYED_ON :: '薛的 mem0 记忆服务部署在 docker 虚拟机上。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+    DEPLOYED_ON :: '薛的 mem0 记忆服务部署在一台 lima docker 虚拟机上。' episodes=['9c1c9c5e-7673-4069-ad1e-24fea7d7d1c6']
+[add#2 replay] ok nodes=4 edges=3
+[after replay] entity_edges=6 entity_nodes=5
+
+# 图侧已同步判据（redis-cli，gm-joinkey-probe2）：
+#   MATCH (e:Episodic) RETURN e.uuid, size(e.entity_edges)
+#   -> 9c1c9c5e-... , 3
+#
+# 图键机制（同一探针的首轮失败输出）：
+#   driver 指向 database=default_db 而 group_id=gm-joinkey-probe 时：
+#   graphiti_core.errors.NodeNotFoundError: node f7373482-... not found   （预建 episode 落在 default_db，add_episode 读的是 gm-joinkey-probe）

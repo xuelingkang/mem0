@@ -1,0 +1,36 @@
+=== baseline ===
+-ERR Invalid graph operation on empty key
+{'used_memory': '7344312', 'used_memory_human': '7.00M', 'used_memory_rss': '39284736', 'used_memory_rss_human': '37.46M', 'used_memory_peak': '16773456', 'used_memory_peak_human': '16.00M', 'used_memory_peak_time': '1789629413', 'used_memory_peak_perc': '43.79%', 'used_memory_overhead': '2689152', 'used_memory_startup': '2618128', 'used_memory_dataset': '4655160', 'used_memory_dataset_perc': '98.50%', 'allocator_allocated': '12734472'}
+[nodes] 0.0s
+{'used_memory': '9973808', 'used_memory_human': '9.51M', 'used_memory_rss': '39284736', 'used_memory_rss_human': '37.46M', 'used_memory_peak': '16773912', 'used_memory_peak_human': '16.00M', 'used_memory_peak_time': '1789629591', 'used_memory_peak_perc': '59.46%', 'used_memory_overhead': '2689184', 'used_memory_startup': '2618128', 'used_memory_dataset': '7284624', 'used_memory_dataset_perc': '99.03%', 'allocator_allocated': '12734472'}
+[edges] 0.0s
+{'used_memory': '10945456', 'used_memory_human': '10.44M', 'used_memory_rss': '39284736', 'used_memory_rss_human': '37.46M', 'used_memory_peak': '16773912', 'used_memory_peak_human': '16.00M', 'used_memory_peak_time': '1789629591', 'used_memory_peak_perc': '65.25%', 'used_memory_overhead': '2689184', 'used_memory_startup': '2618128', 'used_memory_dataset': '8256272', 'used_memory_dataset_perc': '99.15%', 'allocator_allocated': '12734472'}
+=== graph stats ===
+*3
+*1
+$8
+count(n)
+*1
+*1
+:8150
+*2
+$19
+Cached execution: 0
+$52
+Query internal execution time: 0.142530 milliseconds
+
+*3
+*1
+$8
+count(e)
+*1
+*1
+:3545
+*2
+$19
+Cached execution: 0
+$52
+Query internal execution time: 0.233533 milliseconds
+
+=== after (with graph resident) ===
+{'used_memory': '11039368', 'used_memory_human': '10.53M', 'used_memory_rss': '39284736', 'used_memory_rss_human': '37.46M', 'used_memory_peak': '16773912', 'used_memory_peak_human': '16.00M', 'used_memory_peak_time': '1789629591', 'used_memory_peak_perc': '65.81%', 'used_memory_overhead': '2689184', 'used_memory_startup': '2618128', 'used_memory_dataset': '8350184', 'used_memory_dataset_perc': '99.16%', 'allocator_allocated': '12734472'}

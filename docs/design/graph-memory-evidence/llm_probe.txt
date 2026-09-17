@@ -1,0 +1,12 @@
+$ ./.venv-gm/bin/python measure/llm_probe.py     # 2026-09-17，网关 deepseek-v4.1-flash
+=== OpenAIGenericClient(json_schema) ===
+  FAIL UnprocessableEntityError: Error code: 422 - {'id': 'W0UvGggV', 'error': {'code': '300211', 'message': '[Request ID:W0UvGggV]所有模型提供商均请求失败: deepseek-v4.1-flash失败：400 Bad Request from POST https://api.aimindsky.com/v1/chat/completions，This response_format type is unavailable now', 'param': None, 'type': None}}
+=== OpenAIGenericClient(json_object) ===
+  OK -> {"duplicate_facts": [0], "contradicted_facts": []}
+=== OpenAIClient(responses.parse) ===
+  OK -> {"duplicate_facts": [0], "contradicted_facts": []}
+
+# 补充：json_object 模式在长提示（真实抽取链路）下的稳定表现（见 measure/e2e.log，同一网关）：
+#   Error in generating LLM response: Extra data: line 1 column 847 (char 846)
+#   pydantic ValidationError: 2 validation errors for EdgeDuplicate (duplicate_facts/contradicted_facts Field required)
+#   结论：图桥按 OpenAIClient 的 /responses 通道装配。

@@ -1,0 +1,41 @@
+# 官方镜像 zepai/graphiti:0.30.2 实测（2026-09-17）
+
+$ sudo docker run --rm zepai/graphiti:0.30.2 sh -c 'ls -la /app; python3 -c "import graphiti_core;print(graphiti_core.__file__)"'
+/app/.venv/bin/python
+/app/graph_service  /app/pyproject.toml  /app/uv.lock
+/app/.venv/lib/python3.12/site-packages/graphiti_core/__init__.py
+
+$ sudo docker exec gm-probe-graphiti /app/.venv/bin/python -c "import importlib.util as u; print('falkordb', u.find_spec('falkordb')); print('neo4j', bool(u.find_spec('neo4j')))"
+falkordb None
+neo4j True
+
+$ sudo docker run -d ... -e db_backend=falkordb -e FALKORDB_HOST=... zepai/graphiti:0.30.2
+  File "/app/.venv/lib/python3.12/site-packages/graphiti_core/driver/falkordb_driver.py", line 32, in <module>
+    raise ImportError(
+ImportError: falkordb is required for FalkorDriver. Install it with: pip install graphiti-core[falkordb]
+ERROR:    Application startup failed. Exiting.
+
+$ sudo docker run -d ... -e db_backend=neo4j -e NEO4J_URI=bolt://gm-probe-neo4j:7687 ... zepai/graphiti:0.30.2
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+# 启动期索引声明出现 Schema.EquivalentSchemaRuleAlreadyExists（幂等索引重复声明，非致命）
+
+$ curl -s http://127.0.0.1:18000/healthcheck
+{"status":"healthy"}
+
+$ curl -s -X POST -H 'Content-Type: application/json' -d '{"group_id":"gm-rest-probe","messages":[{"content":"Xue is a backend engineer at XKW, main language Java.","role_type":"user","role":"tester","name":"probe-0","source_description":"probe"}]}' http://127.0.0.1:18000/messages
+{"message":"Messages added to processing queue","success":true}
+
+$ curl -s -X POST -H 'Content-Type: application/json' -d '{"group_ids":["gm-rest-probe"],"query":"What language does Xue use?","max_facts":5}' http://127.0.0.1:18000/search
+Internal Server Error
+
+# 容器日志（节选）：
+#   graphiti_core/embedder/openai.py line 57 in create -> self.client.embeddings.create(...)
+#   openai.UnprocessableEntityError: Error code: 422 - {'error': {'code': '300211',
+#     'message': '...API密钥未配置该模型'}}
+# 说明：OpenAIEmbedder 未取用 EMBEDDING_MODEL_NAME（该字段在 server/graph_service/config.py 声明但未接线），
+#      实际请求 MODE=text-embedding-3-small（graphiti_core.embedder.openai.DEFAULT_EMBEDDING_MODEL）。
+
+# /messages 响应形态（镜像内 graph_service/dto/ingest.py + routers/ingest.py）：
+#   AddMessagesRequest{group_id, messages[{content,uuid,name,role_type,role,timestamp,source_description}]}
+#   响应 Result{message, success}：不回传 episode uuid；REST 面没有创建 episode 的端点。
