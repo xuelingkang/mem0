@@ -175,7 +175,7 @@ class Qdrant(VectorStoreBase):
         # the bi-temporal validity predicates). A keyword index on a date field would
         # make those Range conditions fall back to a full scan.
         keyword_fields = ["user_id", "agent_id", "run_id", "actor_id"]
-        datetime_fields = ["created_at", "valid_at", "invalid_at"]
+        datetime_fields = ["created_at", "valid_at", "invalid_at", "last_accessed"]
 
         for field, field_schema in ((f, "keyword") for f in keyword_fields):
             self._create_payload_index(field, field_schema)
@@ -545,6 +545,28 @@ class Qdrant(VectorStoreBase):
                     collection_name=self.collection_name,
                     points=[PointVectors(id=vector_id, vector=vector)],
                 )
+
+    def update_payload_batch(self, updates: dict) -> None:
+        """Apply payload-only patches to many points in one request (memory decay).
+
+        One `batch_update_points` call carries every patch, so a search that returned N
+        memories still costs a single store request. Each operation is a `SetPayload`,
+        which rewrites only the named keys: vectors (dense and BM25) and every other
+        payload field stay untouched.
+
+        Args:
+            updates: Mapping of point ID -> payload patch. An empty mapping sends nothing.
+        """
+        if not updates:
+            return
+        operations = [
+            models.SetPayload(payload=payload, points=[point_id])
+            for point_id, payload in updates.items()
+        ]
+        self.client.batch_update_points(
+            collection_name=self.collection_name,
+            update_operations=operations,
+        )
 
     def get(self, vector_id: int) -> dict:
         """

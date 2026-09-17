@@ -4,7 +4,9 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
+import threading
 import time
 import uuid
 import warnings
@@ -14,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
-from mem0.configs.base import MemoryConfig, MemoryItem
+from mem0.configs.base import DecayConfig, MemoryConfig, MemoryItem
 from mem0.configs.enums import MemoryType
 from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
@@ -464,9 +466,16 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
 # from the records' own time fields, so the same input always yields the same output.
 # ---------------------------------------------------------------------------
 
+# Payload keys holding the access footprint of a memory (memory decay): `last_accessed`
+# is the moment the record was last returned by a search, `access_count` how many times
+# it has been returned. Declared here because the read paths promote them top-level.
+DECAY_PAYLOAD_KEYS = ("last_accessed", "access_count")
+
 # Payload keys promoted to the top level of every read result. The four bi-temporal
 # fields are ordinary payload fields (no second store), so they belong in the same
-# list; one declaration keeps a read path from leaking them into `metadata`.
+# list; one declaration keeps a read path from leaking them into `metadata`. The two
+# access-footprint fields (memory decay) are promoted for the same reason: they are
+# first-class record attributes, not user metadata.
 BI_TEMPORAL_PAYLOAD_KEYS = [
     "user_id",
     "agent_id",
@@ -479,6 +488,7 @@ BI_TEMPORAL_PAYLOAD_KEYS = [
     "invalid_at",
     "superseded_by",
     "invalid_reason",
+    *DECAY_PAYLOAD_KEYS,
 ]
 
 # Bi-temporal fields, surfaced top-level on every read result (null when not set).
@@ -705,6 +715,229 @@ def _parse_contradiction_pairs(response: Any) -> List[Dict[str, str]]:
     return [pair for pair in pairs if isinstance(pair, dict)]
 
 
+# ---------------------------------------------------------------------------
+# Memory decay (Ebbinghaus retention + access reinforcement)
+#
+# Design: `docs/design/memory-decay.md`. The time factor is a pure function of the
+# record's own footprint (`last_accessed` / `access_count`, falling back to
+# `created_at`) and the injected `now`; it is applied to the hybrid score in the
+# ranking layer of `/search` only -- never in the write pipeline, never as a filter.
+# All arithmetic is UTC and day-based, so the same footprint at the same instant
+# always yields the same factor.
+# ---------------------------------------------------------------------------
+
+# Fields promoted out of `metadata` on every read path: the footprint travels with the
+# record as a first-class attribute (`last_accessed` / `access_count`), see
+# `BI_TEMPORAL_PAYLOAD_KEYS` above.
+_SECONDS_PER_DAY = 86400.0
+
+# Payload fields surfaced in `score_details` under `explain=true` when decay is active.
+# Kept in sync with `mem0.utils.scoring.DECAY_DETAIL_KEYS`.
+DECAY_DETAIL_KEYS = ("decay_weight", "retention", "memory_strength_days", "elapsed_days", "access_count")
+
+
+def _parse_decay_timestamp(value: Any) -> Optional[datetime]:
+    """把足迹 / 入库时间字段解析成带时区的 UTC 时刻；不可解析时返回 None。
+
+    空值与非法值一律视为「无足迹」，由调用方回落到 `created_at` 或 `Δt = 0`。
+    小数秒与时区偏移（含 `Z`）都接受；朴素时间按 UTC 解释，与写入侧
+    `datetime.now(timezone.utc).isoformat()` 的形态一致。
+    """
+    if value is None or isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text[-1] in ("Z", "z"):
+            # `datetime.fromisoformat` only accepts the `Z` suffix from Python 3.11,
+            # and this SDK supports 3.9+.
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _coerce_access_count(value: Any) -> int:
+    """把 `access_count` 归一为非负整数；缺失或非法取 0（等价于「从未被召回」）。"""
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
+
+
+def _decay_retention(
+    elapsed_days: float,
+    access_count: int,
+    *,
+    halflife_days: float,
+    strength_step_days: float,
+    access_cap: int,
+) -> float:
+    """Ebbinghaus 保留率 `R = exp(-Δt / S)`，`S = S₀ + ΔS·min(n, N_cap)`（设计 §3.1-3.2）。
+
+    Δt 以天为单位、沿时间轴正向取；负值（时钟回拨）按 0 处理，使因子退化为 1.0。
+    `access_count` 超过 `access_cap` 后不再增长强度，行为与恰好 `access_cap` 次一致。
+    """
+    counted = min(access_count, access_cap) if access_cap > 0 else 0
+    strength_days = halflife_days + strength_step_days * counted
+    if strength_days <= 0:
+        return 0.0
+    delta = elapsed_days if elapsed_days > 0 else 0.0
+    return math.exp(-delta / strength_days)
+
+
+def _decay_weight(retention: float, floor: float) -> float:
+    """把保留率归一成 [floor, 1] 的时间因子：`FLOOR + (1 - FLOOR)·R`（设计 §3.4）。
+
+    只下调、不放大：`decay_weight <= 1`，因此时间因子永远不能把一条候选的分抬到
+    它的原始语义分之上，新的候选也不会获得额外加成。
+    """
+    return floor + (1.0 - floor) * retention
+
+
+def _decay_factors_for_candidates(
+    candidates: List[Dict[str, Any]],
+    config: DecayConfig,
+    now: datetime,
+) -> Dict[str, Dict[str, Any]]:
+    """为整批候选计算时间因子（同一 `now` 基准，设计 §3.5）。
+
+    每条候选的时间起点取 `last_accessed`，缺失时以 `created_at` 兜底；两者皆缺时
+    `Δt = 0`，时间因子为中性 1.0（存量记录不回填足迹，设计 §4.5）。
+
+    Args:
+        candidates: 打分前的候选，元素含 `id` 与 `payload`。
+        config: 衰减配置（参数与开关）。
+        now: 本次检索统一的时刻基准（UTC）。
+
+    Returns:
+        `{memory_id: {decay_weight, retention, memory_strength_days, elapsed_days, access_count}}`。
+    """
+    factors: Dict[str, Dict[str, Any]] = {}
+    for candidate in candidates:
+        mem_id = candidate.get("id")
+        if mem_id is None:
+            continue
+        payload = candidate.get("payload") or {}
+        reference = _parse_decay_timestamp(payload.get("last_accessed")) or _parse_decay_timestamp(
+            payload.get("created_at")
+        )
+        if reference is None:
+            elapsed_days = 0.0
+        else:
+            elapsed_days = (now - reference).total_seconds() / _SECONDS_PER_DAY
+            if elapsed_days < 0:
+                elapsed_days = 0.0
+        access_count = _coerce_access_count(payload.get("access_count"))
+        retention = _decay_retention(
+            elapsed_days,
+            access_count,
+            halflife_days=config.halflife_days,
+            strength_step_days=config.strength_step_days,
+            access_cap=config.access_cap,
+        )
+        kept = min(access_count, config.access_cap) if config.access_cap > 0 else 0
+        factors[str(mem_id)] = {
+            "decay_weight": _decay_weight(retention, config.floor),
+            "retention": retention,
+            "memory_strength_days": config.halflife_days + config.strength_step_days * kept,
+            "elapsed_days": elapsed_days,
+            "access_count": access_count,
+        }
+    return factors
+
+
+def _dispatch_decay_reinforcement(vector_store, updates: Dict[str, Dict[str, Any]]) -> None:
+    """把强化写入派发到后台线程（设计 §4.3）。
+
+    强化不进入响应时延路径：检索结果先返回，写入在后台线程里补齐；写入失败只记日志，
+    不改变已返回的结果。
+    """
+
+    def _write() -> None:
+        try:
+            vector_store.update_payload_batch(updates)
+        except Exception as e:
+            logger.warning(f"Decay reinforcement write failed for {len(updates)} memories: {e}")
+
+    threading.Thread(target=_write, name="mem0-decay-reinforce", daemon=True).start()
+
+
+def _decay_config_of(memory) -> Optional[DecayConfig]:
+    """取实例的衰减配置段；不是真正的 `DecayConfig` 时返回 None。
+
+    返回 None 在调用方一律等价于「关闭」：本机制对检索路径必须是严格增量的，实例若
+    未携带配置段（子类、测试替身、替身式 MagicMock 配置）就不得产生任何副作用，也不
+    得让替身的属性值流进算式。
+    """
+    config = getattr(getattr(memory, "config", None), "decay", None)
+    return config if isinstance(config, DecayConfig) else None
+
+
+def _reinforce_search_hits(memory, results: List[Dict[str, Any]]) -> None:
+    """给一次 `/search` 的最终返回列表派发访问足迹写入（设计 §4.2-4.3）。
+
+    一次「访问」定义为该记忆出现在最终返回列表中：候选池内被 `top_k` 截断的条目
+    不产生强化。四项写放大控制缺一不可——只动入选条目、合成一次批量写、同一记忆在
+    冷却窗口内只写一次、写入异步入后台线程。
+
+    关闭态下直接返回：不产生任何足迹写入，也不触碰冷却表（设计 §6.2）。因此调用方
+    无需再次判定开关。
+
+    Args:
+        memory: `Memory` / `AsyncMemory` 实例，提供 `config.decay`、`vector_store`
+            以及冷却表 `_decay_write_at` / `_decay_write_lock`。
+        results: 本次检索最终返回的结果列表（元素含 `id`，可能含 `access_count`）。
+    """
+    # 缺配置段一律视为关闭：本机制对检索路径必须是严格增量的，实例若未携带 decay 段
+    # （旧配置对象、子类、测试替身）时不得产生任何副作用。
+    config = _decay_config_of(memory)
+    if config is None or not config.enabled or not isinstance(results, list) or not results:
+        return
+
+    now = datetime.now(timezone.utc)
+    monotonic_now = time.monotonic()
+    cooldown = config.cooldown_seconds
+    updates: Dict[str, Dict[str, Any]] = {}
+
+    with memory._decay_write_lock:
+        for result in results:
+            memory_id = result.get("id")
+            if not memory_id:
+                continue
+            memory_id = str(memory_id)
+            if memory_id in updates:
+                continue
+            last_written = memory._decay_write_at.get(memory_id)
+            if cooldown > 0 and last_written is not None and monotonic_now - last_written < cooldown:
+                # 冷却窗口内的重复命中不累加计数，也不产生写入。
+                continue
+            memory._decay_write_at[memory_id] = monotonic_now
+            updates[memory_id] = {
+                "last_accessed": now.isoformat(),
+                "access_count": _coerce_access_count(result.get("access_count")) + 1,
+            }
+        # 冷却表只保留窗口内的条目：窗口为 0 时没有条目可以留在表里，因此表不会随
+        # 检索量无限增长。
+        for memory_id in [
+            mid for mid, at in memory._decay_write_at.items() if monotonic_now - at >= cooldown
+        ]:
+            memory._decay_write_at.pop(memory_id, None)
+
+    if updates:
+        _dispatch_decay_reinforcement(memory.vector_store, updates)
+
+
 setup_config()
 logger = logging.getLogger(__name__)
 
@@ -767,6 +1000,11 @@ class Memory(MemoryBase):
         # Entity store is initialized lazily on first use
         self._entity_store = None
 
+        # 检索强化的进程内冷却表：memory_id -> 上次写入的单调时刻。请求路径只做
+        # 查表/登记，真正的 payload 写在后台线程执行（设计 §4.3）。
+        self._decay_write_at: Dict[str, float] = {}
+        self._decay_write_lock = threading.Lock()
+
         if MEM0_TELEMETRY:
             # Create telemetry config manually to avoid deepcopy issues with thread locks
             telemetry_config_dict = {}
@@ -808,6 +1046,18 @@ class Memory(MemoryBase):
     @property
     def project(self):
         return _OSSProject()
+
+    @property
+    def decay_config(self) -> DecayConfig:
+        """记忆衰减配置（设计 `docs/design/memory-decay.md`，配置段 `MemoryConfig.decay`）。"""
+        return self.config.decay
+
+    def _decay_factors(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Dict[str, Any]]]:
+        """本次检索的时间因子表；关闭态返回 None，使打分器走原有的纯混合分路径。"""
+        config = _decay_config_of(self)
+        if config is None or not config.enabled:
+            return None
+        return _decay_factors_for_candidates(candidates, config, datetime.now(timezone.utc))
 
     @property
     def entity_store(self):
@@ -1836,6 +2086,10 @@ class Memory(MemoryBase):
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
 
+        # 强化只针对最终入选（本次 rerank 之后）的条目；关闭态下为空操作，且异步派发
+        # 不进入响应时延路径（设计 §4.2-4.3）。
+        _reinforce_search_hits(self, original_memories)
+
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
         elif scale_threshold_notice:
@@ -2009,6 +2263,7 @@ class Memory(MemoryBase):
             })
 
         # Step 8: Score and rank
+        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -2016,6 +2271,7 @@ class Memory(MemoryBase):
             threshold=threshold,
             top_k=limit,
             explain=explain,
+            decay_factors=self._decay_factors(candidates),
         )
 
         # Step 9: Format results
@@ -2515,6 +2771,11 @@ class AsyncMemory(MemoryBase):
         self.custom_instructions = self.config.custom_instructions
         self._entity_store = None
 
+        # 检索强化的进程内冷却表：memory_id -> 上次写入的单调时刻（设计 §4.3，与
+        # 同步实现的语义一致）。
+        self._decay_write_at: Dict[str, float] = {}
+        self._decay_write_lock = threading.Lock()
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
@@ -2546,6 +2807,18 @@ class AsyncMemory(MemoryBase):
     @property
     def project(self):
         return _AsyncOSSProject()
+
+    @property
+    def decay_config(self) -> DecayConfig:
+        """记忆衰减配置（设计 `docs/design/memory-decay.md`，配置段 `MemoryConfig.decay`）。"""
+        return self.config.decay
+
+    def _decay_factors(self, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Dict[str, Any]]]:
+        """本次检索的时间因子表；关闭态返回 None，使打分器走原有的纯混合分路径。"""
+        config = _decay_config_of(self)
+        if config is None or not config.enabled:
+            return None
+        return _decay_factors_for_candidates(candidates, config, datetime.now(timezone.utc))
 
     @property
     def entity_store(self):
@@ -3573,6 +3846,10 @@ class AsyncMemory(MemoryBase):
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
 
+        # 强化只针对最终入选（本次 rerank 之后）的条目；关闭态下为空操作，且异步派发
+        # 不进入响应时延路径（设计 §4.2-4.3）。
+        _reinforce_search_hits(self, original_memories)
+
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
         elif scale_threshold_notice:
@@ -3745,6 +4022,7 @@ class AsyncMemory(MemoryBase):
             })
 
         # Step 8: Score and rank
+        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -3752,6 +4030,7 @@ class AsyncMemory(MemoryBase):
             threshold=threshold,
             top_k=limit,
             explain=explain,
+            decay_factors=self._decay_factors(candidates),
         )
 
         # Step 9: Format results

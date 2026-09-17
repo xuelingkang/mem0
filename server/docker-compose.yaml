@@ -30,6 +30,14 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - AUTH_DISABLED=${AUTH_DISABLED:-false}
       - MEM0_TELEMETRY=${MEM0_TELEMETRY:-true}
+      # Retrieval decay knobs (optional): unset means the SDK defaults are used, and
+      # `enabled=false` keeps retrieval byte-identical to pre-decay releases.
+      - MEM0_DECAY_ENABLED=${MEM0_DECAY_ENABLED:-false}
+      - MEM0_DECAY_HALFLIFE_DAYS=${MEM0_DECAY_HALFLIFE_DAYS:-}
+      - MEM0_DECAY_STRENGTH_STEP_DAYS=${MEM0_DECAY_STRENGTH_STEP_DAYS:-}
+      - MEM0_DECAY_ACCESS_CAP=${MEM0_DECAY_ACCESS_CAP:-}
+      - MEM0_DECAY_FLOOR=${MEM0_DECAY_FLOOR:-}
+      - MEM0_DECAY_COOLDOWN_SECONDS=${MEM0_DECAY_COOLDOWN_SECONDS:-}
 
   postgres:
       image: pgvector/pgvector:pg17

@@ -56,6 +56,16 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
 
 ENTITY_BOOST_WEIGHT = 0.5
 
+# Time-factor components published in `score_details` when decay is active. The scorer
+# only copies them through, so the field names stay owned by the decay implementation.
+DECAY_DETAIL_KEYS = (
+    "decay_weight",
+    "retention",
+    "memory_strength_days",
+    "elapsed_days",
+    "access_count",
+)
+
 
 def score_and_rank(
     semantic_results: List[Dict[str, Any]],
@@ -64,12 +74,14 @@ def score_and_rank(
     threshold: float,
     top_k: int,
     explain: bool = False,
+    decay_factors: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Score candidates additively and return top-k results.
 
     For each candidate:
         semantic_score is taken from the result's score field.
         combined = (semantic + bm25 + entity_boost) / max_possible
+        final_score = combined * decay_weight
 
     Threshold gates the semantic score BEFORE combining -- candidates
     below the threshold are excluded even if BM25/entity would boost them.
@@ -80,6 +92,10 @@ def score_and_rank(
         - Semantic + BM25 + entity: max_possible = 2.5
         - Semantic + entity (no BM25): max_possible = 1.5
 
+    The time factor is applied after combining and before ranking, so it can only
+    reorder candidates that are already in the pool: it is a multiplier bounded by
+    [floor, 1].0 in the caller, never a filter.
+
     Args:
         semantic_results: Candidate memories from vector search.
         bm25_scores: Normalized keyword scores keyed by memory ID.
@@ -87,10 +103,16 @@ def score_and_rank(
         threshold: Minimum semantic score required before hybrid scoring.
         top_k: Maximum number of results to return.
         explain: Include score_details in each result when true.
+        decay_factors: Optional per-candidate time factor keyed by memory ID, each entry
+            carrying `decay_weight` plus the explanatory components listed in
+            `DECAY_DETAIL_KEYS`. Candidates absent from the mapping (and every candidate
+            when the mapping is omitted or empty) score exactly as they did before the
+            time factor existed.
 
     Returns:
         List of scored result dicts sorted by combined score descending.
     """
+
     has_bm25 = bool(bm25_scores)
     has_entity = bool(entity_boosts)
 
@@ -118,21 +140,31 @@ def score_and_rank(
         raw_combined = semantic_score + bm25_score + entity_boost
         combined = min(raw_combined / max_possible, 1.0)
 
+        # Time factor: a bounded multiplier on the hybrid score, never a filter.
+        decay = decay_factors.get(mem_id_str) if decay_factors else None
+        final_score = combined if decay is None else combined * float(decay.get("decay_weight", 1.0))
+
         scored_result = {
             "id": mem_id_str,
-            "score": combined,
+            "score": final_score,
             "payload": result.get("payload"),
         }
         if explain:
-            scored_result["score_details"] = {
+            score_details = {
                 "semantic_score": semantic_score,
                 "bm25_score": bm25_score,
                 "entity_boost": entity_boost,
                 "raw_score": raw_combined,
                 "max_possible_score": max_possible,
-                "final_score": combined,
+                "final_score": final_score,
                 "threshold": threshold,
             }
+            if decay is not None:
+                # 五项分量：时间因子本身 + 四项可解释输入（设计 §5.3）。关闭态下不出现，
+                # 使 explain 输出与引入本机制之前逐位一致。
+                for key in DECAY_DETAIL_KEYS:
+                    score_details[key] = decay.get(key)
+            scored_result["score_details"] = score_details
         scored.append(scored_result)
 
     scored.sort(key=lambda x: x["score"], reverse=True)

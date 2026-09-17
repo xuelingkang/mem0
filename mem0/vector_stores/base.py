@@ -82,6 +82,24 @@ class VectorStoreBase(ABC):
         """
         return None
 
+    def update_payload_batch(self, updates: dict) -> None:
+        """Apply payload-only patches to several points in one request.
+
+        Used by memory decay to record the access footprint (`last_accessed` /
+        `access_count`) of the memories a search returned. Implementations must not
+        touch vectors or any other payload field, and must send the whole mapping as
+        a single store request.
+
+        The default implementation is a no-op: a store that cannot patch payloads in
+        bulk simply records no footprint, and search keeps working (the time factor
+        then degrades to `created_at` / 0 for those records).
+
+        Args:
+            updates: Mapping of point ID -> payload patch (only the keys to update).
+                An empty mapping must send no request at all.
+        """
+        return None
+
     def search_batch(self, queries: list, vectors_list: list, top_k: int = 1, filters: dict = None):
         """Batch search for multiple queries at once.
 

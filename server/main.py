@@ -137,6 +137,40 @@ EMBEDDING_DIMS = int(
     or "2048"
 )
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env override; leave the SDK default in place when unset."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_number(name: str, default, cast):
+    """Read a numeric env override, falling back to the SDK default on bad input."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return cast(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+# Retrieval decay (memory decay): the SDK owns the semantics of these knobs
+# (`mem0.configs.base.DecayConfig`), this block only lets a deployment override the
+# defaults through the environment without editing code. `enabled` stays off unless
+# asked for, which keeps the retrieval behaviour byte-identical to pre-decay releases.
+DECAY_CONFIG = {
+    "enabled": _env_flag("MEM0_DECAY_ENABLED", False),
+    "halflife_days": _env_number("MEM0_DECAY_HALFLIFE_DAYS", 12.0, float),
+    "strength_step_days": _env_number("MEM0_DECAY_STRENGTH_STEP_DAYS", 3.0, float),
+    "access_cap": _env_number("MEM0_DECAY_ACCESS_CAP", 20, int),
+    "floor": _env_number("MEM0_DECAY_FLOOR", 0.90, float),
+    "cooldown_seconds": _env_number("MEM0_DECAY_COOLDOWN_SECONDS", 300.0, float),
+}
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -154,6 +188,7 @@ DEFAULT_CONFIG = {
     },
     "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": EMBEDDING_DIMS}},
     "history_db_path": HISTORY_DB_PATH,
+    "decay": DECAY_CONFIG,
 }
 
 
@@ -410,7 +445,8 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
 ALL_MEMORIES_LIMIT = 1000
 # Payload keys surfaced as first-class fields: they are pulled out of `metadata` so a
 # client never sees a bi-temporal field nested under it (the four fields sit one level
-# up, next to `hash` and `created_at`).
+# up, next to `hash` and `created_at`). The two access-footprint fields (memory decay)
+# are the same kind of record attribute and are reserved here as well.
 _RESERVED_PAYLOAD_KEYS = {
     "data",
     "user_id",
@@ -424,6 +460,8 @@ _RESERVED_PAYLOAD_KEYS = {
     "invalid_at",
     "superseded_by",
     "invalid_reason",
+    "last_accessed",
+    "access_count",
 }
 
 
@@ -443,6 +481,10 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
         "invalid_at": payload.get("invalid_at"),
         "superseded_by": payload.get("superseded_by"),
         "invalid_reason": payload.get("invalid_reason"),
+        # Access footprint (memory decay): null until the record is first returned by a
+        # search, so the response shape stays stable for clients.
+        "last_accessed": payload.get("last_accessed"),
+        "access_count": payload.get("access_count"),
         "metadata": {k: v for k, v in payload.items() if k not in _RESERVED_PAYLOAD_KEYS},
         "created_at": payload.get("created_at"),
         "updated_at": payload.get("updated_at"),
@@ -528,6 +570,8 @@ EXPORT_CSV_COLUMNS = [
     "invalid_at",
     "superseded_by",
     "invalid_reason",
+    "last_accessed",
+    "access_count",
     "created_at",
     "updated_at",
 ]

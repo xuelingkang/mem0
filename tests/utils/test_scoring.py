@@ -1,6 +1,7 @@
 import pytest
 
 from mem0.utils.scoring import (
+    DECAY_DETAIL_KEYS,
     get_bm25_params,
     normalize_bm25,
     score_and_rank,
@@ -154,6 +155,48 @@ class TestScoreAndRank:
         results = [{"id": "a", "score": 0.8, "payload": {"data": "mem a"}}]
         scored = score_and_rank(results, {}, {}, threshold=0.1, top_k=10)
         assert "score_details" not in scored[0]
+
+    def test_no_decay_factors_keeps_the_explain_shape(self):
+        """关闭态（未传时间因子）不得新增任何 score_details 键。"""
+        results = [{"id": "a", "score": 0.8, "payload": {"data": "mem a"}}]
+        scored = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, explain=True, decay_factors=None)
+        assert scored[0]["score_details"] == score_and_rank(results, {}, {}, threshold=0.1, top_k=10, explain=True)[0][
+            "score_details"
+        ]
+        assert "decay_weight" not in scored[0]["score_details"]
+
+    def test_decay_factor_multiplies_combined_score(self):
+        results = [{"id": "a", "score": 0.8, "payload": {"data": "mem a"}}]
+        factors = {
+            "a": {
+                "decay_weight": 0.9,
+                "retention": 0.0,
+                "memory_strength_days": 12.0,
+                "elapsed_days": 500.0,
+                "access_count": 0,
+            }
+        }
+        scored = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, explain=True, decay_factors=factors)
+        assert scored[0]["score"] == pytest.approx(0.72)
+        details = scored[0]["score_details"]
+        assert details["final_score"] == pytest.approx(0.72)
+        assert details["semantic_score"] == 0.8
+        assert details["decay_weight"] == 0.9
+        assert details["elapsed_days"] == 500.0
+        assert details["access_count"] == 0
+        assert set(details) >= set(DECAY_DETAIL_KEYS)
+
+    def test_candidates_missing_from_the_mapping_score_unchanged(self):
+        results = [
+            {"id": "a", "score": 0.8, "payload": {}},
+            {"id": "b", "score": 0.7, "payload": {}},
+        ]
+        scored = score_and_rank(
+            results, {}, {}, threshold=0.1, top_k=10, decay_factors={"a": {"decay_weight": 0.9}}
+        )
+        by_id = {r["id"]: r["score"] for r in scored}
+        assert by_id["a"] == pytest.approx(0.72)
+        assert by_id["b"] == pytest.approx(0.7)
 
 
 class TestEntityBoostWeight:
