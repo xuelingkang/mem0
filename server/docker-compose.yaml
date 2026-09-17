@@ -38,6 +38,15 @@ services:
       - MEM0_DECAY_ACCESS_CAP=${MEM0_DECAY_ACCESS_CAP:-}
       - MEM0_DECAY_FLOOR=${MEM0_DECAY_FLOOR:-}
       - MEM0_DECAY_COOLDOWN_SECONDS=${MEM0_DECAY_COOLDOWN_SECONDS:-}
+      # Dream (background memory synthesis). Off by default: it writes new records, so it
+      # never turns itself on during an upgrade. `DREAM_ENABLED=true` starts the periodic
+      # thread and enables POST /dream/run and POST /dream/preview (409 while disabled).
+      - DREAM_ENABLED=${DREAM_ENABLED:-false}
+      - DREAM_INTERVAL_SECONDS=${DREAM_INTERVAL_SECONDS:-}
+      - DREAM_INITIAL_DELAY_SECONDS=${DREAM_INITIAL_DELAY_SECONDS:-}
+      - DREAM_RUN_TIMEOUT_SECONDS=${DREAM_RUN_TIMEOUT_SECONDS:-}
+      - DREAM_PER_CLUSTER_TIMEOUT_SECONDS=${DREAM_PER_CLUSTER_TIMEOUT_SECONDS:-}
+      - DREAM_REPORT_DIR=${DREAM_REPORT_DIR:-}
 
   postgres:
       image: pgvector/pgvector:pg17

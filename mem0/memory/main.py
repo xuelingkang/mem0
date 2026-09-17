@@ -25,6 +25,7 @@ from mem0.configs.prompts import (
     BITEMP_EPOCH,
     CONTRADICTION_DETECTION_PROMPT,
     INVALID_REASON_SUPERSEDED,
+    MEMORY_KIND_OBSERVATION,
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     generate_additive_extraction_prompt,
     generate_contradiction_detection_prompt,
@@ -475,7 +476,17 @@ DECAY_PAYLOAD_KEYS = ("last_accessed", "access_count")
 # fields are ordinary payload fields (no second store), so they belong in the same
 # list; one declaration keeps a read path from leaking them into `metadata`. The two
 # access-footprint fields (memory decay) are promoted for the same reason: they are
-# first-class record attributes, not user metadata.
+# first-class record attributes, not user metadata. The observation fields (Dream) are
+# the same kind of attribute: an observation's evidence chain must be readable without
+# digging into `metadata`.
+OBSERVATION_PAYLOAD_KEYS = (
+    "memory_kind",
+    "observation_key",
+    "source_memory_ids",
+    "evidence_count",
+    "dream_run_id",
+)
+
 BI_TEMPORAL_PAYLOAD_KEYS = [
     "user_id",
     "agent_id",
@@ -489,6 +500,7 @@ BI_TEMPORAL_PAYLOAD_KEYS = [
     "superseded_by",
     "invalid_reason",
     *DECAY_PAYLOAD_KEYS,
+    *OBSERVATION_PAYLOAD_KEYS,
 ]
 
 # Bi-temporal fields, surfaced top-level on every read result (null when not set).
@@ -664,18 +676,37 @@ def _with_bitemporal_filter(
     filters: Optional[Dict[str, Any]],
     as_of: Any = None,
     include_invalidated: bool = False,
+    include_observations: bool = False,
 ) -> Dict[str, Any]:
-    """把有效事实谓词与业务 filters 以 AND 合并，供所有读路径共用。
+    """把有效事实谓词（以及可选的「排除观察」谓词）与业务 filters 以 AND 合并。
 
     合并（而非就地改写）保证调用方传入的 filters 不被污染，也保证 `include_invalidated`
-    时原样返回、不加任何时间条件。
+    时原样返回、不加任何时间条件。「排除观察」谓词只作用于 `memory_kind` 已赋值的
+    记录——既有事实条目没有该字段，Qdrant 的 `MatchValue` 不匹配缺失字段，取反后
+    全部放行（设计 §5.5、§8）。
+
+    Args:
+        filters: 业务过滤条件（含作用域）。
+        as_of: point-in-time 时刻；None 表示当前。
+        include_invalidated: 为 True 时不加有效性谓词。
+        include_observations: 为 True 时不排除观察条目（读路径显式纳入）。
+
+    Returns:
+        合并后的过滤条件；两端都为空时返回空字典。
     """
-    predicate = _bitemporal_filter(as_of, include_invalidated)
-    if predicate is None:
-        return dict(filters) if filters else {}
-    if not filters:
-        return predicate
-    return {"AND": [dict(filters), predicate]}
+    predicates = []
+    bitemporal = _bitemporal_filter(as_of, include_invalidated)
+    if bitemporal is not None:
+        predicates.append(bitemporal)
+    if not include_observations:
+        predicates.append({"NOT": [{"memory_kind": {"eq": MEMORY_KIND_OBSERVATION}}]})
+
+    base = dict(filters) if filters else {}
+    if not predicates:
+        return base
+    if not base:
+        return predicates[0] if len(predicates) == 1 else {"AND": predicates}
+    return {"AND": [base, *predicates]}
 
 
 def _scope_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1432,6 +1463,8 @@ class Memory(MemoryBase):
         # Phase 1: Existing memory retrieval
         # 只取有效事实，且 top_k 提升为候选池大小：该结果既作 1a 的去重参考，也作 1b 的候选池。
         # 检索必须排除已失效记录，否则 hash 去重会把「同一事实失效后重新出现」挡在门外（方案 3.3）。
+        # 同时排除观察条目（Dream）：观察是合成信念，既不该成为 1a 的去重参照，也不该成为
+        # 1b 的矛盾检测对象（设计 §3.2）。
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         query_embedding = self.embedding_model.embed(parsed_messages, "search")
         existing_results = self.vector_store.search(
@@ -1831,6 +1864,7 @@ class Memory(MemoryBase):
         show_expired: bool = False,
         as_of: Optional[str] = None,
         include_invalidated: bool = False,
+        include_observations: bool = False,
         **kwargs,
     ):
         """
@@ -1846,6 +1880,9 @@ class Memory(MemoryBase):
                 were valid at T (point-in-time). None means the current moment.
             include_invalidated (bool, optional): Return invalidated facts too, ignoring the
                 validity filter. Defaults to False.
+            include_observations (bool, optional): Include Dream observations. Defaults to
+                False (observations are synthesized beliefs, not user memories; the
+                management listing is the path that asks for them explicitly).
 
         Returns:
             dict: A dictionary containing a list of memories under the "results" key.
@@ -1892,7 +1929,9 @@ class Memory(MemoryBase):
             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"}
         )
 
-        all_memories_result = self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
+        all_memories_result = self._get_all_from_vector_store(
+            effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated, include_observations
+        )
 
         if scale_threshold_notice:
             display_scale_threshold_notice(self, "sync", "get_all", *scale_threshold_notice)
@@ -1901,10 +1940,18 @@ class Memory(MemoryBase):
         return {"results": all_memories_result}
 
     def _get_all_from_vector_store(
-        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
+        self,
+        filters,
+        limit,
+        show_expired=False,
+        output_limit=None,
+        as_of=None,
+        include_invalidated=False,
+        include_observations=False,
     ):
         memories_result = self.vector_store.list(
-            filters=_with_bitemporal_filter(filters, as_of, include_invalidated), top_k=limit
+            filters=_with_bitemporal_filter(filters, as_of, include_invalidated, include_observations),
+            top_k=limit,
         )
 
         # Handle different vector store return formats by inspecting first element
@@ -1965,6 +2012,7 @@ class Memory(MemoryBase):
         show_expired: bool = False,
         as_of: Optional[str] = None,
         include_invalidated: bool = False,
+        include_observations: bool = False,
         **kwargs,
     ):
         """
@@ -2002,6 +2050,10 @@ class Memory(MemoryBase):
                 were valid at T (point-in-time). None means the current moment.
             include_invalidated (bool, optional): Return invalidated facts too, ignoring the
                 validity filter. Defaults to False.
+            include_observations (bool, optional): Include Dream observations in the
+                candidate set. Defaults to False: observations are synthesized beliefs and
+                are not part of the memory-injection path unless asked for. The flag only
+                widens the candidate set -- the scoring function is untouched.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
@@ -2075,7 +2127,7 @@ class Memory(MemoryBase):
         search_start = time.perf_counter()
         original_memories = self._search_vector_store(
             query,
-            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
+            _with_bitemporal_filter(effective_filters, as_of, include_invalidated, include_observations),
             limit,
             threshold,
             explain=explain,
@@ -3582,6 +3634,7 @@ class AsyncMemory(MemoryBase):
         show_expired: bool = False,
         as_of: Optional[str] = None,
         include_invalidated: bool = False,
+        include_observations: bool = False,
         **kwargs,
     ):
         """
@@ -3643,7 +3696,9 @@ class AsyncMemory(MemoryBase):
             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"}
         )
 
-        all_memories_result = await self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
+        all_memories_result = await self._get_all_from_vector_store(
+            effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated, include_observations
+        )
 
         if scale_threshold_notice:
             await display_scale_threshold_notice_async(self, "async", "get_all", *scale_threshold_notice)
@@ -3652,11 +3707,18 @@ class AsyncMemory(MemoryBase):
         return {"results": all_memories_result}
 
     async def _get_all_from_vector_store(
-        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
+        self,
+        filters,
+        limit,
+        show_expired=False,
+        output_limit=None,
+        as_of=None,
+        include_invalidated=False,
+        include_observations=False,
     ):
         memories_result = await asyncio.to_thread(
             self.vector_store.list,
-            filters=_with_bitemporal_filter(filters, as_of, include_invalidated),
+            filters=_with_bitemporal_filter(filters, as_of, include_invalidated, include_observations),
             top_k=limit,
         )
 
@@ -3718,6 +3780,7 @@ class AsyncMemory(MemoryBase):
         show_expired: bool = False,
         as_of: Optional[str] = None,
         include_invalidated: bool = False,
+        include_observations: bool = False,
         **kwargs,
     ):
         """
@@ -3755,6 +3818,10 @@ class AsyncMemory(MemoryBase):
                 were valid at T (point-in-time). None means the current moment.
             include_invalidated (bool, optional): Return invalidated facts too, ignoring the
                 validity filter. Defaults to False.
+            include_observations (bool, optional): Include Dream observations in the
+                candidate set. Defaults to False: observations are synthesized beliefs and
+                are not part of the memory-injection path unless asked for. The flag only
+                widens the candidate set -- the scoring function is untouched.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
@@ -3832,7 +3899,7 @@ class AsyncMemory(MemoryBase):
         search_start = time.perf_counter()
         original_memories = await self._search_vector_store(
             query,
-            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
+            _with_bitemporal_filter(effective_filters, as_of, include_invalidated, include_observations),
             limit,
             threshold,
             explain=explain,

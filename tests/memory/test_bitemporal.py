@@ -232,7 +232,17 @@ class TestBitemporalFilter:
 
     def test_include_invalidated_drops_the_predicate_entirely(self):
         assert _bitemporal_filter(include_invalidated=True) is None
-        assert _with_bitemporal_filter({"user_id": "u"}, include_invalidated=True) == {"user_id": "u"}
+        # `include_invalidated` only drops the *validity* predicate. The Dream observation
+        # exclusion is a separate default on the read path (memory-dream design §5.5): it
+        # survives as long as observations are not explicitly asked for, and disappears
+        # once they are.
+        assert _with_bitemporal_filter({"user_id": "u"}, include_invalidated=True) == {
+            "AND": [{"user_id": "u"}, {"NOT": [{"memory_kind": {"eq": "observation"}}]}]
+        }
+        assert (
+            _with_bitemporal_filter({"user_id": "u"}, include_invalidated=True, include_observations=True)
+            == {"user_id": "u"}
+        )
 
     def test_scope_filters_are_combined_by_and_not_overwritten(self):
         merged = _with_bitemporal_filter({"user_id": "u"})

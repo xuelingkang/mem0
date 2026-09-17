@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,7 @@ import telemetry
 from auth import ADMIN_API_KEY, AUTH_DISABLED, JWT_SECRET, require_admin, verify_auth
 from db import SessionLocal
 from dotenv import load_dotenv
+from dream_scheduler import DreamScheduler, configure_scheduler
 from errors import (
     UpstreamError,
     install_request_id_logging,
@@ -27,6 +29,7 @@ from pydantic import BaseModel, Field
 from rate_limit import limiter
 from routers import api_keys as api_keys_router
 from routers import auth as auth_router
+from routers import dream as dream_router
 from routers import entities as entities_router
 from routers import requests as requests_router
 from schemas import MessageResponse
@@ -171,6 +174,20 @@ DECAY_CONFIG = {
     "cooldown_seconds": _env_number("MEM0_DECAY_COOLDOWN_SECONDS", 300.0, float),
 }
 
+# Dream (background memory synthesis): the integration subsystem keeps its own knobs and
+# stays off unless asked for. It is the one feature here that *writes* new records on its
+# own schedule, so it must never switch itself on during an upgrade; `enabled=false` keeps
+# both the periodic thread and the two trigger endpoints inert.
+DREAM_CONFIG = {
+    "enabled": _env_flag("DREAM_ENABLED", False),
+    "interval_seconds": _env_number("DREAM_INTERVAL_SECONDS", 86400.0, float),
+    "initial_delay_seconds": _env_number("DREAM_INITIAL_DELAY_SECONDS", 1800.0, float),
+    "run_timeout_seconds": _env_number("DREAM_RUN_TIMEOUT_SECONDS", 1800.0, float),
+    "per_cluster_timeout_seconds": _env_number("DREAM_PER_CLUSTER_TIMEOUT_SECONDS", 60.0, float),
+    "report_dir": os.environ.get("DREAM_REPORT_DIR", "/app/history/dream-reports"),
+    "lock_path": os.environ.get("DREAM_LOCK_PATH", "/app/history/dream.lock"),
+}
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -189,11 +206,29 @@ DEFAULT_CONFIG = {
     "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": EMBEDDING_DIMS}},
     "history_db_path": HISTORY_DB_PATH,
     "decay": DECAY_CONFIG,
+    "dream": DREAM_CONFIG,
 }
 
 
 set_session_factory(SessionLocal)
 initialize_state(DEFAULT_CONFIG)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """挂载 Dream 的进程内调度线程（设计 §5.6）。
+
+    调度器只在 `dream.enabled=true` 时真正启动周期线程；关闭态下 `start()` 立即返回，
+    `POST /dream/*` 由端点翻译成 409。关停信号置位后线程在单簇边界处退出。
+    """
+    scheduler = DreamScheduler(get_config=get_current_config, get_memory=get_memory_instance)
+    configure_scheduler(scheduler)
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.stop()
+        configure_scheduler(None)
 
 
 app = FastAPI(
@@ -206,6 +241,7 @@ app = FastAPI(
     ),
     version="1.0.0",
     redirect_slashes=False,
+    lifespan=_lifespan,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -223,6 +259,7 @@ app.include_router(auth_router.router)
 app.include_router(api_keys_router.router)
 app.include_router(entities_router.router)
 app.include_router(requests_router.router)
+app.include_router(dream_router.router)
 
 
 class Message(BaseModel):
@@ -264,6 +301,14 @@ class SearchRequest(BaseModel):
     )
     include_invalidated: Optional[bool] = Field(
         None, description="Return invalidated facts too, ignoring the bi-temporal validity filter."
+    )
+    include_observations: Optional[bool] = Field(
+        None,
+        description=(
+            "Include Dream observations in the candidate set. Defaults to false: observations "
+            "are synthesized beliefs, not user memories, so they stay out of the memory-injection "
+            "path unless asked for. The flag only widens the candidate set -- scoring is untouched."
+        ),
     )
 
 
@@ -462,6 +507,13 @@ _RESERVED_PAYLOAD_KEYS = {
     "invalid_reason",
     "last_accessed",
     "access_count",
+    # Dream observation payload: an observation's evidence chain is a first-class
+    # attribute of the record (design §5.5 / §6.4), so it is never nested in `metadata`.
+    "memory_kind",
+    "observation_key",
+    "source_memory_ids",
+    "evidence_count",
+    "dream_run_id",
 }
 
 
@@ -485,6 +537,13 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
         # search, so the response shape stays stable for clients.
         "last_accessed": payload.get("last_accessed"),
         "access_count": payload.get("access_count"),
+        # Dream observation attributes: null on a plain fact, which is the "no observation
+        # fields at all" case made explicit rather than absent (design §4.1).
+        "memory_kind": payload.get("memory_kind"),
+        "observation_key": payload.get("observation_key"),
+        "source_memory_ids": payload.get("source_memory_ids"),
+        "evidence_count": payload.get("evidence_count"),
+        "dream_run_id": payload.get("dream_run_id"),
         "metadata": {k: v for k, v in payload.items() if k not in _RESERVED_PAYLOAD_KEYS},
         "created_at": payload.get("created_at"),
         "updated_at": payload.get("updated_at"),
@@ -551,6 +610,10 @@ def get_all_memories(
         if top_k is not None:
             params["top_k"] = top_k
         params["show_expired"] = show_expired
+        # Management listing stays full: the SDK's default read excludes Dream observations
+        # (they are synthesized beliefs, not injected memories), but the dashboard and the
+        # export must not show a dataset smaller than the inventory (design §5.5).
+        params["include_observations"] = True
         return get_memory_instance().get_all(**params)
     except HTTPException:
         raise
@@ -572,6 +635,11 @@ EXPORT_CSV_COLUMNS = [
     "invalid_reason",
     "last_accessed",
     "access_count",
+    "memory_kind",
+    "observation_key",
+    "source_memory_ids",
+    "evidence_count",
+    "dream_run_id",
     "created_at",
     "updated_at",
 ]
@@ -668,6 +736,8 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
             params["as_of"] = search_req.as_of
         if search_req.include_invalidated is not None:
             params["include_invalidated"] = search_req.include_invalidated
+        if search_req.include_observations is not None:
+            params["include_observations"] = search_req.include_observations
         return get_memory_instance().search(query=search_req.query, filters=filters, **params)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

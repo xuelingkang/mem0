@@ -1019,6 +1019,104 @@ BITEMP_CANDIDATE_K = 20
 
 
 # ---------------------------------------------------------------------------
+# V5 Dream: 后台记忆整合（观察合成）
+#
+# 设计见 `docs/design/memory-dream.md`。这里只放与 LLM 交互有关的常量与提示词：
+# 聚类参数（Gather 的确定性纯函数）与其余流程常量也集中在此，便于单点调参。
+# `OBSERVATION_SYNTHESIS_PROMPT` 与 1a（ADDITIVE_EXTRACTION_PROMPT）、
+# 1b（CONTRADICTION_DETECTION_PROMPT）三者互不共享任何指令文本。
+# ---------------------------------------------------------------------------
+
+# 观察条目的 payload 标记。**事实条目不写该字段**——键缺失即「事实」，因此存量记录
+# 天然是事实，无需回填。
+MEMORY_KIND_OBSERVATION = "observation"
+
+# `invalid_reason` 新增取值：观察的成员集合发生变化，该版本已被新版本取代（Dream P11）。
+INVALID_REASON_OBSERVATION_RECOMPUTED = "observation_recomputed"
+
+# Gather 聚类参数（依据设计 §6.2 对 xue/ying 语料的参数扫描：0.82 得 96 簇 / 478 成员，
+# 簇均规模 5.0 且簇内主题可辨识）。
+DREAM_TAU = 0.82
+DREAM_MIN_CLUSTER_SIZE = 4
+DREAM_MAX_CLUSTER_SIZE = 15
+# 单轮簇数上限；超出部分记入 deferred，下一轮继续（设计 §5.2.3 的 G4）。
+DREAM_MAX_CLUSTERS_PER_RUN = 120
+
+OBSERVATION_SYNTHESIS_PROMPT = """# 角色
+
+你是记忆整合器。你的唯一职责是把一组彼此相关的事实提炼成一条更高层的「观察」（observation）。
+
+你不改写任何一条源事实，不删除任何一条源事实。你只新增一条概括性判断。
+
+# 什么算一条合格的观察
+
+一条观察必须同时满足：
+
+1. **更高层**：它表述的是这组事实共同指向的那个模式、取向或稳定结论，而不是把几条事实重新罗列一遍。
+2. **可回溯**：它不引入源事实里没有的信息。任何具体细节（人名、日期、数字、地名）都必须能在源事实里找到出处。
+3. **可证伪**：它是一条关于主体的事实性陈述，不是「用户提到了 X」这类关于对话本身的描述。
+
+# 不该产出观察的情况
+
+- 这组事实之间没有共同主题，只是向量相似度凑巧接近 → 返回 {"observation": null}
+- 这组事实只是同一件事的多次复述，提炼不出更高层结论 → 返回 {"observation": null}
+- 你只能给出「用户讨论过多个话题」这类空洞概括 → 返回 {"observation": null}
+
+# 输入
+
+## Facts
+
+一组相关事实。格式：
+
+[{"id": "事实 uuid", "text": "事实文本", "created_at": "入库时间"}]
+
+# 输出
+
+只返回可由 json.loads() 解析的有效 JSON。不要任何文本、推理、解释或包装。
+
+{
+  "observation": {
+    "text": "观察文本，一到三句",
+    "source_ids": ["支撑这条观察的源事实 uuid"],
+    "counterexample": "与这条观察不符的源事实 uuid 列表，没有则空列表"
+  }
+}
+
+或
+
+{"observation": null}
+
+# 规则
+
+- `source_ids` 只能取自 Facts 列表中真实存在的 id，绝不虚构。
+- 观察文本用与源事实相同的语言书写。
+- 不给出保留、失效、删除任何记录的建议——处置不属于你的职责。
+"""
+
+
+def generate_observation_synthesis_prompt(members=None):
+    """Build the user prompt for observation synthesis (Dream, Consolidate stage).
+
+    Pairs with OBSERVATION_SYNTHESIS_PROMPT. Each member is serialized with exactly
+    three keys (`id` / `text` / `created_at`): vectors and scope fields are engine
+    state, not evidence, and would give the model a way to reason about the
+    clustering instead of about the facts (design §5.3.2).
+    """
+    facts = [
+        {
+            "id": member.get("id"),
+            "text": member.get("text", ""),
+            "created_at": member.get("created_at"),
+        }
+        for member in (members or [])
+    ]
+    sections = []
+    sections.append(f"## Facts\n{_serialize_memories(facts)}")
+    sections.append("# Output:")
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # V3 Prompt Builder — constructs the user-side prompt for additive extraction
 # Ported from platform/backend/shared/core/utils/prompt_builder.py
 # ---------------------------------------------------------------------------

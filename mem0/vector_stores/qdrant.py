@@ -174,7 +174,19 @@ class Qdrant(VectorStoreBase):
         # while created_at / valid_at / invalid_at are range-filtered (cursor paging and
         # the bi-temporal validity predicates). A keyword index on a date field would
         # make those Range conditions fall back to a full scan.
-        keyword_fields = ["user_id", "agent_id", "run_id", "actor_id"]
+        # `memory_kind` / `observation_key` / `source_memory_ids` carry the Dream
+        # observation payload: the default read predicate matches `memory_kind` by value,
+        # the supersede check looks observations up by `observation_key`, and the reverse
+        # evidence lookup matches an element of the `source_memory_ids` array.
+        keyword_fields = [
+            "user_id",
+            "agent_id",
+            "run_id",
+            "actor_id",
+            "memory_kind",
+            "observation_key",
+            "source_memory_ids",
+        ]
         datetime_fields = ["created_at", "valid_at", "invalid_at", "last_accessed"]
 
         for field, field_schema in ((f, "keyword") for f in keyword_fields):
