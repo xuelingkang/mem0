@@ -1,9 +1,9 @@
-# memory-decay 设计（mem0 自托管记忆·阶段 2：Ebbinghaus 衰减 + 访问强化）
+# memory-decay 设计（mem0 自托管记忆：Ebbinghaus 衰减 + 访问强化）
 
 | 项 | 值 |
 | --- | --- |
 | 目标仓库 | `/Users/xuelingkang/Documents/Containers/mem0` |
-| 前置阶段 | 阶段 0（村规废弃、纯 ADD）与阶段 1（bi-temporal 事实模型）均已交付并核验通过 |
+| 依赖机制 | 纯 ADD 写入（已无写入期收敛）、bi-temporal 事实模型，均已交付并核验通过 |
 | 前置文档 | `docs/design/bitemporal-fact-model.md`（事实模型与 `valid_at` / `invalid_at` 语义） |
 | 生效面 | 检索排序层（`/search` 路径），不新增存储、不新增 LLM 调用 |
 | 存储 | Qdrant 1.19.0，集合 `memories_2048`（2048 维 + `bm25` sparse 槽位） |
@@ -245,7 +245,7 @@ Qdrant payload 顶层新增 2 个字段（与 `data` / `hash` / `created_at` / `
 
 依据（第 10 节 E1）：全库 3545 条全部具备 `created_at`，`last_accessed` / `access_count` 命中数均为 0；因此上线首日全库走第二行语义，全库时间因子分布落在 [0.9185, 1.0000]（实测：min 0.9185、p25 0.9241、p50 0.9369、p75 0.9724）。
 
-不做回填的理由与阶段 1 的 `valid_at` 同理：**`created_at` 是存量记录唯一真实可信的「上次使用」证据**；写入推测值等于伪造一条访问历史，且会让「从未被召回」与「很久以前被召回」两种不同状态不可区分。云平台对 decay 上线前的存量记忆同样采用「无足迹 → 用事件时间兜底」的降级路径。
+不做回填的理由与 bi-temporal 的 `valid_at` 同理：**`created_at` 是存量记录唯一真实可信的「上次使用」证据**；写入推测值等于伪造一条访问历史，且会让「从未被召回」与「很久以前被召回」两种不同状态不可区分。云平台对 decay 上线前的存量记忆同样采用「无足迹 → 用事件时间兜底」的降级路径。
 
 后续行为：新写入记录在首次被检索返回时获得足迹；存量记录在被检索返回后自然积累足迹，此后与其它记录行为一致。
 
@@ -406,7 +406,7 @@ s₁/s₂ ≥ 1/0.90 = 1.1111  ⟹  s₁·w₁ ≥ s₁·0.90 ≥ s₂·1.00 ≥
 
 | 文件 | 本地既有改动 | 本方案新增改动 | 冲突风险 |
 | --- | --- | --- | --- |
-| `mem0/memory/main.py` | 阶段 0/1 改动（+ 常量收敛） | 衰减纯函数、两份检索实现、结果格式化 | **高**（上游 V3 管道核心，改动频繁） |
+| `mem0/memory/main.py` | 既有改动（+ 常量收敛） | 衰减纯函数、两份检索实现、结果格式化 | **高**（上游 V3 管道核心，改动频繁） |
 | `mem0/utils/scoring.py` | 无 | 打分器签名与 `score_details` | 低（上游近期未动） |
 | `mem0/vector_stores/qdrant.py` | 游标分页 + payload 索引按字段声明 | 批量足迹写入方法、索引字段追加 | 中 |
 | `server/main.py` | 游标分页 / 独立 provider / 导出 | 配置段、序列化、导出列 | 中（均为小改） |
@@ -500,7 +500,7 @@ s₁/s₂ ≥ 1/0.90 = 1.1111  ⟹  s₁·w₁ ≥ s₁·0.90 ≥ s₂·1.00 ≥
 | [AC-30] | 导出同步：`GET /memories/export?format=json` 中每条记录的 `metadata` 不含两个足迹字段；`format=csv` 的表头含两列 | 导出文件检查 |
 | [AC-31] | 管理列表不受影响：`GET /memories` 的顺序仍为 `created_at` 降序、`total` 与基线一致；两次连续调用返回的首屏 id 序相同（足迹字段变化不改变该端点的排序键） | 端到端两次调用对比 |
 | [AC-32] | 写入路径不受影响：`POST /memories`（`infer=true`）仍返回 `event=ADD`；写入管道 Phase 1 的候选检索结果与改动前一致（不受时间因子影响） | 隔离 `user_id` 端到端 + 候选集对比 |
-| [AC-33] | point-in-time 与 bi-temporal 语义保持：`as_of` / `include_invalidated` 行为与改动前一致，失效记录仍不出现在默认读 | 端到端复跑阶段 1 的验收用例 |
+| [AC-33] | point-in-time 与 bi-temporal 语义保持：`as_of` / `include_invalidated` 行为与改动前一致，失效记录仍不出现在默认读 | 端到端复跑 bi-temporal 的验收用例 |
 | [AC-34] | 索引存在：`GET /collections/memories_2048` 的 `payload_schema` 含 `last_accessed: datetime` | 直接查 Qdrant REST |
 
 ## 11.7 验证纪律与工程
@@ -512,7 +512,7 @@ s₁/s₂ ≥ 1/0.90 = 1.1111  ⟹  s₁·w₁ ≥ s₁·0.90 ≥ s₂·1.00 ≥
 | [AC-37] | 容器内可见新符号（重启后生效）：`docker exec mem0-dev-mem0-1 python -c "from mem0.memory.main import <新符号>"` 成功 |
 | [AC-38] | `make lint`（ruff，line length 120）对 `mem0/`、`server/` 改动零告警 |
 | [AC-39] | 实现完成后 `bash patches/generate-patch.sh` 成功刷新 `patches/mem0-local.patch`，覆盖本次全部改动文件 |
-| [AC-40] | 变更不夺取既有资产：bi-temporal 三段式、中文提示词、游标翻页、dashboard 改造、维度单一来源均保持可用（阶段 1 的验收用例可复跑通过） |
+| [AC-40] | 变更不夺取既有资产：bi-temporal 三段式、中文提示词、游标翻页、dashboard 改造、维度单一来源均保持可用（bi-temporal 的验收用例可复跑通过） |
 
 ---
 
@@ -550,4 +550,4 @@ s₁/s₂ ≥ 1/0.90 = 1.1111  ⟹  s₁·w₁ ≥ s₁·0.90 ≥ s₂·1.00 ≥
 | Ebbinghaus 原始标定数据（20 分钟 58%、1 小时 44%、1 天 33%、31 天 21%） | 衰减曲线形状的经验来源 |
 | PowerMem（OceanBase，Apache-2.0）：`decay = −ln(0.44)` 标定 + 保留下限 + `combined_score = similarity × retention` | 3.3 依据 B 的标定方法、5.1 的融合形态（相乘而非相加） |
 | mem0 云平台 Memory Decay 文档：缩放因子区间 0.3×–1.5×、地板保证「只重排不淘汰」、每次召回最多保留最近 20 次触摸、存量记录降级用事件时间兜底、`threshold` 在衰减之前应用 | 3.4 区间形态与 4.5 存量降级路径、8 观测项、5.3 `threshold` 语义 |
-| mem0 云平台 Temporal Reasoning 文档：检索参考时刻 `reference_date` | 阶段 3 的接口位（不在本方案范围） |
+| mem0 云平台 Temporal Reasoning 文档：检索参考时刻 `reference_date` | — |

@@ -1,10 +1,10 @@
-# graph-memory 设计（mem0 自托管记忆·阶段 3：Graphiti 旁路图检索）
+# graph-memory 设计（mem0 自托管记忆：Graphiti 旁路图检索）
 
 | 项 | 值 |
 | --- | --- |
 | 目标仓库 | `/Users/xuelingkang/Documents/Containers/mem0`（`main`） |
 | 基线 commit | `63fa9116`（memory-decay 文档收口后） |
-| 前置阶段 | 阶段 1（bi-temporal 事实模型）、阶段 2（Ebbinghaus 衰减 + 访问强化）均已交付并核验通过 |
+| 依赖机制 | bi-temporal 事实模型、Ebbinghaus 衰减 + 访问强化，均已交付并核验通过 |
 | 前置文档 | `docs/design/bitemporal-fact-model.md`、`docs/design/memory-decay.md` |
 | 生效面 | 写入路径（事实入图）与检索排序层（`/search` 路径）；事实主存仍在 Qdrant |
 | 存储 | Qdrant 1.19.0 集合 `memories_2048`（3612 点 / 向量 2048 维 + `bm25` sparse）；新增 FalkorDB 图库（图键按作用域隔离） |
@@ -27,7 +27,7 @@
 
 ## 1.1 背景
 
-`/search` 当前按混合打分排序：语义相似度 + BM25 + 实体加权，再乘时间因子（阶段 2）：
+`/search` 当前按混合打分排序：语义相似度 + BM25 + 实体加权，再乘时间因子（衰减）：
 
 ```
 combined   = min((semantic + bm25 + entity_boost) / max_possible, 1.0)
@@ -47,7 +47,7 @@ final      = combined × decay_weight
 3. **图不可用时主链路不受影响**：写入照常、检索照常，图分支静默跳过（第 6.4 节逐条）。
 4. 同步是异步的：入图不阻塞主写入响应，失败可重试。
 5. 图与事实主存通过**构造性 join key**（episode uuid = memory id）双向可追溯，图上不另存映射表。
-6. 与阶段 2 的时间因子共存：两个机制作用面不同（关联维 vs 时间维），复合顺序固定，各自有界（第 6.3 节）。
+6. 与衰减的时间因子共存：两个机制作用面不同（关联维 vs 时间维），复合顺序固定，各自有界（第 6.3 节）。
 7. 全部能力由一个开关控制；关闭时检索与写入行为与引入本机制之前逐位一致。
 
 ## 1.3 范围
@@ -247,7 +247,7 @@ graphiti-core 的 `GraphProvider` 枚举覆盖 NEO4J / FALKORDB / KUZU / NEPTUNE
 
 - 队列为**进程内有界队列**（默认容量 1000），满时丢弃最旧任务并累加 `graph_dropped` 计数；
 - 投递是 O(1) 的内存操作，被 `try/except` 包裹，任何异常记计数器后返回，不改变写入结果；
-- worker 为**单线程 + 独立事件循环**：串行调用图桥 `/episodes`，与 FastAPI 的请求线程池互不占用（与阶段 2 的强化写入派发同构）。
+- worker 为**单线程 + 独立事件循环**：串行调用图桥 `/episodes`，与 FastAPI 的请求线程池互不占用（与衰减的强化写入派发同构）。
 
 ## 5.2 重试与熔断
 
@@ -335,7 +335,7 @@ final        = combined × decay_weight
 
 ## 6.3 与 Decay 的共存方式
 
-| 项 | 阶段 2 时间因子 | 本阶段图信号 |
+| 项 | 衰减时间因子 | 图信号 |
 | --- | --- | --- |
 | 作用维度 | 时间（龄 + 召回足迹） | 关联（实体与关系路径） |
 | 组合位置 | 乘性系数，作用于 `combined` 之后 | 加性分量，进入 `combined` 分子 |
@@ -448,8 +448,8 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 | 文件 | 本地既有改动 | 本方案新增改动 | 冲突风险 |
 | --- | --- | --- | --- |
-| `mem0/memory/main.py` | 阶段 0/1/2 改动（bi-temporal、衰减、中文提示词） | 派发调用、图检索分支、两份实现 | **高**（上游 V3 管道核心） |
-| `mem0/utils/scoring.py` | 阶段 2 的衰减分量 | 图分量与分母条件增长 | 中 |
+| `mem0/memory/main.py` | 既有改动（bi-temporal、衰减、中文提示词） | 派发调用、图检索分支、两份实现 | **高**（上游 V3 管道核心） |
+| `mem0/utils/scoring.py` | 衰减分量 | 图分量与分母条件增长 | 中 |
 | `mem0/configs/base.py` | 衰减配置段 | 图配置段 | 低 |
 | `server/main.py` | 分页、独立 provider、导出、衰减配置 | 图配置透传与 `score_details` | 低 |
 | `server/docker-compose.yaml` | 衰减开关透传 | 两个新服务与图环境变量 | 低 |
@@ -542,7 +542,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | [AC-26] | 关闭时零图调用：`enabled=false` 下连续 20 次写入与 10 次检索，图桥访问日志计数与关闭前相同（增量为 0） | 图桥访问日志 |
 | [AC-27] | 开关可运行时切换：以配置通道切换 关→开→关，检索行为随之变化，无需重启容器 | 三次 `POST /search` + `GET /configure` 复核 |
 | [AC-28] | 存储面不变：变更前后 Qdrant 集合的 `payload_schema` 键集合相同；不存在新增集合；无新增 payload 字段 | 直接查 Qdrant REST |
-| [AC-29] | 既有资产可用：阶段 2 的验收用例（衰减函数、足迹写入、开关回退、存量兼容）复跑通过；bi-temporal 的 `as_of` / `include_invalidated` 行为与阶段 1 一致 | 复跑既有用例 |
+| [AC-29] | 既有资产可用：衰减的验收用例（衰减函数、足迹写入、开关回退、存量兼容）复跑通过；bi-temporal 的 `as_of` / `include_invalidated` 行为保持一致 | 复跑既有用例 |
 | [AC-30] | 接口契约不变：`GET /memories` 顺序仍为 `created_at` 降序且 `total` 与基线一致；`GET /memories/{id}` 与导出的字段集合与基线相同（`explain` 之外的响应不含新键） | 端点对比 |
 | [AC-31] | `explain` 只增键：`score_details` 含 `graph_boost` / `graph_facts`，且既有键（`semantic_score` / `bm25_score` / `entity_boost` / `raw_score` / `max_possible_score` / `final_score` / `threshold`）取值语义不变 | 读取响应 JSON 的键集合与取值 |
 
@@ -603,4 +603,4 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | Kuzu 项目状态公告（`kuzudb/kuzu` README、`kuzudb.com` 解析状态） | 4.3 载体可持续性 |
 | mem0 v3 云平台图记忆说明（`docs`：无外部图库、实体节点与共享实体连接、排序阶段提分） | 本方案的融合位置与「补充信号」定位 |
 | `FalkorDB/mem0-falkordb`（provider `falkordb`）与 `Nerfherder16/System-Recall`（Mem0 + Neo4j + Qdrant + Graphiti 自托管，README 建议 8GB+ RAM） | 生态一致性与资源量级对照 |
-| 阶段 2 文档 `docs/design/memory-decay.md` | 时间因子定义、复合顺序、开关与回退形态 |
+| 衰减设计 `docs/design/memory-decay.md` | 时间因子定义、复合顺序、开关与回退形态 |

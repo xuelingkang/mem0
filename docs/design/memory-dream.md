@@ -46,7 +46,7 @@
 - `server/main.py` / `server/models.py` / `server/alembic/versions/`：运行记账表、序列化一等字段、检索参数。
 - `tests/memory/test_dream.py`、`tests/test_dream_router.py`（新增）。
 
-不包含（见第 9 节职责边界）：检索排序的任何改动、源事实的任何失效/合并处置、图结构、跨作用域整合、实时整合。
+职责边界见第 9 节。
 
 ---
 
