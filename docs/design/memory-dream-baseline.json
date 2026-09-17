@@ -1,0 +1,146 @@
+{
+  "captured_at_utc": "2026-09-17T06:01:52Z",
+  "repo": "/Users/xuelingkang/Documents/Containers/mem0",
+  "base_commit": "b0b4e38d",
+  "collection": "memories_2048",
+  "collection_snapshot": {
+    "points_total": 3545,
+    "count_must_not_memory_kind_observation": 3545,
+    "count_memory_kind_observation": 0,
+    "by_agent_id": {
+      "ying": 3129,
+      "shi": 259,
+      "mo": 118,
+      "jian": 39
+    },
+    "probe_records_left": 0,
+    "temporary_collections_left": [
+      "bt_ac23_48c7b96d",
+      "bt_probe_b54b5a59",
+      "memories",
+      "memories_2048"
+    ]
+  },
+  "payload_indexes_present": [
+    "created_at",
+    "valid_at",
+    "invalid_at",
+    "user_id",
+    "agent_id",
+    "run_id",
+    "actor_id"
+  ],
+  "payload_indexes_to_add": [
+    "memory_kind",
+    "observation_key",
+    "source_memory_ids"
+  ],
+  "clustering": {
+    "algorithm": "greedy seed expansion on cosine similarity within (user_id, agent_id) scope",
+    "params": {
+      "tau": 0.82,
+      "min_cluster_size": 4,
+      "max_cluster_size": 15
+    },
+    "result_at_base": {
+      "clusters": 96,
+      "members": 478,
+      "mean_size": 4.98,
+      "max_size": 14,
+      "p50": 4,
+      "p90": 6
+    },
+    "sweep": {
+      "0.80": {
+        "clusters": 132,
+        "members": 675,
+        "mean_size": 5.11,
+        "max_size": 15
+      },
+      "0.82": {
+        "clusters": 96,
+        "members": 478,
+        "mean_size": 4.98,
+        "max_size": 14
+      },
+      "0.84": {
+        "clusters": 75,
+        "members": 350,
+        "mean_size": 4.67,
+        "max_size": 9
+      },
+      "0.86": {
+        "clusters": 42,
+        "members": 192,
+        "mean_size": 4.57,
+        "max_size": 8
+      }
+    },
+    "runtime_seconds": 3.0,
+    "vector_matrix_bytes": 28999680
+  },
+  "llm_cost_measured": {
+    "model": "deepseek-v4.1-flash",
+    "clusters_called": 96,
+    "clusters_with_observation": 25,
+    "clusters_null": 71,
+    "errors": 0,
+    "elapsed_seconds": 284.9,
+    "prompt_tokens": 111516,
+    "completion_tokens": 38633,
+    "reasoning_tokens": 33717,
+    "per_cluster": {
+      "prompt_tokens": 1162,
+      "completion_tokens": 402,
+      "seconds": 2.97
+    },
+    "per_cluster_seconds_range": [
+      0.49,
+      14.82
+    ],
+    "per_cluster_prompt_range": [
+      905,
+      2461
+    ]
+  },
+  "embedder_measured": {
+    "model": "qwen3.7-text-embedding",
+    "dims": 2048,
+    "single_seconds": 0.57,
+    "batch_20_seconds": 1.04,
+    "max_batch": 20,
+    "batch_21_response": "400 InternalError.Algo.InvalidParameter: batch size is invalid, it should not be larger than 20."
+  },
+  "write_path_measured": {
+    "same_point_id_rewrite": {
+      "count_before": 3545,
+      "after_first": 3546,
+      "after_rerun": 3546,
+      "idempotent": true
+    },
+    "different_id_same_key_duplicates": 2,
+    "uuid5_stable": true
+  },
+  "lock_measured": {
+    "location": "/app/history/dream.lock",
+    "cross_process_block_errno": 11,
+    "same_process_block_errno": 11,
+    "acquired_after_release": true
+  },
+  "environment": {
+    "lima_vm": {
+      "cpus": 2,
+      "memory": "8GiB",
+      "disk": "64GiB"
+    },
+    "docker_stats": {
+      "mem0": "259.8MiB/7.737GiB",
+      "qdrant": "309.4MiB/7.737GiB",
+      "postgres": "66.54MiB/7.737GiB",
+      "dashboard": "105MiB/7.737GiB"
+    },
+    "numpy": "2.5.2",
+    "scheduler_libs_present": []
+  },
+  "acceptance_criteria_count": 48
+}
