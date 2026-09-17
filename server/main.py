@@ -128,6 +128,15 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", OPENAI_BASE_URL)
 EMBEDDER_API_KEY = os.environ.get("EMBEDDER_API_KEY", OPENAI_API_KEY)
 EMBEDDER_BASE_URL = os.environ.get("EMBEDDER_BASE_URL", OPENAI_BASE_URL)
 
+# Single source of truth for vector dimensionality. The embedder's output size and the
+# Qdrant collection's vector size must agree, so both read this one value: setting only
+# one of the two env vars can no longer silently desync them.
+EMBEDDING_DIMS = int(
+    os.environ.get("EMBEDDER_EMBEDDING_DIMS")
+    or os.environ.get("QDRANT_EMBEDDING_DIMS")
+    or "2048"
+)
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -136,14 +145,14 @@ DEFAULT_CONFIG = {
             "host": os.environ.get("QDRANT_HOST", "qdrant"),
             "port": int(os.environ.get("QDRANT_PORT", "6333")),
             "collection_name": os.environ.get("QDRANT_COLLECTION_NAME", "memories"),
-            "embedding_model_dims": int(os.environ.get("QDRANT_EMBEDDING_DIMS", "2048")),
+            "embedding_model_dims": EMBEDDING_DIMS,
         },
     },
     "llm": {
         "provider": "openai",
         "config": {"api_key": LLM_API_KEY, "openai_base_url": LLM_BASE_URL, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
     },
-    "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": int(os.environ.get("EMBEDDER_EMBEDDING_DIMS", "4096"))}},
+    "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": EMBEDDING_DIMS}},
     "history_db_path": HISTORY_DB_PATH,
 }
 

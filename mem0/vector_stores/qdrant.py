@@ -582,9 +582,9 @@ class Qdrant(VectorStoreBase):
         Args:
             filters (dict, optional): Filters to apply to the list. Defaults to None.
             top_k (int, optional): Number of vectors to return. Defaults to 100.
-            cursor (str, optional): Opaque keyset cursor from a previous call
-                ("<created_at>|<id>"). Resumes listing right after the anchor point,
-                so pages never overlap and never skip rows inserted meanwhile.
+            cursor (str, optional): Opaque keyset cursor from a previous call -- the
+                `created_at` value of the last row on that page. Listing resumes strictly
+                below it (created_at < cursor, newest-first), so pages never overlap.
 
         Returns:
             list: List of vectors.
