@@ -12,6 +12,13 @@
 | 实现形态 | 仅本地改动（相对 `upstream/main`），不提交上游 PR |
 | 资源结论 | **就地可跑**，VM 维持 2 CPU / 8GiB（第 3 节） |
 
+> **2026-09-17 修订（核验整改卡 `t_362c77d2`，基于独立核验卡 `t_e6669818` 的未通过项）。**
+> 四处与实测不符的判据/表述已按实测改写：`[AC-12]` 后半句的占比上界写进了前提（§11.3）、
+> `[AC-34]` 拆成「健康路径确定 + 降级路径显式」两条（§11.3）、§10 的 E6 换成实测尾部分位并
+> 据此把 `timeout_seconds` 默认值由 0.4 抬到 1.0（§6.5、§10）、两项未申报的实现偏离如实
+> 记录（§7）。同时补齐两处观测面：图派发计数器的服务侧只读端点（§8、§7）与检索响应里的
+> `graph_status`（§6.4、§8）——超时此前与「无命中」在响应上完全同形，无法诊断。
+
 > 本文档为本地设计文档，位于仓库 `docs/design/`，与 Mintlify 文档站（`docs/**/*.mdx`）无关，不参与 `llms.txt` 收录检查。
 
 ---
@@ -51,10 +58,11 @@ final      = combined × decay_weight
 - `server/docker-compose.yaml`：新增 `falkordb` 与 `graph-bridge` 两个服务。
 - `mem0/memory/graph_sync.py`：新增图同步模块（派发队列、串行 worker、重试、幂等判据、熔断）。
 - `mem0/utils/scoring.py`：打分器接受图加分，分母随启用信号增长。
-- `mem0/memory/main.py`：写入路径派发入图、检索路径调用图检索并计算加分（sync / async 两份实现）。
+- `mem0/memory/main.py`：写入路径派发入图、检索路径调用图检索并计算加分（sync / async 两份实现），并把本次图分支状态随每条结果发布。
 - `mem0/configs/base.py`：新增图检索配置段。
 - `server/main.py`：配置默认值透传、`score_details` 序列化。
-- `server/docker-compose.yaml` / `server/.env`：图能力相关的环境变量透传。
+- `server/routers/graph.py`（新增）：图派发计数器的只读端点（`GET /graph/stats`）。
+- `server/docker-compose.yaml` / `server/.env.example`：图能力相关的环境变量透传。
 - `tests/`：新增单测与端到端验证。
 
 ---
@@ -81,11 +89,11 @@ final      = combined × decay_weight
 | 项 | 要求 |
 | --- | --- |
 | 主写入在线路径 | 图派发为内存队列投递，O(1) 且不抛异常；图不可用时写入响应时延与关闭态同量级 |
-| 主检索在线路径 | 图分支有硬超时预算（默认 0.4s，实测一次图检索 0.12–0.23s）；超时即放弃该次图信号，不延长响应 |
+| 主检索在线路径 | 图分支有硬超时预算（默认 1.0s；实测图桥 `/search` n=100 的 p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s，见 §10 E17）；超时即放弃该次图信号，响应最多被延长到预算上限，且该次状态在响应里标为 `timeout` |
 | 并发模型 | 入图单 worker 串行（Graphiti 要求同一分区的 episode 顺序摄入）；图库连接按作用域缓存复用 |
 | 新增 LLM 调用 | 仅在图侧（写入路径），主检索路径零 LLM 调用 |
 | 幂等性 | 同一 memory id 的 episode 在图侧唯一；重复派发不产生重复边 |
-| 可观测 | 派发/成功/失败/丢弃/熔断计数、图库节点边数、图检索时延与命中数均可查 |
+| 可观测 | 派发/成功/失败/丢弃/熔断计数（`GET /graph/stats`）、图分支状态（每条检索结果的 `graph_status`）、图库节点边数（图桥 `/stats`）、图检索时延与命中数均可查 |
 | 资源 | 新增常驻内存 ≤ 215MiB（实测基数，第 3 节）；新容器均设内存上限，防止挤占主链路 |
 | 隔离 | 图分区键由作用域派生，按 `user_id` 天然隔离；测试数据可按分区整体删除 |
 | 可复现 | 图信号计算为纯函数（给定图检索结果与候选池，输出确定），不依赖 LLM |
@@ -208,7 +216,7 @@ graphiti-core 的 `GraphProvider` 枚举覆盖 NEO4J / FALKORDB / KUZU / NEPTUNE
                      ┌────────────────────────▼──────┐
    POST /search  ───▶│  graph-bridge (新增，≤512m)    │
      （图分支，       │   ├─ /episodes  入图           │
-       0.4s 预算）    │   ├─ /search    图检索         │
+       1.0s 预算）    │   ├─ /search    图检索         │
                      │   ├─ /health    /stats         │
                      │   └─ graphiti-core 0.30.2      │
                      └────────────────────────┬──────┘
@@ -286,7 +294,7 @@ FalkorDB 后端的一处机制约束（E13）：`group_id` 即图键（database�
 
 位置：`_search_vector_store` 的候选集（`candidates`，语义检索过 `threshold` 之后）构建完成、进入 `score_and_rank` 之前。图分支与既有 BM25 / 实体加分的取数并列，互不依赖。
 
-调用：`POST {endpoint}/search {group_ids: [作用域键], query, max_facts}`，在**硬超时预算**内（默认 0.4s；实测 0.12–0.23s，E6）同步取回；超时或异常返回空结果。
+调用：`POST {endpoint}/search {group_ids: [作用域键], query, max_facts}`，在**硬超时预算**内（默认 1.0s；实测分位见 §10 E17）同步取回；超时或异常返回空结果，并把该次状态带走。
 
 图侧结果的采用规则：
 
@@ -295,6 +303,7 @@ FalkorDB 后端的一处机制约束（E13）：`group_id` 即图键（database�
 | 失效事实 | `invalid_at` 非空的事实默认不参与加分（与主通道失效语义一致，可由配置放开） |
 | 映射范围 | 事实 `episodes` 中的 id 只有在**本次候选池内**才产生加分；池外 id 忽略 |
 | 条数 | 采用 `max_facts` 条（默认 10），按图检索返回顺序定权 |
+| 本次状态 | 每次调用带一个状态值（`ok` / `skipped` / `timeout` / `error` / `disabled`），随检索结果的 `graph_status` 发布（§6.4） |
 
 ## 6.2 融合公式
 
@@ -363,7 +372,19 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | 图侧内存超限被 cgroup 截断 | 主链路不受影响（独立容器） | 容器重启，恢复后队列继续按序入图 |
 | 网络分区（VM 内部网络异常） | 同「图桥进程停止」 | 同 |
 
-统一原则：**入图失败不回滚事实写入；检索缺图信号即按无信号打分；任何图侧异常的可见面是计数器与日志，而不是响应内容或响应时延。**
+统一原则：**入图失败不回滚事实写入；检索缺图信号即按无信号打分；图侧的每一次降级都是显式状态——状态值、计数器与日志共同构成可见面，而不是被静默吞掉。**
+
+状态值的判定面（`graph_status`，随每条检索结果发布；图能力关闭时也发布，取值为 `disabled`）：
+
+| 状态 | 含义 | 对打分的影响 |
+| --- | --- | --- |
+| `ok` | 图桥在预算内返回了结果（命中数可能为 0） | 命中即加分，未命中即 0（分母不增长） |
+| `timeout` | 图桥未在预算内返回 | 本次无图信号 |
+| `error` | 图桥在预算内失败（连接失败 / 非 2xx / 畸形响应） | 本次无图信号 |
+| `skipped` | 能力开启，但无作用域键或候选池为空，未发起调用 | 本次无图信号 |
+| `disabled` | 能力关闭，未发起任何图调用 | 无图分量，分数与关闭态逐位一致 |
+
+降级路径下「结果等于关闭态」的准确含义是 **id 序与分数**等于关闭态（`[AC-20]`/`[AC-21]` 的判定面）；`graph_status` 正是两者唯一的差别，也是这次降级可被诊断的依据——7.5% 的静默降级在调用方视角曾是「同一查询时而带图增强时而不带」且无从查因。
 
 ## 6.5 开关与回退
 
@@ -375,13 +396,13 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | `endpoint` | `http://graph-bridge:8000` | 图桥地址 |
 | `weight` | 0.5 | `W_g`，图加分上限 |
 | `max_facts` | 10 | 每次图检索取用的事实条数 |
-| `timeout_seconds` | 0.4 | 图检索硬超时预算 |
+| `timeout_seconds` | 1.0 | 图检索硬超时预算（0.4 → 1.0：实测尾部见 §10 E6/E17） |
 | `include_invalidated` | `false` | 是否采用 `invalid_at` 非空的事实 |
 | `queue_size` | 1000 | 派发队列容量 |
 | `max_retries` | 3 | 单条 episode 最大重试次数 |
 | `circuit_breaker_failures` / `circuit_cooldown_seconds` | 5 / 60 | 熔断阈值与冷却窗口 |
 
-回退语义：关闭开关后不产生任何图调用与图写入；`max_possible` 与 `final_score` 回到无图形态；`score_details` 中不出现图分量键，`explain` 输出与引入本机制之前逐位一致。
+回退语义：关闭开关后不产生任何图调用与图写入；`max_possible` 与 `final_score` 回到无图形态；`score_details` 中不出现图分量键，`explain` 输出与引入本机制之前逐位一致；每条结果只多一个只读字段 `graph_status = "disabled"`（不参与打分，也不进入 `score_details`），使「能力关闭」与「图没答上来」在响应上不再同形。
 
 ---
 
@@ -392,15 +413,17 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | `server/graph-bridge/app.py`（新增） | 图桥 | FastAPI 薄壳：装配 graphiti-core 客户端（LLM 用 `OpenAIClient` 的 `/responses` 通道，embedder 用 OpenAI 兼容 embedder 客户端）、作用域→图键映射、driver 缓存、`/episodes`（含幂等前置）、`/search`、`/stats`、`/health`、`/graph/{group_id}` |
 | `server/graph-bridge/requirements.txt`、`Dockerfile`、`README.md`（新增） | 图桥 | 依赖固定 `graphiti-core[falkordb]==0.30.2`；镜像基于 `python:3.12-slim` |
 | `server/docker-compose.yaml` | 部署 | 新增 `falkordb`（`mem_limit: 384m`，仅内网）与 `graph-bridge`（`mem_limit: 512m`，仅内网，`depends_on` falkordb）；`mem0` 服务透传 `MEM0_GRAPH_*` 并 `depends_on` graph-bridge（软依赖） |
-| `server/.env` | 部署 | 新增图能力环境变量（默认 `MEM0_GRAPH_ENABLED=false`） |
-| `mem0/memory/graph_sync.py`（新增） | 同步 | 作用域→图键纯函数、有界队列、单 worker（线程 + 事件循环）、HTTP 客户端、重试与熔断、计数器 |
+| `server/.env.example` | 部署 | 新增图能力环境变量（默认 `MEM0_GRAPH_ENABLED=false`）。**实际做法**：`server/.env` 未新增变量——它未纳入版本控制（`.gitignore`），运行行为由 compose 的 `${MEM0_GRAPH_ENABLED:-false}` 等默认值兜底；`.env.example` 是模板与文档面 |
+| `server/routers/graph.py`（新增） | REST | `GET /graph/stats`：图派发计数与熔断状态的只读端点（`[AC-9]`/`[AC-25]` 的判定面，§8） |
+| `mem0/memory/graph_sync.py`（新增） | 同步 | 作用域→图键纯函数、有界队列、单 worker（线程 + 事件循环）、HTTP 客户端、重试与熔断、计数器、图分支状态值 |
 | `mem0/configs/base.py` | 配置 | `MemoryConfig` 新增 `graph` 配置段与其默认值 |
 | `mem0/utils/scoring.py` | 打分 | `score_and_rank` 接受 `graph_boosts`；`max_possible` 条件增长；`score_details` 输出版本分量 |
-| `mem0/memory/main.py` | 逻辑 | 写入路径两份实现的收尾派发；`_search_vector_store` 两份实现（sync/async）调用图检索并折算加分、传入打分器 |
-| `server/main.py` | REST | `DEFAULT_CONFIG` 增加 `graph` 段（读环境变量）；`score_details` 透传新键 |
-| `tests/memory/test_graph_sync.py`（新增） | 测试 | 图键派生、队列容量与丢弃、重试与熔断、幂等前置判据、降级 |
-| `tests/utils/test_scoring.py` | 测试 | 打分器新增参数与分母条件增长的断言 |
-| `tests/memory/test_graph_search.py`（新增） | 测试 | 图加分折算、失效事实过滤、候选池外 id 忽略、关闭态一致 |
+| `mem0/memory/main.py` | 逻辑 | 写入路径两份实现的收尾派发；`_search_vector_store` 两份实现（sync/async）调用图检索并折算加分、传入打分器，并把 `graph_status` 发布到每条结果 |
+| `server/main.py` | REST | `DEFAULT_CONFIG` 增加 `graph` 段（读环境变量）；`score_details` 透传新键；挂载图观测路由 |
+| `tests/memory/test_graph_sync.py`（新增） | 测试 | 图键派生、队列容量与丢弃、重试与熔断、幂等前置判据、降级与状态值 |
+| `tests/memory/test_graph_search.py`（新增） | 测试 | 图加分折算、失效事实过滤、候选池外 id 忽略、关闭态一致，以及打分器的新增参数与分母条件增长的断言（§6.2）。**实际做法**：打分断言落在本文件，`tests/utils/test_scoring.py` 本阶段零改动——落点与既有的打分器用例（`tests/utils/test_scoring.py` 只覆盖通用打分）同层，但与本文原先的清单不一致 |
+| `tests/test_graph_router.py`（新增） | 测试 | 图计数器只读端点：读数透传、关闭态/未派发态零读数、读数不创建派发器 |
+| `docs/design/graph-memory-evidence/bridge_search_latency.{py,txt}`（新增） | 证据 | 图桥 `/search` 尾部分位实测的脚本与原始输出（§10 E17） |
 
 接口契约保持：`/search`、`/memories`、`/memories/{id}`、`/memories/export` 的请求参数与既有响应字段全部保持；`explain` 只增键不改键。Qdrant 集合、payload schema、既有索引不变（join key 在图上，不需要新增 payload 字段）。
 
@@ -410,13 +433,14 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 | 观测项 | 方式 | 期望 |
 | --- | --- | --- |
-| 派发与丢弃 | 进程计数器（`graph_dispatched` / `graph_synced` / `graph_failed` / `graph_dropped`） | 常态 `dispatched ≈ synced`；图不可用时 `dropped` 上升，`synced` 停增 |
-| 熔断状态 | 计数器 + 日志（进入/退出冷却） | 图不可用 60s 内进入冷却，恢复后自动放行 |
-| 图规模 | `GET /stats?group_id=` | `episodes` 单调上升并与新增事实数同阶；`entity_nodes` / `entity_edges` 随之增长 |
-| 图检索时延与命中 | 图桥访问日志（时延 + `max_facts` 命中数）+ 检索侧计时 | 单次 ≤ 超时预算；命中数 > 0 的比例随时间上升 |
+| 派发与丢弃 | `GET /graph/stats`（mem0 侧的只读端点，5 项计数 + 熔断状态 + 队列长度） | 常态 `dispatched ≈ synced`；图不可用时 `dropped` 上升，`synced` 停增 |
+| 图分支状态 | `POST /search` 每条结果的 `graph_status` | 取 `ok` / `skipped` / `timeout` / `error` / `disabled`；`timeout` 与 `error` 的比例是「图没答上来」的量化面 |
+| 熔断状态 | `GET /graph/stats` 的 `circuit_open` / `consecutive_failures` + 日志（进入/退出冷却） | 图不可用 60s 内进入冷却，恢复后自动放行 |
+| 图规模 | 图桥 `GET /stats?group_id=` | `episodes` 单调上升并与新增事实数同阶；`entity_nodes` / `entity_edges` 随之增长 |
+| 图检索时延与命中 | 图桥访问日志（时延 + `max_facts` 命中数）+ 检索侧计时 + `GET /graph/stats` 的 `timeout_seconds` | 单次 ≤ 超时预算（默认 1.0s，§10 E17）；命中数 > 0 的比例随时间上升 |
 | 图信号参与度 | `POST /search?explain=true` 的 `score_details` | 含 `graph_boost` / `graph_facts`；图命中为 0 时 `graph_boost = 0.0` |
 | 资源 | `docker stats` + VM `free -m` | 图桥 ≤ 512MiB、FalkorDB ≤ 384MiB；VM `available` ≥ 4GiB；swap 保持 0 |
-| 图键隔离 | FalkorDB `GRAPH.LIST` / `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
+| 图键隔离 | 图桥 `GET /graphs` / FalkorDB `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
 
 ---
 
@@ -438,7 +462,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 # 10. 实测证据
 
-全部数据采集于 2026-09-17，主机 macOS（vz），VM `docker`（aarch64，2 vCPU / 7922MiB），mem0 四服务在线，Qdrant 集合 `memories_2048`（3612 点）。探针脚本与原始输出留存于 `docs/design/graph-memory-evidence/`（`graphiti_e2e.py` / `llm_probe.py` / `joinkey_probe.py` / `falkor_scale.py` 及对应 `.txt` 原始输出、`vm_resource.txt`、`official_image_probe.txt`），可按脚本头部注释复跑。
+全部数据采集于 2026-09-17，主机 macOS（vz），VM `docker`（aarch64，2 vCPU / 7922MiB），mem0 四服务在线，Qdrant 集合 `memories_2048`（3612 点）。探针脚本与原始输出留存于 `docs/design/graph-memory-evidence/`（`graphiti_e2e.py` / `llm_probe.py` / `joinkey_probe.py` / `falkor_scale.py` / `bridge_search_latency.py` 及对应 `.txt` 原始输出、`vm_resource.txt`、`official_image_probe.txt`），可按脚本头部注释复跑。
 
 | 编号 | 证据 | 结论 |
 | --- | --- | --- |
@@ -447,7 +471,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | E3 | `docker stats`：`falkordb/falkordb:latest` 空载 62.43 → 67.5MiB（分步启动观测） | 图库常驻预算 |
 | E4 | 规模化压测：8150 实体节点 + 3545 边写入后 `INFO memory`：`used_memory` 7.00MiB → 10.53MiB、`used_memory_dataset` 8.25MiB、`used_memory_rss` 37.46MiB 不变；`count(n)=8150`、`count(e)=3545` | 目标规模图数据的内存模型（3.2/4.3） |
 | E5 | `docker stats`：`zepai/graphiti:0.30.2` 容器 idle 145.3MiB、CPU 0.23% | 图服务常驻与 CPU 预算 |
-| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 选定的形态）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；`/search` 0.12–0.23s、RRF 检索 0.23s；进程峰值 RSS 155MB | 时延预算、LLM 负载；0.4s 超时预算的裕度 |
+| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 选定的形态）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；进程峰值 RSS 155MB。**`/search` 时延以 E17 的专门采样为准**——本条当时记录的「0.12–0.23s」只覆盖了轻载样本、未覆盖尾部，核验复跑 40 次即得 `p95 0.520 / max 0.678s`（超 0.4s 3/40），故 0.4s 预算不成立 | 时延预算、LLM 负载 |
 | E7 | 结构化输出探测（`graphiti-core` 三种客户端 × 本机网关 `deepseek-v4.1-flash`）：`OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；`OpenAIGenericClient(json_object)` 短提示通过、长提示下出现 `EdgeDuplicate` 校验失败（`Extra data: line 1 column 847`）；`OpenAIClient(responses.parse)` → 通过 | 图桥按 `/responses` 通道装配 LLM 客户端 |
 | E8 | 官方镜像内 `import falkordb` → `None`（不存在），`neo4j` → 存在；带 `db_backend=falkordb` 启动 → `ImportError: falkordb is required for FalkorDriver` | G1 |
 | E9 | 官方镜像 + Neo4j 后端：`/healthcheck` → `{"status":"healthy"}`；`/messages` → 202；`/search` → `422 ... API密钥未配置该模型`（embedder 实际用默认 `text-embedding-3-small`） | G2 |
@@ -458,6 +482,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | E14 | Neo4j 对照：`neo4j:5.26-community` 空载 328MiB（启动 33s）→ 507.1MiB；`dbms.listConfig()`：`pagecache.size = 512.00MiB` | 4.3 对照数据 |
 | E15 | 镜像体积：本机展开 `falkordb/falkordb:latest` 570MB、`zepai/graphiti:0.30.2` 582MB、`neo4j:5.26-community` 660MB；Docker Hub arm64 拉取体积 FalkorDB 206.7MB、Graphiti 192.0MB | 3.2 磁盘预算 |
 | E16 | `graphiti_core` 版本：PyPI 最新 `graphiti-core` 0.30.2（requires_python `>=3.10,<4`），镜像内为同一版本；`Graphiti` 构造器接受 `graph_driver` / `llm_client` / `embedder` / `cross_encoder` | 依赖锁版本与客户端装配方式 |
+| E17 | 图桥 `/search` 尾部分位（核验整改卡实测，`bridge_search_latency.py`）：第 1 轮 n=60 → `p50 0.131 / p90 0.258 / p95 0.343 / p99 0.425 / max 0.472s`；第 2 轮（图键补入实体与关系边）n=100 → `p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s`，其中超 0.4s 共 14/100（14.0%），超 0.6s 4/100，超 0.8s 2/100，无超 1.0s | `timeout_seconds` 默认值取 1.0 的依据：两轮 max 均在预算内，且对 p99/max 仍有 ~19% 裕度；0.4s 只覆盖到约 p85，属「正常请求会落进超时区」 |
 
 ---
 
@@ -482,7 +507,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | [AC-6] | 入图不阻塞主写入：图桥正常运行与停止两种状态下，各连续 5 次 `POST /memories`（每次 1 条事实），两次的响应时延 p50 相对差 ≤ 50%（写入本身含多次 LLM 调用，判定看派发是否引入量级差异而非微秒级差异），且两种状态下事实均写入成功 | 两次计时输出对比 |
 | [AC-7] | 幂等：同一 memory id 触发两次同步，图内该 uuid 的 Episodic 节点恰好 1 个；第二次调用返回 `already_synced`；该 uuid 关联的边数与首次完成后相比不增加 | 图键内查询 + 图桥响应字段 |
 | [AC-8] | 失败可重试：停止图桥 30s，期间写入 3 条事实；恢复图桥后 3 分钟内 3 条事实全部可在图中查到 | 停止/恢复操作 + `/stats` 与图检索 |
-| [AC-9] | 队列有界且可观测：把 `queue_size` 设为 5 并持续阻断图桥，写入 20 条事实 → 进程 RSS 增量 < 50MiB，且 `graph_dropped` 计数器 > 0；恢复后可查到的 episode 数 ≤ 5 | 计数器读数 + `/stats` |
+| [AC-9] | 队列有界且可观测：把 `queue_size` 设为 5 并持续阻断图桥，写入 20 条事实 → 进程 RSS 增量 < 50MiB，且 `graph_dropped` 计数器 > 0；恢复后可查到的 episode 数 ≤ 5 | `GET /graph/stats` 的 `graph_dropped` 读数（服务侧只读端点，§8、§7）+ 图桥 `/stats` |
 | [AC-10] | 存量不受影响：图内 episode 数等于实施后新增事实数（与 3500+ 存量无关）；Qdrant `points_count` 只按期间新增量增长；`GET /memories?limit=1` 的 `total` 不回退 | Qdrant 与 REST 计数对比 |
 
 ## 11.3 检索融合
@@ -490,7 +515,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | 编号 | 验收内容 | 判定方式 |
 | --- | --- | --- |
 | [AC-11] | 图信号真实参与打分：隔离 `user_id` 构造两条近似候选（B 被图检索命中、A 未被命中）→ 开启图能力后 B 的 `final_score` 高于关闭态同名条目的 `final_score`，且 `explain` 中 B 的 `graph_boost > 0`、A 的 `graph_boost = 0.0` | 两态各跑一次 `POST /search?explain=true` 逐条比对 |
-| [AC-12] | 图信号有上限：任一候选的 `graph_boost ≤ weight`（默认 0.5）；把 `explain` 的 `graph_boost` 与 `max_possible_score` 相除，占比 ≤ 0.167 | 读取响应 JSON 的 `score_details` |
+| [AC-12] | 图信号有上限：任一候选的 `graph_boost ≤ weight`（默认 0.5）；且 `graph_boost / max_possible_score ≤ W_g / (1.0 + has_bm25 + has_entity + W_g)`——**上界随实际启用的信号数变化**，四信号全开（分母 3.0）时收为 0.167，只启用图信号时（分母 1.5）为 0.333。判据把前提写进公式，不再是「无条件 ≤ 0.167」 | 读取响应 JSON 的 `score_details`，代入选定的 `W_g` 与本次分母 |
 | [AC-13] | 不引入、不淘汰候选：`top_k` 取等于候选池规模时，开启与关闭图能力两种状态下返回的 id **集合完全相同**，仅顺序可能不同；开启态不存在 `threshold` 以下的候选进入结果 | 两态对比 id 集合 |
 | [AC-14] | 保序判据成立：对真实语料 20 条 query × `top_k=50` 扫描，不存在 `s_A ≥ (s_B + 0.5)/0.90` 却被翻转的候选对（A 在前） | 用 `explain` 的 `semantic_score` 全对扫描 |
 | [AC-15] | 与时间因子复合正确：开启两机制时 `explain` 同时含 `graph_boost` 与 `decay_weight` / `retention` / `memory_strength_days` / `elapsed_days` / `access_count`；单独关闭其中之一，另一机制的分量与行为不变 | 三种开关组合各跑一次比对 |
@@ -503,12 +528,12 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 | 编号 | 验收内容 | 判定方式 |
 | --- | --- | --- |
-| [AC-20] | 图桥停止：`POST /memories` 与 `POST /search` 均返回 2xx；检索结果与关闭态逐条相等；日志出现跳过一次的计数 | 停容器 + 两态比对 |
+| [AC-20] | 图桥停止：`POST /memories` 与 `POST /search` 均返回 2xx；检索结果的 id 序与分数与关闭态逐条相等，且每条结果的 `graph_status` 标为 `error`（图桥不可达）或 `timeout`（未在预算内返回）；被跳过的派发计入 `graph_dropped` | 停容器 + 两态比对 + `GET /graph/stats` 读数 |
 | [AC-21] | 图库停止（图桥在）：行为同 [AC-20]，结果与关闭态逐条相等 | 停 FalkorDB + 两态比对 |
 | [AC-22] | 超时预算生效：把 `timeout_seconds` 设为 0.001 后连续 10 次 `POST /search`，响应时延 p95 与关闭态差 ≤ 5%，结果与关闭态一致 | 两态计时与结果比对 |
 | [AC-23] | 畸形数据不致命：图桥返回空列表、缺字段、伪造 memory id 三种响应时，`POST /search` 返回 2xx、无 5xx、结果与关闭态一致（图分量按 0 计） | 注入响应 + 结果比对 |
 | [AC-24] | 失败不回滚事实：图桥全阻断期间写入 5 条事实，解除阻断后 5 条在 Qdrant 中均可检索到（`GET /memories/{id}` 命中） | 写入 + 读取 |
-| [AC-25] | 熔断生效并可恢复：连续 5 次失败后进入冷却，冷却窗口内的派发被记为丢弃（不发起新请求，图桥访问日志 0 次）；冷却结束后自动放行（访问日志恢复增长） | 计数器 + 图桥访问日志 |
+| [AC-25] | 熔断生效并可恢复：连续 5 次失败后进入冷却，冷却窗口内的派发被记为丢弃（不发起新请求，图桥访问日志 0 次）；冷却结束后自动放行（访问日志恢复增长） | `GET /graph/stats` 的 `circuit_open` / `consecutive_failures` / `graph_dropped` 读数 + 图桥访问日志 |
 
 ## 11.5 开关、接口与范围
 
@@ -527,7 +552,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | --- | --- |
 | [AC-32] | 全部端到端验证使用隔离 `user_id`（`test_graph_*`）及其派生图键；验证完毕后删除图键（`DELETE /graph/{group_id}`）并清理 Qdrant 测试点，`GET /memories?limit=1` 的 `total` 回到基线值 |
 | [AC-33] | 存量 3500+ 条真实记忆全程无删除、无重建、无向量重算；`user_id=xue` 的 `points_count` 单调不减 |
-| [AC-34] | 每次测试的 `explain` 输出中对同一 query 的两次调用，`graph_boost` 取值一致（纯函数，不依赖 LLM 采样） |
+| [AC-34] | 图信号的一致性分两条判定：**(a) 健康路径**——图服务可用且两次调用都未超时（结果 `graph_status` 均为 `ok`）时，同一 query 两次 `explain` 调用的 `graph_boost` 逐条相等（折算为纯函数，不依赖 LLM 采样）；**(b) 降级路径**——发生超时（或故障）时，响应必须把该次标为 `graph_status = "timeout"`（`error`），即「不一致」只允许出现在被显式标注的那一类里，不允许静默。判据的「一致」是「健康路径确定 + 降级路径显式」，不是「任何情况下都一致」——显式降级下两次取值必然不同，那是设计而非缺陷 | 两态响应比对 + `graph_status` 取值；预算取 §6.5 的默认值（1.0s，实测尾部见 E17） |
 | [AC-35] | `make lint`（ruff，line length 120）对 `mem0/`、`server/` 改动零告警；`docker exec mem0-dev-mem0-1 python -c "from mem0.memory.graph_sync import <新符号>"` 成功 |
 | [AC-36] | 实现完成后 `bash patches/generate-patch.sh` 成功刷新 `patches/mem0-local.patch`，覆盖本次全部改动文件 |
 | [AC-37] | 图桥不修改 graphiti-core 源码：镜像内 `graphiti_core` 与 PyPI 0.30.2 的文件清单一致（无本地补丁文件） |

@@ -11,6 +11,7 @@
 | `graphiti_e2e.py` | 端到端：FalkorDB 容器 + 本机 LLM 与 embedder，写 5 条中文事实、检索、导出图统计 | 需 FalkorDB 可达（脚本内置 `127.0.0.1:16379`，按环境调整） |
 | `joinkey_probe.py` | join key 与幂等：预建 `EpisodicNode(uuid=memory_id)` → `add_episode(uuid=同)` → 检索边 `episodes` 校验 → 重放表现 | 同上；脚本内 `driver.database` 必须与 `group_id` 相同 |
 | `falkor_scale.py` | 图库规模内存模型：直连 Redis 协议压 8150 实体 + 3545 边，读 `INFO memory` | 需 FalkorDB 可达；不调用 LLM |
+| `bridge_search_latency.py` | 图桥 `/search` 尾部分位：自建探针图键（实体 + 关系边）后连续采样，给 `timeout_seconds` 选值 | 在 mem0 容器内跑（图桥不发布宿主端口）：`docker cp` 后 `docker exec mem0-dev-mem0-1 python /tmp/bridge_search_latency.py 100`；跑完 `DELETE /graph/test_graph_rect_lat` |
 
 脚本仅写探针图键（`gm-*`），不触碰 mem0 的 Qdrant 数据与线上记忆。
 
@@ -22,6 +23,7 @@
 | `e2e_responses.txt` | E6（端到端时延、实体/边规模、检索时延） |
 | `joinkey_probe.txt` | E11（join key）、E12（幂等）、E13（图键机制） |
 | `falkor_scale.txt` | E4（目标规模内存模型） |
+| `bridge_search_latency.txt` | E6（`/search` 时延的修订口径）、E17（尾部分位与预算选值） |
 | `vm_resource.txt` | E1–E3、E5、E14–E15（VM 与容器资源、Neo4j 对照、镜像体积） |
 | `official_image_probe.txt` | E8–E10（官方镜像三处缺口 G1–G3） |
 
