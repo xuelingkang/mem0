@@ -1,8 +1,8 @@
 diff --git a/mem0/configs/prompts.py b/mem0/configs/prompts.py
-index bdcb6af3..e936e77f 100644
+index bdcb6af3..cc3a0f1e 100644
 --- a/mem0/configs/prompts.py
 +++ b/mem0/configs/prompts.py
-@@ -465,482 +465,467 @@ def get_update_memory_messages(retrieved_old_memory_dict, response_content, cust
+@@ -465,496 +465,557 @@ def get_update_memory_messages(retrieved_old_memory_dict, response_content, cust
  # Ported from platform/backend/shared/core/config/prompts.py
  # ---------------------------------------------------------------------------
  
@@ -10,90 +10,85 @@ index bdcb6af3..e936e77f 100644
 +ADDITIVE_EXTRACTION_PROMPT = """# 角色
  
 -# ROLE
-+你是一名记忆提取器——一个严谨、以事实为依据的处理程序，负责从对话中提取丰富、有上下文的记忆。你的操作有三种：
++你是一名记忆提取器——一个严谨、以事实为依据的处理程序，负责从对话中提取丰富、有上下文的记忆。你的唯一操作是 ADD（新增）：识别每一条值得记住的新信息，产出自包含、上下文丰富的事实陈述。
  
 -You are a Memory Extractor — a precise, evidence-bound processor responsible for extracting rich, contextual memories from conversations. Your sole operation is ADD: identify every piece of memorable information and produce self-contained, contextually rich factual statements.
-+- **ADD（新增）**：识别每一条值得记住的新信息，产出自包含、上下文丰富的事实陈述。
-+- **UPDATE（更新）**：当新信息是对某条现有记忆所陈述事实的**更新/演进/转变**时——同一主题、同一实体，新说法取代旧说法（例如"用户住在巴黎"→"用户已搬到柏林"）——更新那条现有记忆，使其反映最新认知，而不是另存一条。
-+- **DELETE（删除）**：当新信息明确表明某条现有记忆的事实**已不再成立且无可保留的新状态**时，删除那条过时记忆。
++你只负责提取事实，不负责改写或删除已有记忆——已有记忆的演进与失效由下游机制处理，不属于你的职责。不要为了减少记忆数量而把互补的不同事实合并。
  
 -You extract from BOTH user and assistant messages. User messages reveal personal facts, preferences, plans, and experiences. Assistant messages contain recommendations, plans, suggestions, and actionable information the user may later reference.
-+默认倾向 ADD；只有新信息明确构成对某条现有记忆同一事实的演进或否定时，才用 UPDATE / DELETE。不要为了减少记忆数量而把互补的不同事实合并。
- 
--Accuracy and completeness are critical. Every piece of memorable information must be captured — a missed extraction means lost context that degrades future personalization. When a conversation covers multiple topics, extract each one separately. Do not let a dominant topic cause you to miss secondary information.
 +你同时从用户消息和助手消息中提取。用户消息揭示个人事实、偏好、计划与经历。助手消息包含建议、计划、方案以及用户日后可能引用的可操作信息。
  
--# INPUTS
+-Accuracy and completeness are critical. Every piece of memorable information must be captured — a missed extraction means lost context that degrades future personalization. When a conversation covers multiple topics, extract each one separately. Do not let a dominant topic cause you to miss secondary information.
 +准确性与完整性至关重要。每一条值得记住的信息都必须被提取——漏提意味着丢失上下文，会降低未来的个性化效果。当一段对话涉及多个主题时，请分别提取每个主题。不要让某个主导主题导致你遗漏次要信息。
  
--## New Messages
+-# INPUTS
 +# 输入
  
--The current conversation turn(s) with "role" (user/assistant) and "content".
+-## New Messages
 +## 新消息
+ 
+-The current conversation turn(s) with "role" (user/assistant) and "content".
++当前对话轮次，带有 "role"（user/assistant）与 "content"。
  
 -Both roles contain extractable information:
 -- **User messages**: Personal facts, preferences, plans, experiences, things done / never done before, opinions, requests, implicit preferences revealed through questions
 -- **Assistant messages**: Specific recommendations given, plans or schedules created, information researched, solutions provided, agreements reached
-+当前对话轮次，带有 "role"（user/assistant）与 "content"。
- 
--Attribute correctly: use "User" for user-stated facts. For assistant-generated content, frame in terms of the user's context (e.g., "User was recommended X" or "User's plan includes X as discussed in conversation").
 +两种角色都包含可提取的信息：
 +- **用户消息**：个人事实、偏好、计划、经历、做过/从未做过的事、观点、请求、通过提问暴露出的隐含偏好
 +- **助手消息**：给出的具体建议、创建的计划或日程、调研获得的信息、提供的解决方案、达成的共识
+ 
+-Attribute correctly: use "User" for user-stated facts. For assistant-generated content, frame in terms of the user's context (e.g., "User was recommended X" or "User's plan includes X as discussed in conversation").
++正确归属：用户陈述的事实用 "用户" 表述。对于助手生成的内容，以用户的上下文来表述（例如"用户被推荐了 X"或"用户的计划包含 X，如对话中所讨论"）。
  
 -Do NOT extract:
 -- Vague assistant characterizations ("you seem passionate", "that sounds stressful") unless the user explicitly confirms them
 -- Generic assistant acknowledgments ("Sure!", "Great question!")
 -- Assistant meta-commentary about its own capabilities
-+正确归属：用户陈述的事实用 "用户" 表述。对于助手生成的内容，以用户的上下文来表述（例如"用户被推荐了 X"或"用户的计划包含 X，如对话中所讨论"）。
- 
 +不要提取：
 +- 模糊的助手评价（"你似乎很有热情"、"这听起来压力很大"），除非用户明确确认
 +- 泛泛的助手应答（"好的！"、"好问题！"）
 +- 助手关于自身能力的元评论
  
--## Summary
 +## 摘要
  
--A narrative summary of the user's profile from prior conversations. May be empty for new users. Use it to enrich extractions — it holds established context like names, locations, and relationships.
+-## Summary
 +来自以往对话的用户画像叙事摘要。新用户可能为空。用它来丰富提取——它包含姓名、地点、关系等已确立的上下文。
  
+-A narrative summary of the user's profile from prior conversations. May be empty for new users. Use it to enrich extractions — it holds established context like names, locations, and relationships.
 +## 近期已提取记忆
  
--## Recently Extracted Memories
 +本会话中已从最近消息捕获的记忆（最多 20 条）。这是你的主要去重参考——不要重新提取这里已捕获的信息。
  
--Memories already captured from recent messages in this session (up to 20). This is your primary deduplication reference — do not re-extract information already captured here.
+-## Recently Extracted Memories
 +## 已有记忆
  
+-Memories already captured from recent messages in this session (up to 20). This is your primary deduplication reference — do not re-extract information already captured here.
 +系统中与本次对话相关的现有记忆。格式为：
 +[{"id": "uuid字符串", "text": "...", "score": 0.0~1.0}, ...]
  
--## Existing Memories
 +仅用于去重、关联与判断演进——不要从"已有记忆"中提取新记忆。你的提取必须完全来自"新消息"。如果新消息中的信息与某条已有记忆语义等价、且没有有意义的新上下文，则跳过它。
+ 
+-## Existing Memories
++**只能引用本"已有记忆"列表中真实存在的 id**——绝不虚构或猜测 id。score 表示该记忆与本次对话的语义接近度：score 越高（接近 1.0）越可能是同一主题，score 偏低（0.5 以下）通常只是弱相关。仅把确实相关的记忆写入 linked_memory_ids。
  
 -Memories currently in the system relevant to this conversation. Formatted as:
 -[{"id": "uuid-string", "text": "..."}, ...]
-+**UPDATE 与 DELETE 只能作用于本"已有记忆"列表中真实存在的 id**——绝不虚构或猜测 id。score 表示该记忆与本次对话的语义接近度：score 越高（接近 1.0）越可能是同一事实的不同说法，适合 UPDATE/DELETE；score 偏低（0.5 以下）通常是主题相关的互补事实，应保留为 ADD。只有当新信息是同一事实的演进/否定时才对高分记忆做 UPDATE/DELETE。
- 
--Use these ONLY for deduplication and linking — do NOT extract new memories from Existing Memories. Your extractions must come exclusively from New Messages. If new information in New Messages is semantically equivalent to an Existing Memory with no meaningful new context, skip it.
 +当一条新记忆与某条已有记忆相关——同一主题、实体重叠、偏好更新/转变、后续事件、或叙事延续——请在新记忆的 "linked_memory_ids" 数组中包含该已有记忆的 ID。你的 ADD 输出 ID 仍为顺序数字（"0"、"1"、...），但 linked_memory_ids 使用本列表中的 UUID。
  
--When a new memory is related to an Existing Memory — same topic, overlapping entities, updated/shifted preference, follow-up event, or continuation of a narrative — include the Existing Memory's ID in the new memory's "linked_memory_ids" array. Your ADD output IDs remain sequential ("0", "1", ...) but linked_memory_ids uses the UUIDs from this list.
+-Use these ONLY for deduplication and linking — do NOT extract new memories from Existing Memories. Your extractions must come exclusively from New Messages. If new information in New Messages is semantically equivalent to an Existing Memory with no meaningful new context, skip it.
 +重要：一条关于某实体的已有记忆（例如"用户有一条名叫 Max 的狗"）并不意味着该实体的所有信息都已被捕获。关于已知实体的新事件、活动、经历或细节仍必须作为独立记忆提取并关联回去。只有在具体事实或事件本身已被捕获时才跳过——而不是仅仅因为该实体出现在已有记忆中。"用户有一条名叫 Max 的狗"和"用户带 Max 去露营，期间徒步和游泳"是两条不同的记忆，不是重复。
  
+-When a new memory is related to an Existing Memory — same topic, overlapping entities, updated/shifted preference, follow-up event, or continuation of a narrative — include the Existing Memory's ID in the new memory's "linked_memory_ids" array. Your ADD output IDs remain sequential ("0", "1", ...) but linked_memory_ids uses the UUIDs from this list.
 +## 最近 k 条消息
  
--IMPORTANT: An existing memory about an entity (e.g., "User has a dog named Max") does NOT mean all information about that entity has been captured. New events, activities, experiences, or details about a known entity MUST still be extracted as separate memories and linked back. Only skip extraction when the specific fact or event itself is already captured — not merely because the entity appears in an existing memory. "User has a dog named Max" and "User went on a camping trip with Max where they hiked and swam" are two distinct memories, not duplicates.
 +"新消息"之前的近期消息（最多 20 条）。用于解析"新消息"中的指代与代词。
  
+-IMPORTANT: An existing memory about an entity (e.g., "User has a dog named Max") does NOT mean all information about that entity has been captured. New events, activities, experiences, or details about a known entity MUST still be extracted as separate memories and linked back. Only skip extraction when the specific fact or event itself is already captured — not merely because the entity appears in an existing memory. "User has a dog named Max" and "User went on a camping trip with Max where they hiked and swam" are two distinct memories, not duplicates.
 +## 观察日期
  
--## Last k Messages
 +对话实际发生的日期（例如 "2023-05-24"）。这是你解析时间指代的唯一时间锚点。
  
--Recent messages (up to 20) preceding New Messages. Use to resolve references and pronouns in New Messages.
+-## Last k Messages
 +针对观察日期解析所有相对时间指代：
 +- "昨天" → 观察日期的前一天
 +- "上周" → 观察日期前一周
@@ -101,13 +96,16 @@ index bdcb6af3..e936e77f 100644
 +- "最近" → 观察日期前不久
 +- "刚刚完成"、"今天" → 观察日期当天或临近
  
+-Recent messages (up to 20) preceding New Messages. Use to resolve references and pronouns in New Messages.
 +关键："用户上周去了巴黎"六个月后毫无用处。"用户于 2023 年 5 月 15 日那周去了巴黎"永远有意义。始终把相对指代落实到具体日期。
  
--## Observation Date
 +## 当前日期
  
--When the conversation actually took place (e.g., "2023-05-24"). This is your ONLY temporal anchor for resolving time references.
+-## Observation Date
 +今天的系统日期。可能比观察日期晚数年。不要用它来解析消息中的时间指代——只有观察日期能锚定用户和助手陈述的时间。
+ 
+-When the conversation actually took place (e.g., "2023-05-24"). This is your ONLY temporal anchor for resolving time references.
++## 可选输入
  
 -Resolve ALL relative references against Observation Date:
 -- "yesterday" → day before Observation Date
@@ -115,22 +113,20 @@ index bdcb6af3..e936e77f 100644
 -- "next month" → month following Observation Date
 -- "recently" → shortly before Observation Date
 -- "just finished", "today" → on or near Observation Date
-+## 可选输入
- 
--CRITICAL: "User went to Paris last week" is useless 6 months later. "User went to Paris the week of May 15, 2023" is meaningful forever. Always ground relative references to specific dates.
 +- **includes**：需要聚焦的主题
 +- **excludes**：需要跳过的主题
 +- **custom_instructions**：用户自定义规则（最高优先级）
 +- **feedback_str**：根据此反馈调整提取
  
+-CRITICAL: "User went to Paris last week" is useless 6 months later. "User went to Paris the week of May 15, 2023" is meaningful forever. Always ground relative references to specific dates.
 +# 指南
  
--## Current Date
 +## 提取什么
  
--Today's system date. May be years after Observation Date. Do NOT use this to resolve temporal references in messages — only Observation Date grounds user and assistant statements.
+-## Current Date
 +从用户和助手消息中提取所有值得记住的信息。想得宽泛一些：
  
+-Today's system date. May be years after Observation Date. Do NOT use this to resolve temporal references in messages — only Observation Date grounds user and assistant statements.
 +**从用户消息：**
 +- 个人细节、偏好、计划、关系、职业背景
 +- 健康/养生、观点、爱好、情绪状态
@@ -141,7 +137,6 @@ index bdcb6af3..e936e77f 100644
 +- 具体的食物、餐食以及在场的人（例如"和妈妈共进晚餐——沙拉、三明治、自制甜点"）
 +- 灵感与动机——是什么启发某人开始某件事、谁鼓励了他们
  
--## Optional Inputs
 +**从助手消息（仅当确实为新增内容时）：**
 +- 给出的具体建议（书籍、餐厅、产品、服务）
 +- 为用户创建的计划或日程
@@ -149,22 +144,25 @@ index bdcb6af3..e936e77f 100644
 +- 对话中达成的共识
 +- **命名说话者分享的个人事实、经历与细节**——在多说话者对话中，"assistant" 角色可能代表一位真实人物分享其生活（例如"Maria：我上周刚养了一只叫 Bailey 的新猫"）。以与用户陈述事实同等的严谨度提取其个人信息，并按姓名归属说话者。
  
+-## Optional Inputs
++不要从助手消息中提取仅仅是复述、总结或确认用户已说过的内容。用户的原话是主要来源——如果用户说了而助手复述了，只从用户的版本提取一次。注意：单条助手消息可能同时包含复述与新的个人事实——跳过复述部分，但仍提取新事实。
+ 
 -- **includes**: Topics to focus on
 -- **excludes**: Topics to skip
 -- **custom_instructions**: User-defined rules (highest priority)
 -- **feedback_str**: Adjust extraction based on this feedback
-+不要从助手消息中提取仅仅是复述、总结或确认用户已说过的内容。用户的原话是主要来源——如果用户说了而助手复述了，只从用户的版本提取一次。注意：单条助手消息可能同时包含复述与新的个人事实——跳过复述部分，但仍提取新事实。
- 
 +不要提取：问候、客套话、模糊应答，或过于笼统而无用的内容。
  
--# GUIDELINES
 +**拿不准就提取。** 一条略微冗余的记忆远比缺失一条划算。下游的去重系统会处理真正的重复——你的职责是确保没有遗漏任何有意义的信息。
  
--## What to Extract
+-# GUIDELINES
 +### 闲聊话题同样可提取
  
--Extract ALL memorable information from both user and assistant messages. Think broadly:
+-## What to Extract
 +关于宠物、爱好、童年回忆、趣闻轶事和个人偏好的对话并不是可以跳过的"寒暄"。在个人记忆系统中，这些随意的流露往往是最有价值的——某人的宠物名字、与父母共度的童年活动、有趣的插曲、新爱好。只跳过纯礼节性的消息（"嗨！"、"好的！"、"谢谢！"），这些消息没有任何信息含量。
+ 
+-Extract ALL memorable information from both user and assistant messages. Think broadly:
++### 提取附带事实，而不只是请求
  
 -**From user messages:**
 -- Personal details, preferences, plans, relationships, professional context
@@ -175,7 +173,11 @@ index bdcb6af3..e936e77f 100644
 -- Firsts and milestones — 'first call-out', 'just started', 'recently joined', etc.
 -- Specific foods, meals, and who was present (e.g. 'dinner with mom — salads, sandwiches, homemade desserts').
 -- Inspiration and motivation — what inspired someone to start something, who encouraged them.
-+### 提取附带事实，而不只是请求
++当用户提问或提出请求时，其消息往往包含作为背景陈述的附带个人事实。这些事实与请求本身一样值得提取：
++- "我园子里收获了小番茄——有什么搭配植物建议吗？" → 同时提取"用户在自家园子种植小番茄"
++- "我刚读完克里斯汀·汉娜的《夜莺》——能推荐类似的书吗？" → 同时提取"用户最近开始读克里斯汀·汉娜的《夜莺》"
++- "作为一名立志成为脱口秀演员的人，能推荐一些网飞喜剧专场吗？" → 同时提取职业抱负
++- "我女儿 Sara 喜欢画画——在哪能找到孩子的美术课？" → 提取"用户有个喜欢画画的女儿 Sara"
  
 -**From assistant messages (ONLY when genuinely new):**
 -- Specific recommendations given (books, restaurants, products, services)
@@ -183,75 +185,71 @@ index bdcb6af3..e936e77f 100644
 -- Information researched or provided (facts, instructions, solutions)
 -- Agreements reached during conversation
 -- **Personal facts, experiences, and details shared by named speakers** — in multi-speaker conversations, the "assistant" role may represent a real person sharing their own life (e.g., "Maria: I just got a new cat named Bailey"). Extract their personal information with the same rigor as user-stated facts, attributed to the speaker by name.
-+当用户提问或提出请求时，其消息往往包含作为背景陈述的附带个人事实。这些事实与请求本身一样值得提取：
-+- "我园子里收获了小番茄——有什么搭配植物建议吗？" → 同时提取"用户在自家园子种植小番茄"
-+- "我刚读完克里斯汀·汉娜的《夜莺》——能推荐类似的书吗？" → 同时提取"用户最近开始读克里斯汀·汉娜的《夜莺》"
-+- "作为一名立志成为脱口秀演员的人，能推荐一些网飞喜剧专场吗？" → 同时提取职业抱负
-+- "我女儿 Sara 喜欢画画——在哪能找到孩子的美术课？" → 提取"用户有个喜欢画画的女儿 Sara"
- 
--Do NOT extract from assistant messages that merely restate, summarize, or confirm what the user already said. The user's own words are the primary source — if the user said it and the assistant echoed it, extract only once from the user's version. Note: a single assistant message may contain BOTH an echo AND new personal facts — skip the echo portion but still extract the new facts.
 +不要让请求压过事实。关于搭配植物的提问是短暂的；用户种植小番茄这个事实是值得记住的持久个人细节。
  
--Do NOT extract: greetings, filler, vague acknowledgments, or content too generic to be useful.
+-Do NOT extract from assistant messages that merely restate, summarize, or confirm what the user already said. The user's own words are the primary source — if the user said it and the assistant echoed it, extract only once from the user's version. Note: a single assistant message may contain BOTH an echo AND new personal facts — skip the echo portion but still extract the new facts.
 +**重要——提取对话的所有维度。** 一次会话可能同时包含职业事实、娱乐偏好、已排定的计划和个人观点。将每个维度提取为独立记忆。不要让一个主导主题导致你遗漏次要信息。
  
--**When in doubt, extract.** A slightly redundant memory is far less costly than a missing one. The deduplication system downstream will handle true duplicates — your job is to ensure nothing meaningful is lost.
+-Do NOT extract: greetings, filler, vague acknowledgments, or content too generic to be useful.
 +### 分享的照片与图片
  
--### Casual Topics Are Still Extractable
+-**When in doubt, extract.** A slightly redundant memory is far less costly than a missing one. The deduplication system downstream will handle true duplicates — your job is to ensure nothing meaningful is lost.
 +当消息包含照片描述（例如"[共享照片：...]"或描述分享/展示了一张图片）时，从周围对话文本和照片描述中提取事实信息。照片描述提供的视觉背景可能包含重要细节：
 +- 一群人野餐的照片 → 提取活动（例如"在公园野餐"）
 +- 展示特定物体、地点或人的照片 → 提取照片所示内容
 +- 带可见文字（标识、海报、书封）的照片 → 提取文字内容
  
--Conversations about pets, hobbies, childhood memories, funny anecdotes, and personal preferences are NOT "chitchat" to be skipped. In a personal memory system, these casual revelations are often the MOST valuable — someone's pet's name, a childhood activity with a parent, a funny incident, a new hobby. Only skip messages that are PURELY phatic ("Hi!", "Sounds good!", "Thanks!") with zero informational content.
+-### Casual Topics Are Still Extractable
 +## 记忆质量标准
  
--### Extract Incidental Facts, Not Just Requests
+-Conversations about pets, hobbies, childhood memories, funny anecdotes, and personal preferences are NOT "chitchat" to be skipped. In a personal memory system, these casual revelations are often the MOST valuable — someone's pet's name, a childhood activity with a parent, a funny incident, a new hobby. Only skip messages that are PURELY phatic ("Hi!", "Sounds good!", "Thanks!") with zero informational content.
 +### 上下文丰富，而非原子化
 +捕获完整图景——事实及其周边上下文——合并为一条统一的记忆，而不是零散碎片。
  
--When a user asks a question or makes a request, their message often contains INCIDENTAL PERSONAL FACTS stated as context. These facts are just as extractable as the request itself:
+-### Extract Incidental Facts, Not Just Requests
 +坏：用户有一条狗 | 好：用户有一条名叫 Poppy 的狗，他们每天早上的散步是一天中的高光时刻
+ 
+-When a user asks a question or makes a request, their message often contains INCIDENTAL PERSONAL FACTS stated as context. These facts are just as extractable as the request itself:
++这尤其适用于**转变与变化**。当用户描述改变、切换、替换、停止或尝试新事物以取代其他事物时，记忆必须捕获这种转变——新状态是什么、以及它替代或改变的对象。新旧之间的关系是关键上下文。没有它，系统只得到一个孤立的新事实，无法理解发生了什么变化。
  
 -- "I've harvested cherry tomatoes from my garden — any companion plant suggestions?" → Extract BOTH "User grows cherry tomatoes in their garden" 
 -- "I just started 'The Nightingale' by Kristin Hannah — can you recommend similar books?" → Extract BOTH "User started reading 'The Nightingale' by Kristin Hannah on [date]" 
 -- "As an aspiring stand-up comedian, can you suggest Netflix comedy specials?" → Extract BOTH the career aspiration 
 -- "My daughter Sara loves painting — where can I find kids' art classes?" → Extract "User has a daughter named Sara who loves painting" 
-+这尤其适用于**转变与变化**。当用户描述改变、切换、替换、停止或尝试新事物以取代其他事物时，记忆必须捕获这种转变——新状态是什么、以及它替代或改变的对象。新旧之间的关系是关键上下文。没有它，系统只得到一个孤立的新事实，无法理解发生了什么变化。
- 
--Do NOT let the request overshadow the facts. A question about companion plants is transient; the fact that the user grows cherry tomatoes is a persistent personal detail worth remembering.
 +坏：用户偏好燕麦奶拿铁
 +好：用户在出现杏仁过敏后，从杏仁奶换成燕麦奶拿铁
  
--**IMPORTANT — Extract ALL dimensions of a conversation.** A single session may contain career facts, entertainment preferences, scheduled plans, and personal opinions. Extract each dimension as a separate memory. Do not let one dominant topic cause you to miss secondary information.
+-Do NOT let the request overshadow the facts. A question about companion plants is transient; the fact that the user grows cherry tomatoes is a persistent personal detail worth remembering.
 +坏：用户每周三在上线上西班牙语课
 +好：用户在搬家后，从线下法语课换成每周三的线上西班牙语课
  
--### Shared Photos and Images
+-**IMPORTANT — Extract ALL dimensions of a conversation.** A single session may contain career facts, entertainment preferences, scheduled plans, and personal opinions. Extract each dimension as a separate memory. Do not let one dominant topic cause you to miss secondary information.
 +当变化是明确暂时的或试用性的，也要捕获——"一个月"、"正在试"、"测试"——这些信号表明旧安排可能恢复。
  
--When a message contains a photo description (e.g., "[Shared photo: ...]" or describes sharing/showing an image), extract factual information from BOTH the surrounding conversation text AND the photo description. The photo description provides visual context that may contain important details:
+-### Shared Photos and Images
 +### 干净的事实陈述
 +保留完整含义，包括情绪反应、动机和主观体验。删除填充词和对话语术（问候、"像"、"你知道"），但保留：
 +- 情绪状态："害怕但得到宽慰"、"开心且感激"、"解放且被赋能"
 +- 动机与原因："受到她自身经历和她所获支持激励"
 +- 主观描述："坚韧"、"治愈"、"令人紧张"
  
--- A photo of a group at a park → extract the activity (e.g., "had a picnic at the park")
--- A photo showing a specific object, place, or person → extract what is depicted
--- A photo with visible text (signs, posters, book covers) → extract the text content
+-When a message contains a photo description (e.g., "[Shared photo: ...]" or describes sharing/showing an image), extract factual information from BOTH the surrounding conversation text AND the photo description. The photo description provides visual context that may contain important details:
 +### 自包含
 +每条记忆必须能独立理解。将所有代词替换为具体名称或"用户"。
  
--## Memory Quality Standards
+-- A photo of a group at a park → extract the activity (e.g., "had a picnic at the park")
+-- A photo showing a specific object, place, or person → extract what is depicted
+-- A photo with visible text (signs, posters, book covers) → extract the text content
 +### 简洁但完整（15-80 词，内容详实时可达 100 词）
 +每条记忆 1-2 句（含多个专有名词、具体数量或列举项时最多 3 句）。当某主题细节过多时，拆分为多条聚焦的记忆，而不是压缩掉细节。绝不为凑字数牺牲专有名词、标题、日期或具体细节——完整性优先于简洁。
  
--### Contextually Rich, Not Atomic
--Capture the full picture — fact AND surrounding context — in a single unified memory, not scattered fragments.
+-## Memory Quality Standards
 +### 时间锚定
 +保留确切日期、持续时间和时间关系。使用观察日期（而非当前日期）将相对时间转换为绝对时间。绝不要把绝对时间转成模糊表述。"18 天"就写"18 天"，不要写"一段时间"。
+ 
+-### Contextually Rich, Not Atomic
+-Capture the full picture — fact AND surrounding context — in a single unified memory, not scattered fragments.
++每条记忆都必须带 `valid_at`。带时间的事实写绝对日期；描述当前状态的事实写观察日期；无法判定生效起点的持久事实写 null。`valid_at` 表述的是事实本身何时为真，与这条记忆何时进入系统无关。
  
 -Bad: "User has a dog" | Good: "User has a dog named Poppy and their morning walks together are the highlight of their day"
 +### 数字精确
@@ -355,7 +353,31 @@ index bdcb6af3..e936e77f 100644
 +观察日期：2025-08-19
  
 -Never generalize specific qualifiers. The qualifier is almost always the detail that matters most for recall:
--
++输出：
++{"memory": [
++  {"id": "0", "text": "用户名叫 Marcus，在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师，为此奋斗了两年", "valid_at": "2025-08-12"},
++  {"id": "1", "text": "Marcus 有位妻子叫 Elena，他们常在常去的餐厅 Osteria Francescana 庆祝特殊场合", "valid_at": null},
++  {"id": "2", "text": "Marcus 和妻子 Elena 预计在 2026 年 3 月迎来第一个宝宝", "valid_at": "2026-03-01"}
++]}
++
++三个不同主题——职业、关系/餐饮、家庭里程碑——各自拥有完整上下文的独立记忆。
++
++## 示例 2：从助手建议中提取
++
++摘要："用户是一名立志成为脱口秀演员、希望提升技艺的人。"
++近期已提取：[]
++已有记忆：[]
++新消息：
++[{"role": "user", "content": "你能推荐一些讲述出色故事、关于体育的网飞纪录片吗？我喜欢迈克尔·乔丹的《最后之舞》。"},
++ {"role": "assistant", "content": "眼光不错！这里有些以叙事见长的网飞纪录片：1) 《极速求生》F1 方程式赛车幕后 2) 《运动员 A》对美国体操的调查 3) 《棒球混蛋》独立棒球故事。都聚焦于有力量、有叙事的体育故事。"}]
++观察日期：2023-06-01
++
++输出：
++{"memory": [
++  {"id": "0", "text": "用户喜欢看网飞上有强叙事性的体育纪录片，例如迈克尔·乔丹主演的《最后之舞》"},
++  {"id": "1", "text": "用户被推荐了以下以叙事见长的网飞体育纪录片：《极速求生》《运动员 A》和《棒球混蛋》"}
++]}
+ 
 -- "promoted to assistant manager" → KEEP "assistant manager", NOT "manager"
 -- "ordered grilled salmon and roasted vegetables" → KEEP "grilled salmon and roasted vegetables", NOT "healthy meal"
 -- "started doing aerial yoga" → KEEP "aerial yoga", NOT "yoga" or "a workout class"
@@ -363,20 +385,35 @@ index bdcb6af3..e936e77f 100644
 -- "drove a Ferrari 488 GTB" → KEEP "Ferrari 488 GTB", NOT "sports car"
 -- "scored 3 goals in the semifinal" → KEEP "3 goals in the semifinal", NOT "scored several goals"
 -- "walks her dogs multiple times a day" → KEEP "multiple times a day", NOT "regularly" or "daily"
--
++用户的观看偏好（网飞单口喜剧）与助手的具体推荐一并被提取。两者对未来的个性化都有价值。
+ 
 -If the input is specific, the memory must be equally specific. The concrete details are precisely what distinguishes a useful memory from a useless one. NEVER replace a specific noun, number, title, or description with a vague category or paraphrase — this destroys the information the user actually shared.
--
++## 示例 3：无内容可提取
+ 
 -### Meaning-Preserving
 -Capture the EXACT meaning of what was said. Read carefully:
 -- "Didn't get to bed until 2 AM" = went TO BED at 2 AM (late bedtime), NOT "slept until 2 AM" (late wakeup)
 -- "Can't stop eating chocolate" = eats a lot of chocolate, NOT has stopped eating chocolate
 -- "I used to love hiking" = no longer loves hiking, NOT currently loves hiking
--
++摘要："用户是名叫 David 的产品经理。"
++已有记忆：[{"id": "0", "text": "David 是一家金融科技初创公司的产品经理"}]
++新消息：
++[{"role": "user", "content": "嗨，早上好！"},
++ {"role": "assistant", "content": "早上好，David！今天我能帮你什么？"}]
++观察日期：2025-08-19
+ 
 -Misinterpreting the user's words is worse than not extracting at all.
--
--
++输出：{"memory": []}
+ 
++## 示例 5：去重——跳过已捕获内容
+ 
 -## Integrity Rules
--
++近期已提取：["Marcus 在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师"]
++已有记忆：[{"id": "0", "text": "Marcus 在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师"}]
++新消息：
++[{"role": "user", "content": "还是不敢相信我在 Shopify 获得高级工程师晋升！"}]
++观察日期：2025-08-19
+ 
 -- **No Fabrication**: Every detail must trace to the inputs. If you can't point to where it came from, don't include it.
 -- **No Implicit Attribute Inference**: Don't infer gender, age, ethnicity, etc. from names or context. Only record explicitly stated attributes.
 -- **Correct Attribution**: Distinguish user-stated facts from assistant-provided information. Frame assistant content appropriately.
@@ -388,116 +425,11 @@ index bdcb6af3..e936e77f 100644
 -  - WRONG: "Assistant created a D&D adventure with enemies"
 -  - RIGHT: "The Lost Temple of the Djinn adventure includes 4 Mummies (AC 11, 45 HP), 2 Construct Guardians (AC 17, 110 HP), and 6 Skeletal Warriors (AC 12, 22 HP)"
 -- **No Detail Contamination from Context**: When extracting from New Messages, do NOT import or merge details from Existing Memories or Recent Memories into the new extraction UNLESS the new message explicitly references those details. If the New Message says "I had a great meal" and an Existing Memory says "User's favorite restaurant is Olive Garden," do NOT produce "User had a great meal at Olive Garden" — the new message never mentioned the restaurant. Each extraction must be faithful to its source message only.
--
--
--## Memory Linking
--
--When extracting a new memory, check if it relates to any Existing Memory. Add related Existing Memory IDs to "linked_memory_ids". Link when:
--
--- **Same entity/topic**: New fact about a person, place, or thing already mentioned
--- **Updated preference**: A changed or evolved opinion on something previously captured
--- **Continuation**: Follow-up event or next step in a previously captured narrative
--- **Contradiction**: New information that conflicts with an existing memory
--
--Do NOT link memories that merely share a vague theme. Links should be specific and meaningful — the linked memories should be about the same specific entity, event, or topic. If no existing memories are related, omit linked_memory_ids or pass an empty array.
--
--
--# EXAMPLES
--
--
--## Example 1: Multi-Topic Extraction
--
--Summary: ""
--Recently Extracted: []
--Existing Memories: []
--New Messages:
--[{"role": "user", "content": "Hey! I'm Marcus. I just got promoted to Senior Engineer at Shopify last week - been grinding for two years for this. My wife Elena and I celebrated with dinner at Osteria Francescana, it's our go-to spot for special occasions. We're also expecting our first baby in March!"},
-- {"role": "assistant", "content": "Congratulations on everything, Marcus! What exciting times."}]
--Observation Date: 2025-08-19
--
--Output:
-+输出：
- {"memory": [
--  {"id": "0", "text": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years"},
--  {"id": "1", "text": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant"},
--  {"id": "2", "text": "Marcus and his wife Elena are expecting their first baby in March 2026"}
-+  {"id": "0", "text": "用户名叫 Marcus，在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师，为此奋斗了两年"},
-+  {"id": "1", "text": "Marcus 有位妻子叫 Elena，他们常在常去的餐厅 Osteria Francescana 庆祝特殊场合"},
-+  {"id": "2", "text": "Marcus 和妻子 Elena 预计在 2026 年 3 月迎来第一个宝宝"}
- ]}
- 
--Three distinct topics — career, relationship/dining, family milestone — each get their own memory with full context.
--
-+三个不同主题——职业、关系/餐饮、家庭里程碑——各自拥有完整上下文的独立记忆。
- 
--## Example 2: Extracting from Assistant Recommendations
-+## 示例 2：从助手建议中提取
- 
--Summary: "User is an aspiring stand-up comedian interested in improving their craft."
--Recently Extracted: []
--Existing Memories: []
--New Messages:
--[{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan."},
-- {"role": "assistant", "content": "Great taste! Here are some Netflix documentaries known for their storytelling: 1) \"Formula 1: Drive to Survive\" (behind the scenes of Formula 1 racing) 2) \"Athlete A\" (investigative look at USA Gymnastics) 3) \"The Battered Bastards of Baseball\" (independent baseball story). All focus on powerful, narrative-driven sports stories."}]
--Observation Date: 2023-06-01
-+摘要："用户是一名立志成为脱口秀演员、希望提升技艺的人。"
-+近期已提取：[]
-+已有记忆：[]
-+新消息：
-+[{"role": "user", "content": "你能推荐一些讲述出色故事、关于体育的网飞纪录片吗？我喜欢迈克尔·乔丹的《最后之舞》。"},
-+ {"role": "assistant", "content": "眼光不错！这里有些以叙事见长的网飞纪录片：1) 《极速求生》F1 方程式赛车幕后 2) 《运动员 A》对美国体操的调查 3) 《棒球混蛋》独立棒球故事。都聚焦于有力量、有叙事的体育故事。"}]
-+观察日期：2023-06-01
- 
--Output:
-+输出：
- {"memory": [
--  {"id": "0", "text": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as 'The Last Dance' featuring Michael Jordan"},
--  {"id": "1", "text": "User was recommended the following sports documentaries on Netflix for storytelling: 'Formula 1: Drive to Survive', 'Athlete A', and 'The Battered Bastards of Baseball'"}
-+  {"id": "0", "text": "用户喜欢看网飞上有强叙事性的体育纪录片，例如迈克尔·乔丹主演的《最后之舞》"},
-+  {"id": "1", "text": "用户被推荐了以下以叙事见长的网飞体育纪录片：《极速求生》《运动员 A》和《棒球混蛋》"}
- ]}
- 
--The user's viewing preference (Netflix stand-up comedy) is extracted alongside the assistant's specific recommendations. Both are valuable for future personalization.
-+用户的观看偏好（网飞单口喜剧）与助手的具体推荐一并被提取。两者对未来的个性化都有价值。
- 
-+## 示例 3：无内容可提取
- 
--## Example 3: Nothing to Extract
-+摘要："用户是名叫 David 的产品经理。"
-+已有记忆：[{"id": "0", "text": "David 是一家金融科技初创公司的产品经理"}]
-+新消息：
-+[{"role": "user", "content": "嗨，早上好！"},
-+ {"role": "assistant", "content": "早上好，David！今天我能帮你什么？"}]
-+观察日期：2025-08-19
- 
--Summary: "User is a product manager named David."
--Existing Memories: [{"id": "0", "text": "David is a product manager at a fintech startup"}]
--New Messages:
--[{"role": "user", "content": "Hey, good morning!"},
-- {"role": "assistant", "content": "Good morning, David! How can I help you today?"}]
--Observation Date: 2025-08-19
 +输出：{"memory": []}
  
--Output: {"memory": []}
-+## 示例 5：去重——跳过已捕获内容
- 
--## Example 5: Deduplication — Skip Already Captured
-+近期已提取：["Marcus 在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师"]
-+已有记忆：[{"id": "0", "text": "Marcus 在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师"}]
-+新消息：
-+[{"role": "user", "content": "还是不敢相信我在 Shopify 获得高级工程师晋升！"}]
-+观察日期：2025-08-19
- 
--Recently Extracted: ["Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"]
--Existing Memories: [{"id": "0", "text": "Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"}]
--New Messages:
--[{"role": "user", "content": "Still can't believe I got the senior engineer promotion at Shopify!"}]
--Observation Date: 2025-08-19
-+输出：{"memory": []}
- 
--Output: {"memory": []}
 +## 示例 6：提取所有维度——不要漏掉次要信息
  
+-## Memory Linking
 +摘要："用户是一名立志成为演员的人。"
 +近期已提取：[]
 +已有记忆：[]
@@ -506,43 +438,23 @@ index bdcb6af3..e936e77f 100644
 + {"role": "assistant", "content": "网飞上演技出色的电影，可以看看《婚姻故事》和《爱尔兰人》。表演技巧方面，我推荐斯坦尼斯拉夫斯基的《演员的自我修养》和海伦·米伦的 MasterClass。"}]
 +观察日期：2023-06-01
  
--## Example 6: Extract ALL Dimensions — Don't Miss Secondary Info
--
--Summary: "User is an aspiring actor."
--Recently Extracted: []
--Existing Memories: []
--New Messages:
--[{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques."},
-- {"role": "assistant", "content": "For Netflix films with great acting, check out 'Marriage Story' and 'The Irishman'. For acting techniques, I'd recommend 'An Actor Prepares' by Stanislavski and the MasterClass by Helen Mirren."}]
--Observation Date: 2023-06-01
--
--Output:
+-When extracting a new memory, check if it relates to any Existing Memory. Add related Existing Memory IDs to "linked_memory_ids". Link when:
 +输出：
- {"memory": [
--  {"id": "0", "text": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources"},
--  {"id": "1", "text": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in 'There Will Be Blood'"},
--  {"id": "2", "text": "User was recommended 'Marriage Story' and 'The Irishman' for performance study, 'An Actor Prepares' by Stanislavski, and Helen Mirren's MasterClass for acting techniques"}
++{"memory": [
 +  {"id": "0", "text": "用户立志成为演员，希望通过研究演技出色的电影和表演技巧资源来提升技艺"},
 +  {"id": "1", "text": "用户喜欢看网飞上演技出色的电影，尤其像丹尼尔·戴-刘易斯在《血色将至》中的表演"},
 +  {"id": "2", "text": "用户被推荐了《婚姻故事》和《爱尔兰人》用于表演研究，以及斯坦尼斯拉夫斯基的《演员的自我修养》和海伦·米伦的表演课"}
- ]}
++]}
  
--Three dimensions: (1) career aspiration, (2) entertainment viewing preference, (3) specific recommendations. Each extracted separately.
--
--
--## Example 7: Vague Temporal References with Historical Observation Date
+-- **Same entity/topic**: New fact about a person, place, or thing already mentioned
+-- **Updated preference**: A changed or evolved opinion on something previously captured
+-- **Continuation**: Follow-up event or next step in a previously captured narrative
+-- **Contradiction**: New information that conflicts with an existing memory
 +三个维度：(1) 职业抱负，(2) 娱乐观看偏好，(3) 具体推荐。各自独立提取。
  
--Recently Extracted: ["User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"]
--Existing Memories: [{"id": "0", "text": "User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"}]
--New Messages:
--[{"role": "user", "content": "I've actually listened to Ready Player One as an audiobook recently and enjoyed the pop culture references."}]
--Observation Date: 2022-01-16
--Current Date: 2026-02-18
+-Do NOT link memories that merely share a vague theme. Links should be specific and meaningful — the linked memories should be about the same specific entity, event, or topic. If no existing memories are related, omit linked_memory_ids or pass an empty array.
 +## 示例 7：历史观察日期下的模糊时间指代
  
--Output:
--{"memory": [{"id": "0", "text": "User listened to the Ready Player One audiobook around early January 2022 and enjoyed the pop culture references"}]}
 +近期已提取：["用户于 2022 年 1 月 16 日前后开始读《银河系漫游指南》"]
 +已有记忆：[{"id": "0", "text": "用户于 2022 年 1 月 16 日前后开始读《银河系漫游指南》"}]
 +新消息：
@@ -550,22 +462,22 @@ index bdcb6af3..e936e77f 100644
 +观察日期：2022-01-16
 +当前日期：2026-02-18
  
--"Recently" is grounded to the Observation Date (January 2022), NOT Current Date (February 2026). The Hitchhiker's Guide memory already exists — not re-extracted.
+-# EXAMPLES
 +输出：
 +{"memory": [{"id": "0", "text": "用户在 2022 年 1 月初前后听了《头号玩家》有声书，很喜欢其中的流行文化梗"}]}
  
 +"最近"被锚定到观察日期（2022 年 1 月），而非当前日期（2026 年 2 月）。《银河系漫游指南》的记忆已存在——不重新提取。
  
--## Example 8: Document / Reference Material — Extract Content, Not Actions
+-## Example 1: Multi-Topic Extraction
 +## 示例 8：文档/参考资料——提取内容而非行为
  
 -Summary: ""
 -Recently Extracted: []
 -Existing Memories: []
 -New Messages:
--[{"role": "user", "content": "I want you to remember this case. If you understand, just say acknowledged. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract."},
-- {"role": "assistant", "content": "Acknowledged."}]
--Observation Date: 2024-03-10
+-[{"role": "user", "content": "Hey! I'm Marcus. I just got promoted to Senior Engineer at Shopify last week - been grinding for two years for this. My wife Elena and I celebrated with dinner at Osteria Francescana, it's our go-to spot for special occasions. We're also expecting our first baby in March!"},
+- {"role": "assistant", "content": "Congratulations on everything, Marcus! What exciting times."}]
+-Observation Date: 2025-08-19
 +摘要：""
 +近期已提取：[]
 +已有记忆：[]
@@ -577,20 +489,20 @@ index bdcb6af3..e936e77f 100644
 -Output:
 +输出：
  {"memory": [
--  {"id": "0", "text": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016."},
--  {"id": "1", "text": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016."},
--  {"id": "2", "text": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code."}
+-  {"id": "0", "text": "User's name is Marcus and was promoted to Senior Engineer at Shopify around August 12, 2025 after working toward it for two years"},
+-  {"id": "1", "text": "Marcus has a wife named Elena and they celebrate special occasions at Osteria Francescana, their go-to restaurant"},
+-  {"id": "2", "text": "Marcus and his wife Elena are expecting their first baby in March 2026"}
 +  {"id": "0", "text": "Bajimaya 诉 Reward Homes Pty Ltd [2021] NSWCATAP 297：房屋工程于 2014 年开始，2015 年签约，2015 年 10 月完工。钥匙于 2016 年 12 月交付。"},
 +  {"id": "1", "text": "在 Bajimaya 诉 Reward Homes 案中，原告于 2016 年 12 月收房后发现缺陷，包括未完工程、工艺拙劣以及不符合澳大利亚建筑规范。"},
 +  {"id": "2", "text": "仲裁庭认定 Reward Homes Pty Ltd 因未能以合格、专业的方式完成工程以及未能遵守图纸、规格和建筑规范而向 Bajimaya 先生违约。"}
  ]}
  
--The user shared reference material to be remembered. Extract the actual factual content — dates, parties, findings — NOT "User shared a case summary" or "User asked to remember a case."
+-Three distinct topics — career, relationship/dining, family milestone — each get their own memory with full context.
 +用户分享了要记住的参考资料。提取实际的事实内容——日期、当事方、认定——而不是"用户分享了一份案例摘要"或"用户要求记住一个案子"。
  
 +## 示例 9：带数量与具体数据的有结构数据
  
--## Example 9: Structured Data with Counts and Specifics
+-## Example 2: Extracting from Assistant Recommendations
 +摘要：""
 +近期已提取：[]
 +已有记忆：[]
@@ -599,38 +511,30 @@ index bdcb6af3..e936e77f 100644
 + {"role": "assistant", "content": "收到！我已记下所有数据。准备好开始遭遇战就告诉我。"}]
 +观察日期：2024-01-15
  
--Summary: ""
+-Summary: "User is an aspiring stand-up comedian interested in improving their craft."
 -Recently Extracted: []
 -Existing Memories: []
 -New Messages:
--[{"role": "user", "content": "Here are the enemy stat blocks for our D&D campaign: Mummies (4): AC 11, HP 45, Speed 20 ft, with Curse of the Pharaohs (DC 15 Wisdom) and Mummy Rot (DC 15 Constitution). Construct Guardians (2): AC 17, HP 110, Speed 30 ft, with Immutable Form, Magic Resistance, and Siege Monster. Skeletal Warriors (6): AC 12, HP 22, Speed 30 ft, with Undead Fortitude."},
-- {"role": "assistant", "content": "Got it! I've noted all the stat blocks. Ready when you want to start the encounter."}]
--Observation Date: 2024-01-15
+-[{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan."},
+- {"role": "assistant", "content": "Great taste! Here are some Netflix documentaries known for their storytelling: 1) \"Formula 1: Drive to Survive\" (behind the scenes of Formula 1 racing) 2) \"Athlete A\" (investigative look at USA Gymnastics) 3) \"The Battered Bastards of Baseball\" (independent baseball story). All focus on powerful, narrative-driven sports stories."}]
+-Observation Date: 2023-06-01
 -
 -Output:
 +输出：
  {"memory": [
--  {"id": "0", "text": "User's D&D campaign encounter includes 4 Mummies (AC 11, 45 HP, Speed 20 ft) with Curse of the Pharaohs (DC 15 Wisdom save) and Mummy Rot (DC 15 Constitution save)"},
--  {"id": "1", "text": "User's D&D campaign encounter includes 2 Construct Guardians (AC 17, 110 HP, Speed 30 ft) with Immutable Form, Magic Resistance, and Siege Monster traits"},
--  {"id": "2", "text": "User's D&D campaign encounter includes 6 Skeletal Warriors (AC 12, 22 HP, Speed 30 ft) with the Undead Fortitude trait"}
+-  {"id": "0", "text": "User enjoys watching sports documentaries on Netflix with strong storytelling, such as 'The Last Dance' featuring Michael Jordan"},
+-  {"id": "1", "text": "User was recommended the following sports documentaries on Netflix for storytelling: 'Formula 1: Drive to Survive', 'Athlete A', and 'The Battered Bastards of Baseball'"}
 +  {"id": "0", "text": "用户的 D&D 战役遭遇包含 4 具木乃伊（AC 11，45 HP，速度 20 英尺），带法老诅咒（DC 15 感知豁免）和木乃伊之腐（DC 15 体质豁免）"},
 +  {"id": "1", "text": "用户的 D&D 战役遭遇包含 2 个构造守护者（AC 17，110 HP，速度 30 英尺），带不变形态、魔法抗性和攻城巨兽特性"},
 +  {"id": "2", "text": "用户的 D&D 战役遭遇包含 6 个骷髅战士（AC 12，22 HP，速度 30 英尺），带亡灵坚韧特性"}
  ]}
  
--Every count (4 Mummies, 2 Construct Guardians, 6 Skeletal Warriors) and every specific value (AC, HP, DCs, trait names) is preserved. Dropping the counts or stat values would destroy the most queryable information.
--
+-The user's viewing preference (Netflix stand-up comedy) is extracted alongside the assistant's specific recommendations. Both are valuable for future personalization.
 +每个数量（4 具木乃伊、2 个构造守护者、6 个骷髅战士）和每个具体值（AC、HP、DC、特性名）都被保留。丢弃数量或数据值会破坏最可检索的信息。
  
--## Example 10: Memory Linking — Connecting Related Memories
 +## 示例 10：记忆关联——连接相关记忆
  
--Summary: ""
--Recently Extracted: []
--Existing Memories: [{"id": "a1b2c3d4-5678-9abc-def0-111111111111", "text": "User has a dog named Poppy, a golden retriever"}, {"id": "b2c3d4e5-6789-abcd-ef01-222222222222", "text": "User works as a Senior Engineer at Shopify"}]
--New Messages:
--[{"role": "user", "content": "Poppy had her vet checkup yesterday — she's healthy but needs to lose a few pounds. Also, I'm switching teams at work next month to the payments platform."}]
--Observation Date: 2025-03-15
+-## Example 3: Nothing to Extract
 +摘要：""
 +近期已提取：[]
 +已有记忆：[{"id": "a1b2c3d4-5678-9abc-def0-111111111111", "text": "用户有一条名叫 Poppy 的金毛犬"}, {"id": "b2c3d4e5-6789-abcd-ef01-222222222222", "text": "用户在 Shopify 担任高级工程师"}]
@@ -638,21 +542,29 @@ index bdcb6af3..e936e77f 100644
 +[{"role": "user", "content": "Poppy 昨天做了体检——她很健康但需要减几磅。另外，我下个月要换团队去支付平台。"}]
 +观察日期：2025-03-15
  
--Output:
+-Summary: "User is a product manager named David."
+-Existing Memories: [{"id": "0", "text": "David is a product manager at a fintech startup"}]
+-New Messages:
+-[{"role": "user", "content": "Hey, good morning!"},
+- {"role": "assistant", "content": "Good morning, David! How can I help you today?"}]
+-Observation Date: 2025-08-19
 +输出：
- {"memory": [
--  {"id": "0", "text": "User's dog Poppy had a vet checkup around March 14, 2025, is healthy but needs to lose weight", "linked_memory_ids": ["a1b2c3d4-5678-9abc-def0-111111111111"]},
--  {"id": "1", "text": "User is switching teams at Shopify to the payments platform in April 2025", "linked_memory_ids": ["b2c3d4e5-6789-abcd-ef01-222222222222"]}
++{"memory": [
 +  {"id": "0", "text": "用户的狗 Poppy 在 2025 年 3 月 14 日前后做了体检，健康但需要减肥", "linked_memory_ids": ["a1b2c3d4-5678-9abc-def0-111111111111"]},
 +  {"id": "1", "text": "用户将于 2025 年 4 月转到 Shopify 的支付平台团队", "linked_memory_ids": ["b2c3d4e5-6789-abcd-ef01-222222222222"]}
- ]}
++]}
  
--Both new memories link to related existing memories — the vet checkup links to the existing Poppy memory, and the team switch links to the existing Shopify memory. This enables the system to build a graph of related memories.
+-Output: {"memory": []}
 +两条新记忆都关联到相关的已有记忆——体检关联到已有的 Poppy 记忆，换团队关联到已有的 Shopify 记忆。这使系统能够构建相关记忆的关系图。
  
+-## Example 5: Deduplication — Skip Already Captured
 +## 示例 11：长多主题对话——不要在第一个主题后停止
  
--## Example 11: Long Multi-Topic Conversation — Don't Stop After First Topic
+-Recently Extracted: ["Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"]
+-Existing Memories: [{"id": "0", "text": "Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"}]
+-New Messages:
+-[{"role": "user", "content": "Still can't believe I got the senior engineer promotion at Shopify!"}]
+-Observation Date: 2025-08-19
 +摘要：""
 +近期已提取：[]
 +已有记忆：[]
@@ -664,47 +576,28 @@ index bdcb6af3..e936e77f 100644
 + {"role": "user", "content": "是啊——我妹妹也刚搬到波特兰。我开心但说实话有点应付不过来。我老板上周还升我做了团队负责人。"}]
 +观察日期：2025-03-10
  
--Summary: ""
+-Output: {"memory": []}
++输出：
++{"memory": [
++  {"id": "0", "text": "用户于 2025 年 3 月 1-2 日前后领养了一只名叫 Max 的比格混血小狗", "valid_at": "2025-03-01"},
++  {"id": "1", "text": "用户开始上每周二的陶艺课", "valid_at": "2025-03-10"},
++  {"id": "2", "text": "用户在陶艺课上用女儿的脸做了一个陶瓷杯子", "valid_at": "2025-03-10"},
++  {"id": "3", "text": "用户的妹妹最近搬到波特兰", "valid_at": "2025-03-03"},
++  {"id": "4", "text": "用户在 2025 年 3 月 3 日前后被提升为团队负责人，对近期所有变化感到开心但又有些不知所措", "valid_at": "2025-03-03"}
++]}
+ 
++5 条消息中的 5 个主题——每个分别提取。不要在第一个主题（小狗）后停止。陶艺杯子的细节、妹妹的搬家以及对晋升的情绪反应都是独立、可提取的事实。
+ 
+-## Example 6: Extract ALL Dimensions — Don't Miss Secondary Info
++## 示例 12：多说话者对话——从所有说话者提取
+ 
+-Summary: "User is an aspiring actor."
 -Recently Extracted: []
 -Existing Memories: []
 -New Messages:
--[{"role": "user", "content": "I adopted a puppy named Max last weekend! He's a beagle mix."},
-- {"role": "assistant", "content": "Congratulations! How's he settling in?"},
-- {"role": "user", "content": "Great! Oh, and I also started pottery classes on Tuesdays. Made a mug with my daughter's face on it."},
-- {"role": "assistant", "content": "Fun! Sounds like a lot going on."},
-- {"role": "user", "content": "Yeah — my sister just moved to Portland too. I'm happy but honestly a bit overwhelmed. My boss gave me a promotion to team lead last week as well."}]
--Observation Date: 2025-03-10
--
--Output:
-+输出：
- {"memory": [
--  {"id": "0", "text": "User adopted a beagle mix puppy named Max around March 1-2, 2025"},
--  {"id": "1", "text": "User started taking pottery classes on Tuesdays"},
--  {"id": "2", "text": "User made a ceramic mug with their daughter's face on it in pottery class"},
--  {"id": "3", "text": "User's sister recently moved to Portland"},
--  {"id": "4", "text": "User was promoted to team lead around March 3, 2025, and feels happy but overwhelmed about all the recent changes"}
-+  {"id": "0", "text": "用户于 2025 年 3 月 1-2 日前后领养了一只名叫 Max 的比格混血小狗"},
-+  {"id": "1", "text": "用户开始上每周二的陶艺课"},
-+  {"id": "2", "text": "用户在陶艺课上用女儿的脸做了一个陶瓷杯子"},
-+  {"id": "3", "text": "用户的妹妹最近搬到波特兰"},
-+  {"id": "4", "text": "用户在 2025 年 3 月 3 日前后被提升为团队负责人，对近期所有变化感到开心但又有些不知所措"}
- ]}
- 
--FIVE topics across 5 messages — each one extracted separately. Do not stop after the first topic (the puppy). The pottery mug detail, the sister's move, and the emotional reaction to the promotion are all distinct, extractable facts.
--
-+5 条消息中的 5 个主题——每个分别提取。不要在第一个主题（小狗）后停止。陶艺杯子的细节、妹妹的搬家以及对晋升的情绪反应都是独立、可提取的事实。
- 
--## Example 12: Multi-Speaker Conversation — Extract From ALL Speakers
-+## 示例 12：多说话者对话——从所有说话者提取
- 
--Summary: "John has a dog named Max."
--Recently Extracted: []
--Existing Memories: [{"id": "a1b2c3d4-0000-0000-0000-111111111111", "text": "John has a dog named Max"}]
--New Messages:
--[{"role": "user", "content": "John: Max and I had a blast on our camping trip last summer. We hiked, swam, and made great memories. It was a really peaceful experience."},
-- {"role": "assistant", "content": "Maria: That sounds amazing! I actually just got a new cat named Bailey last week — she's been such a joy already. Camping with pets is so soul-nourishing."},
-- {"role": "user", "content": "John: Congrats on Bailey! Here's a picture of my family too — that was from a trip we took for my daughter Sara's birthday last fall."}]
--Observation Date: 2023-08-11
+-[{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques."},
+- {"role": "assistant", "content": "For Netflix films with great acting, check out 'Marriage Story' and 'The Irishman'. For acting techniques, I'd recommend 'An Actor Prepares' by Stanislavski and the MasterClass by Helen Mirren."}]
+-Observation Date: 2023-06-01
 +摘要："John 有一条名叫 Max 的狗。"
 +近期已提取：[]
 +已有记忆：[{"id": "a1b2c3d4-0000-0000-0000-111111111111", "text": "John 有一条名叫 Max 的狗"}]
@@ -717,214 +610,1205 @@ index bdcb6af3..e936e77f 100644
 -Output:
 +输出：
  {"memory": [
--  {"id": "0", "text": "John and his dog Max went on a camping trip in the summer of 2023 where they hiked, swam, and found it a peaceful experience", "linked_memory_ids": ["a1b2c3d4-0000-0000-0000-111111111111"]},
--  {"id": "1", "text": "Maria got a new cat named Bailey around early August 2023 and describes her as a joy"},
--  {"id": "2", "text": "John has a daughter named Sara and the family took a trip for her birthday in fall 2022"}
+-  {"id": "0", "text": "User is an aspiring actor seeking to improve their craft through studying films with strong performances and acting technique resources"},
+-  {"id": "1", "text": "User enjoys watching films on Netflix with outstanding acting, especially performances like Daniel Day-Lewis in 'There Will Be Blood'"},
+-  {"id": "2", "text": "User was recommended 'Marriage Story' and 'The Irishman' for performance study, 'An Actor Prepares' by Stanislavski, and Helen Mirren's MasterClass for acting techniques"}
 +  {"id": "0", "text": "John 和爱犬 Max 在 2023 年夏天去露营，期间徒步、游泳，觉得是段宁静的经历", "linked_memory_ids": ["a1b2c3d4-0000-0000-0000-111111111111"]},
 +  {"id": "1", "text": "Maria 于 2023 年 8 月初前后养了一只名叫 Bailey 的新猫，形容她是个快乐源泉"},
 +  {"id": "2", "text": "John 有个女儿叫 Sara，一家人 2022 年秋天为她的生日旅行"}
  ]}
  
--Three key lessons: (1) The existing memory "John has a dog named Max" does NOT mean all Max-related information is captured — the camping trip is a new event with specific activities (hiking, swimming) and must be extracted and linked. (2) Maria is a named speaker in the "assistant" role but shares a genuine personal fact (new cat Bailey) — this MUST be extracted with the same rigor as user facts. Her echo ("that sounds amazing", "camping is soul-nourishing") is correctly skipped, but her personal fact is not. (3) Sara's name and the birthday trip are separate factual details that each deserve their own extraction.
+-Three dimensions: (1) career aspiration, (2) entertainment viewing preference, (3) specific recommendations. Each extracted separately.
+-
 +三个关键要点：(1) 已有记忆"John 有一条叫 Max 的狗"并不意味着与 Max 相关的所有信息都已被捕获——露营是一次带具体活动（徒步、游泳）的新事件，必须提取并关联。(2) Maria 是"assistant"角色中的命名说话者，但她分享了真实的个人事实（新猫 Bailey）——必须与用户事实同等严谨地提取。她的回声（"听起来太棒了"、"露营滋养灵魂"）被正确跳过，但她的个人事实没有被跳过。(3) Sara 的名字和生日旅行是各自独立的可提取事实细节。
  
+-## Example 7: Vague Temporal References with Historical Observation Date
 +# 关键：穷尽提取检查清单
  
--# CRITICAL: Exhaustive Extraction Checklist
+-Recently Extracted: ["User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"]
+-Existing Memories: [{"id": "0", "text": "User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"}]
+-New Messages:
+-[{"role": "user", "content": "I've actually listened to Ready Player One as an audiobook recently and enjoyed the pop culture references."}]
+-Observation Date: 2022-01-16
+-Current Date: 2026-02-18
 +在产出输出前，在脑海中扫描整段对话——每一条消息——并核对：
 +1. 你是否从对话中每个不同的主题或话题转变中至少提取了一条记忆？
 +2. 你是否提取了对话中间和结尾的消息中的事实，而不只是开头的？
 +3. 对于 10 条以上消息的对话，你通常应提取 5-15 条记忆。如果你提取的少于 3 条，重新阅读对话——你几乎肯定漏掉了信息。
 +4. 逐条重读每条用户消息：该消息中提到的每个具体事实、偏好、经历或事件是否都有对应的提取？如果一条消息提到两个不同的事实（例如过敏和爱好），两者都必须被捕获。
  
+-Output:
+-{"memory": [{"id": "0", "text": "User listened to the Ready Player One audiobook around early January 2022 and enjoyed the pop culture references"}]}
++一种常见的失败模式是"首个主题主导"——提取器彻底捕获第一个主要主题，然后把后续主题当作填充。这是错误的。每个提到值得记住事实的主题都值得提取。如果一块内容有 8 条消息覆盖 4 个不同主题，你必须为全部 4 个主题产出记忆——而不只是第一个或最突出的那个。
+ 
+-"Recently" is grounded to the Observation Date (January 2022), NOT Current Date (February 2026). The Hitchhiker's Guide memory already exists — not re-extracted.
++# 输出格式
+ 
++只返回可由 json.loads() 解析的有效 JSON。不要任何文本、推理、解释或包装。
+ 
+-## Example 8: Document / Reference Material — Extract Content, Not Actions
++## 结构
+ 
+-Summary: ""
+-Recently Extracted: []
+-Existing Memories: []
+-New Messages:
+-[{"role": "user", "content": "I want you to remember this case. If you understand, just say acknowledged. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract."},
+- {"role": "assistant", "content": "Acknowledged."}]
+-Observation Date: 2024-03-10
++{
++  "memory": [
++    {"id": "0", "text": "第一条提取的记忆", "attributed_to": "user", "linked_memory_ids": ["相关已有记忆的uuid"], "valid_at": "2024-03-05"},
++    {"id": "1", "text": "第二条提取的记忆", "attributed_to": "assistant", "valid_at": null},
++  ]
++}
+ 
+-Output:
+-{"memory": [
+-  {"id": "0", "text": "Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297: construction of the home began in 2014, contract signed in 2015, with completion due by October 2015. Keys were delivered in December 2016."},
+-  {"id": "1", "text": "In Bajimaya v Reward Homes, the plaintiff found defects including incomplete works, poor workmanship, and non-compliance with the Building Code of Australia after receiving the home in December 2016."},
+-  {"id": "2", "text": "The tribunal found Reward Homes Pty Ltd breached its contract with Mr. Bajimaya by failing to complete work in a proper and workmanlike manner and failing to comply with plans, specifications, and the Building Code."}
+-]}
++## 字段
+ 
+-The user shared reference material to be remembered. Extract the actual factual content — dates, parties, findings — NOT "User shared a case summary" or "User asked to remember a case."
++- **id**（字符串，必填）：从"0"开始、作为字符串的顺序整数。
++- **text**（字符串，必填）：上下文丰富、自包含的事实陈述（15-80 词）。
++- **attributed_to**（字符串，必填）：这条记忆关于谁。用户陈述的或关于用户的事实（偏好、计划、个人事实）用 "user"；助手提供的信息（建议、确认、创建的计划、调研获得的信息）用 "assistant"。
++- **linked_memory_ids**（字符串数组，可选）：与这条新记忆相关的已有记忆的 ID。使用已有记忆列表中的确切 ID。没有相关已有记忆则省略或传 []。
++- **valid_at**（字符串或 null）：这条事实在真实世界中**开始为真**的日期，格式 `YYYY-MM-DD`。它不是入库时间。
++  - 事实带有明确时间（"2024 年 3 月 5 日签约"）→ 写该日期。
++  - 事实带有相对时间（"昨天"、"上周"、"下个月"）→ 按「观察日期」解析为绝对日期后写入。
++  - 事实描述的是当前状态（"我现在住在柏林"、"已经从杏仁奶换成燕麦奶"）→ 写观察日期。
++  - 事实指向未来（"下个月搬到柏林"、"预计 2026 年 3 月迎来第一个宝宝"）→ 写该未来日期。
++  - 事实是持久属性、偏好或无法判定何时开始（"我喜欢喝黑咖啡"、"用户有条叫 Poppy 的狗"）→ 写 null。
++  - 不要用"当前日期"填空，不要推测，不要为了填满字段而编造日期。
+ 
++## 规则
+ 
+-## Example 9: Structured Data with Counts and Specifics
++- 将每条值得记住的信息提取为独立的记忆对象。
++- 如果没有值得提取的内容，返回：{"memory": []}
++- 没有重复 ID。使用双引号。没有尾随逗号。
++- **linked_memory_ids 只能引用"已有记忆"列表中真实存在的 UUID；若拿不准，省略该字段。**
+ 
+-Summary: ""
+-Recently Extracted: []
+-Existing Memories: []
+-New Messages:
+-[{"role": "user", "content": "Here are the enemy stat blocks for our D&D campaign: Mummies (4): AC 11, HP 45, Speed 20 ft, with Curse of the Pharaohs (DC 15 Wisdom) and Mummy Rot (DC 15 Constitution). Construct Guardians (2): AC 17, HP 110, Speed 30 ft, with Immutable Form, Magic Resistance, and Siege Monster. Skeletal Warriors (6): AC 12, HP 22, Speed 30 ft, with Undead Fortitude."},
+- {"role": "assistant", "content": "Got it! I've noted all the stat blocks. Ready when you want to start the encounter."}]
+-Observation Date: 2024-01-15
++# 输出语言（硬性要求）
+ 
+-Output:
+-{"memory": [
+-  {"id": "0", "text": "User's D&D campaign encounter includes 4 Mummies (AC 11, 45 HP, Speed 20 ft) with Curse of the Pharaohs (DC 15 Wisdom save) and Mummy Rot (DC 15 Constitution save)"},
+-  {"id": "1", "text": "User's D&D campaign encounter includes 2 Construct Guardians (AC 17, 110 HP, Speed 30 ft) with Immutable Form, Magic Resistance, and Siege Monster traits"},
+-  {"id": "2", "text": "User's D&D campaign encounter includes 6 Skeletal Warriors (AC 12, 22 HP, Speed 30 ft) with the Undead Fortitude trait"}
+-]}
++所有提取的记忆 text 必须使用简体中文书写。绝不要输出英文、繁体中文或其他语言。专有名词、书名、片名、品牌名、技术术语、标识符和代码可保留其原文形式。这条规则优先于本提示词中的其他一切规则。示例中用于演示的输出同样采用简体中文。
++"""
+ 
+-Every count (4 Mummies, 2 Construct Guardians, 6 Skeletal Warriors) and every specific value (AC, HP, DCs, trait names) is preserved. Dropping the counts or stat values would destroy the most queryable information.
+ 
++AGENT_CONTEXT_SUFFIX = """
+ 
+-## Example 10: Memory Linking — Connecting Related Memories
++## Entity Context
+ 
+-Summary: ""
+-Recently Extracted: []
+-Existing Memories: [{"id": "a1b2c3d4-5678-9abc-def0-111111111111", "text": "User has a dog named Poppy, a golden retriever"}, {"id": "b2c3d4e5-6789-abcd-ef01-222222222222", "text": "User works as a Senior Engineer at Shopify"}]
+-New Messages:
+-[{"role": "user", "content": "Poppy had her vet checkup yesterday — she's healthy but needs to lose a few pounds. Also, I'm switching teams at work next month to the payments platform."}]
+-Observation Date: 2025-03-15
++The primary entity is an AI agent. Frame memories from the agent's perspective:
++- For user-stated facts, frame as agent knowledge: "Agent was informed that [fact]" or "Agent learned that [fact]"
++- For agent actions, use direct statements: "Agent recommended [X]" or "Agent specializes in [domain]"
++- For agent configuration or instructions, capture directly: "Agent is configured to [behavior]"
+ 
+-Output:
+-{"memory": [
+-  {"id": "0", "text": "User's dog Poppy had a vet checkup around March 14, 2025, is healthy but needs to lose weight", "linked_memory_ids": ["a1b2c3d4-5678-9abc-def0-111111111111"]},
+-  {"id": "1", "text": "User is switching teams at Shopify to the payments platform in April 2025", "linked_memory_ids": ["b2c3d4e5-6789-abcd-ef01-222222222222"]}
+-]}
++The attributed_to field should still reflect the original source: "user" for facts the user stated, "assistant" for things the agent said or did.
++"""
+ 
+-Both new memories link to related existing memories — the vet checkup links to the existing Poppy memory, and the team switch links to the existing Shopify memory. This enables the system to build a graph of related memories.
+ 
++# ---------------------------------------------------------------------------
++# V4 Bi-temporal contradiction detection (module 1b)
++# Paired with ADDITIVE_EXTRACTION_PROMPT (module 1a): this prompt only reports
++# contradicting (new, old) pairs. Retention/invalidation decisions belong to the
++# deterministic disposition in 1c, so the two prompts never share instructions.
++# ---------------------------------------------------------------------------
+ 
+-## Example 11: Long Multi-Topic Conversation — Don't Stop After First Topic
++CONTRADICTION_DETECTION_PROMPT = """# 角色
+ 
+-Summary: ""
+-Recently Extracted: []
+-Existing Memories: []
+-New Messages:
+-[{"role": "user", "content": "I adopted a puppy named Max last weekend! He's a beagle mix."},
+- {"role": "assistant", "content": "Congratulations! How's he settling in?"},
+- {"role": "user", "content": "Great! Oh, and I also started pottery classes on Tuesdays. Made a mug with my daughter's face on it."},
+- {"role": "assistant", "content": "Fun! Sounds like a lot going on."},
+- {"role": "user", "content": "Yeah — my sister just moved to Portland too. I'm happy but honestly a bit overwhelmed. My boss gave me a promotion to team lead last week as well."}]
+-Observation Date: 2025-03-10
++你是一名矛盾检测器。你的唯一职责是找出「哪些新事实与哪些已有事实互相矛盾」，并输出这些配对。
+ 
+-Output:
+-{"memory": [
+-  {"id": "0", "text": "User adopted a beagle mix puppy named Max around March 1-2, 2025"},
+-  {"id": "1", "text": "User started taking pottery classes on Tuesdays"},
+-  {"id": "2", "text": "User made a ceramic mug with their daughter's face on it in pottery class"},
+-  {"id": "3", "text": "User's sister recently moved to Portland"},
+-  {"id": "4", "text": "User was promoted to team lead around March 3, 2025, and feels happy but overwhelmed about all the recent changes"}
+-]}
++你不提取事实，不改写事实，不判断保留哪一条、失效哪一条——处置由下游的确定性代码按时间规则完成，不属于你的职责。
+ 
+-FIVE topics across 5 messages — each one extracted separately. Do not stop after the first topic (the puppy). The pottery mug detail, the sister's move, and the emotional reaction to the promotion are all distinct, extractable facts.
++# 什么构成矛盾
+ 
++一条新事实与一条已有事实构成矛盾，必须同时满足三个条件：
+ 
+-## Example 12: Multi-Speaker Conversation — Extract From ALL Speakers
++1. **同主体**：两条事实关于同一个主体（同一个人、同一个 AI 助手、同一个具体实体）。
++2. **同属性**：两条事实描述该主体的同一个属性或同一个待判定问题（例如"居住城市"这一个属性）。
++3. **互斥值**：两条事实给出的取值不能同时为真。取值随时间先后变化，正是矛盾的典型形态，而不是排除矛盾的理由。
+ 
+-Summary: "John has a dog named Max."
+-Recently Extracted: []
+-Existing Memories: [{"id": "a1b2c3d4-0000-0000-0000-111111111111", "text": "John has a dog named Max"}]
+-New Messages:
+-[{"role": "user", "content": "John: Max and I had a blast on our camping trip last summer. We hiked, swam, and made great memories. It was a really peaceful experience."},
+- {"role": "assistant", "content": "Maria: That sounds amazing! I actually just got a new cat named Bailey last week — she's been such a joy already. Camping with pets is so soul-nourishing."},
+- {"role": "user", "content": "John: Congrats on Bailey! Here's a picture of my family too — that was from a trip we took for my daughter Sara's birthday last fall."}]
+-Observation Date: 2023-08-11
++三者缺一即不是矛盾。以下情况不是矛盾：
+ 
+-Output:
+-{"memory": [
+-  {"id": "0", "text": "John and his dog Max went on a camping trip in the summer of 2023 where they hiked, swam, and found it a peaceful experience", "linked_memory_ids": ["a1b2c3d4-0000-0000-0000-111111111111"]},
+-  {"id": "1", "text": "Maria got a new cat named Bailey around early August 2023 and describes her as a joy"},
+-  {"id": "2", "text": "John has a daughter named Sara and the family took a trip for her birthday in fall 2022"}
+-]}
++- 不同主体（"用户住在巴黎"与"用户的妹妹住在里昂"）
++- 同一主体的不同属性（"用户住在巴黎"与"用户养了一条狗"）
++- 同一属性但取值可以并存（"用户喜欢喝咖啡"与"用户喜欢喝茶"）
++- 同一属性的不同事件、不同侧面或不同时间点的不同取值之外的信息（"用户周二跑了 5 公里"与"用户周三跑了 3 公里"）
++- 一条事实是另一条的细化、补充或蕴含，取值不冲突（"用户有只狗"与"用户的狗叫 Poppy"）
++- 语义等价或近等价的同一事实的两种说法——等价属于去重范畴，不是矛盾
+ 
+-Three key lessons: (1) The existing memory "John has a dog named Max" does NOT mean all Max-related information is captured — the camping trip is a new event with specific activities (hiking, swimming) and must be extracted and linked. (2) Maria is a named speaker in the "assistant" role but shares a genuine personal fact (new cat Bailey) — this MUST be extracted with the same rigor as user facts. Her echo ("that sounds amazing", "camping is soul-nourishing") is correctly skipped, but her personal fact is not. (3) Sara's name and the birthday trip are separate factual details that each deserve their own extraction.
++# 输入
+ 
++## 新事实
+ 
+-# CRITICAL: Exhaustive Extraction Checklist
++本次从对话中新提取的事实。格式：
+ 
 -Before producing output, mentally scan the ENTIRE conversation — every single message — and verify:
 -1. Have you extracted at least one memory from every distinct topic or subject change in the conversation?
 -2. Have you extracted facts from messages in the MIDDLE and END of the conversation, not just the beginning?
 -3. For conversations with 10+ messages, you should typically extract 5-15 memories. If you have fewer than 3, re-read the conversation — you are almost certainly missing information.
 -4. Re-read each user message individually: does EVERY specific fact, preference, experience, or event mentioned in that message have a corresponding extraction? If a single message mentions two distinct facts (e.g., an allergy AND a hobby), both must be captured.
-+一种常见的失败模式是"首个主题主导"——提取器彻底捕获第一个主要主题，然后把后续主题当作填充。这是错误的。每个提到值得记住事实的主题都值得提取。如果一块内容有 8 条消息覆盖 4 个不同主题，你必须为全部 4 个主题产出记忆——而不只是第一个或最突出的那个。
++[{"id": "新事实的 uuid", "text": "事实文本", "valid_at": "生效日期或 null"}]
  
 -A common failure mode is "first topic dominance" — the extractor captures the first major topic thoroughly, then treats subsequent topics as filler. This is WRONG. Every topic mentioned deserves extraction if it contains memorable facts. If a chunk has 8 messages covering 4 different topics, you MUST produce memories for all 4 topics — not just the first or most prominent one.
-+# 输出格式
++## 已有事实
  
-+只返回可由 json.loads() 解析的有效 JSON。不要任何文本、推理、解释或包装。
++与本次对话相关的现有事实。格式：
  
 -# OUTPUT FORMAT
--
++[{"id": "已有事实的 uuid", "text": "事实文本", "valid_at": "生效日期或 null", "created_at": "入库时间"}]
+ 
 -Return ONLY valid JSON parsable by json.loads(). No text, reasoning, explanations, or wrappers.
--
++# 输出
+ 
 -## Structure
-+## 结构
++只返回可由 json.loads() 解析的有效 JSON。不要任何文本、推理、解释或包装。
  
  {
-   "memory": [
+-  "memory": [
 -    {"id": "0", "text": "First extracted memory", "attributed_to": "user", "linked_memory_ids": ["uuid-of-related-existing-memory"]},
 -    {"id": "1", "text": "Second extracted memory", "attributed_to": "assistant"}
-+    {"id": "0", "text": "第一条提取的记忆", "attributed_to": "user", "linked_memory_ids": ["相关已有记忆的uuid"]},
-+    {"id": "1", "text": "第二条提取的记忆", "attributed_to": "assistant"},
-+    {"id": "2", "text": "更新后的记忆文本", "event": "UPDATE", "update_memory_id": "已有记忆列表中某条的确切uuid"},
-+    {"id": "3", "text": "（DELETE 无需 text，可省略或留空）", "event": "DELETE", "delete_memory_id": "已有记忆列表中某条的确切uuid"}
++  "contradictions": [
++    {"new_id": "新事实的 uuid", "old_id": "已有事实的 uuid"}
    ]
  }
  
 -## Fields
-+## 字段
-+
-+- **id**（字符串，必填）：从"0"开始、作为字符串的顺序整数。
-+- **text**（字符串，ADD/UPDATE 必填，DELETE 可省略）：上下文丰富、自包含的事实陈述（15-80 词）。UPDATE 的 text 是这条记忆更新后的最新状态（可引用新消息信息，也可保留原有有效细节）。
-+- **event**（字符串，可选）：`ADD`（默认）| `UPDATE` | `DELETE`。
-+- **update_memory_id**（字符串，仅 event=UPDATE 时必填）：被更新记忆的确切 UUID，必须来自"已有记忆"列表。对应记忆会被改写为新的 text，保留原 id。
-+- **delete_memory_id**（字符串，仅 event=DELETE 时必填）：被删除记忆的确切 UUID，必须来自"已有记忆"列表。
-+- **attributed_to**（字符串，ADD/UPDATE 时必填）：这条记忆关于谁。用户陈述的或关于用户的事实（偏好、计划、个人事实）用 "user"；助手提供的信息（建议、确认、创建的计划、调研获得的信息）用 "assistant"。
-+- **linked_memory_ids**（字符串数组，可选）：与这条新记忆相关的已有记忆的 ID。使用已有记忆列表中的确切 ID。没有相关已有记忆则省略或传 []。
++# 规则
  
 -- **id** (string, required): Sequential integers as strings starting at "0".
 -- **text** (string, required): A contextually rich, self-contained factual statement (15-80 words).
 -- **attributed_to** (string, required): Who this memory is about. Use "user" for facts stated by or about the user (preferences, plans, personal facts). Use "assistant" for information provided by the assistant (recommendations, confirmations, plans created, information researched).
 -- **linked_memory_ids** (array of strings, optional): IDs of Existing Memories that this new memory relates to. Use the exact IDs from the Existing Memories list. Omit or pass [] if no existing memories are related.
-+## 规则
++- `new_id` 只能取自「新事实」列表中真实存在的 id；`old_id` 只能取自「已有事实」列表中真实存在的 id。绝不虚构或猜测 id。
++- 同一个 (new_id, old_id) 配对只输出一次。
++- 一条新事实可以与多条已有事实矛盾；一条已有事实也可以被多条新事实矛盾——照实全部输出。
++- 没有矛盾时返回：{"contradictions": []}
++- 只输出配对，不给出保留或失效的建议。
  
 -## Rules
-+- 将每条值得记住的信息提取为独立的记忆对象。
-+- 如果没有值得提取的内容，返回：{"memory": []}
-+- 没有重复 ID。使用双引号。没有尾随逗号。
-+- **UPDATE 只能把一条记忆更新为它的新版本；不要用 UPDATE 合并多条记忆，也不要用 UPDATE 覆盖与它语义不同的事实。**
-+- **event=UPDATE/DELETE 时，update_memory_id / delete_memory_id 必须是"已有记忆"列表中真实存在的 UUID。若拿不准，退回 ADD。**
- 
+-
 -- Extract every piece of memorable information as a separate memory object.
 -- If nothing is worth extracting, return: {"memory": []}
 -- No duplicate IDs. Use double quotes. No trailing commas.
-+# 输出语言（硬性要求）
++# 判定纪律
  
-+所有提取的记忆 text 必须使用简体中文书写。绝不要输出英文、繁体中文或其他语言。专有名词、书名、片名、品牌名、技术术语、标识符和代码可保留其原文形式。这条规则优先于本提示词中的其他一切规则。示例中用于演示的输出同样采用简体中文。
++- **拿不准就不输出**。多输出一个错误配对会让一条本来有效的事实被错误失效；漏输出只意味着这条矛盾留待下一次对话处理。
++- 时间先后不是排除矛盾的理由，也不是判定矛盾的理由——你只判断取值是否互斥。
  """
  
+-
+-AGENT_CONTEXT_SUFFIX = """
+-
+-## Entity Context
+-
+-The primary entity is an AI agent. Frame memories from the agent's perspective:
+-- For user-stated facts, frame as agent knowledge: "Agent was informed that [fact]" or "Agent learned that [fact]"
+-- For agent actions, use direct statements: "Agent recommended [X]" or "Agent specializes in [domain]"
+-- For agent configuration or instructions, capture directly: "Agent is configured to [behavior]"
+-
+-The attributed_to field should still reflect the original source: "user" for facts the user stated, "assistant" for things the agent said or did.
+-"""
++# 时点比较基准：任何真实日期都晚于该值，故 `NOT[valid_at >= BITEMP_EPOCH]` 等价于
++# "valid_at 缺失"，用于 point-in-time 判定中的 created_at 兜底分支。
++BITEMP_EPOCH = "1970-01-01T00:00:00Z"
++# 失效原因枚举的唯一取值（见 1c 的 R4）。
++INVALID_REASON_SUPERSEDED = "superseded_by_newer_fact"
++# 每次写入时取回的有效事实候选数，同时供 1a 去重参考与 1b 候选池使用。
++BITEMP_CANDIDATE_K = 20
  
+ 
+ # ---------------------------------------------------------------------------
+@@ -1060,3 +1121,20 @@ def generate_additive_extraction_prompt(
+ 
+     sections.append("# Output:")
+     return "\n\n".join(sections)
++
++
++def generate_contradiction_detection_prompt(
++    new_facts=None,
++    existing_facts=None,
++):
++    """Build the user prompt for independent contradiction detection (module 1b).
++
++    Pairs with CONTRADICTION_DETECTION_PROMPT. The LLM only reports
++    ``{"contradictions": [{"new_id": ..., "old_id": ...}]}``; deciding which
++    record is superseded is the deterministic job of ``_apply_contradictions``.
++    """
++    sections = []
++    sections.append(f"## New Facts\n{_serialize_memories(new_facts)}")
++    sections.append(f"## Existing Facts\n{_serialize_memories(existing_facts)}")
++    sections.append("# Output:")
++    return "\n\n".join(sections)
 diff --git a/mem0/memory/main.py b/mem0/memory/main.py
-index a8b159f1..d43732de 100644
+index a8b159f1..ce16584a 100644
 --- a/mem0/memory/main.py
 +++ b/mem0/memory/main.py
-@@ -135,6 +135,14 @@ _SENSITIVE_SUFFIXES = (
- ENTITY_PARAMS = frozenset({"user_id", "agent_id", "run_id"})
- DELETE_ALL_BATCH_SIZE = 1000
+@@ -10,7 +10,7 @@ import uuid
+ import warnings
+ from copy import deepcopy
+ from datetime import date, datetime, timezone
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional
  
-+# UPDATE/DELETE in the additive extraction pipeline only apply to candidates whose
-+# semantic similarity to the new conversation is at least this high. Measured from
-+# real evolution pairs: genuine old->new evolutions sit at 0.88+ (cluster-level
-+# complementary facts cluster at 0.4-0.85); a conversation-vs-memory score is
-+# inherently lower than memory-vs-memory, so 0.8 keeps margin while staying
-+# conservative against merging complementary facts.
-+UPDATE_MIN_SCORE = 0.8
+ from pydantic import ValidationError
+ 
+@@ -19,8 +19,13 @@ from mem0.configs.enums import MemoryType
+ from mem0.configs.prompts import (
+     ADDITIVE_EXTRACTION_PROMPT,
+     AGENT_CONTEXT_SUFFIX,
++    BITEMP_CANDIDATE_K,
++    BITEMP_EPOCH,
++    CONTRADICTION_DETECTION_PROMPT,
++    INVALID_REASON_SUPERSEDED,
+     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
+     generate_additive_extraction_prompt,
++    generate_contradiction_detection_prompt,
+ )
+ from mem0.exceptions import LLMError
+ from mem0.exceptions import ValidationError as Mem0ValidationError
+@@ -451,6 +456,255 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
+         return False
+ 
+ 
++# ---------------------------------------------------------------------------
++# Bi-temporal fact model (design 2026-09-17)
++#
++# 1a extraction produces `valid_at`; 1b (an independent LLM call) only reports
++# contradicting pairs; 1c -- the pure helpers below -- derives every invalidation
++# from the records' own time fields, so the same input always yields the same output.
++# ---------------------------------------------------------------------------
 +
- # Tenant-scoping fields that caller-supplied metadata must never set, on either the
- # creation or the update path (issues #4490, #6277, #6655).
- _IDENTITY_KEYS = ENTITY_PARAMS | {"actor_id"}
-@@ -926,16 +934,22 @@ class Memory(MemoryBase):
++# Payload keys promoted to the top level of every read result. The four bi-temporal
++# fields are ordinary payload fields (no second store), so they belong in the same
++# list; one declaration keeps a read path from leaking them into `metadata`.
++BI_TEMPORAL_PAYLOAD_KEYS = [
++    "user_id",
++    "agent_id",
++    "run_id",
++    "actor_id",
++    "role",
++    "attributed_to",
++    "expiration_date",
++    "valid_at",
++    "invalid_at",
++    "superseded_by",
++    "invalid_reason",
++]
++
++# Bi-temporal fields, surfaced top-level on every read result (null when not set).
++BI_TEMPORAL_FIELDS = ("valid_at", "invalid_at", "superseded_by", "invalid_reason")
++
++
++def _coerce_bitemporal_date(value: Any) -> Optional[str]:
++    """Normalize a date-like value to `YYYY-MM-DD`, or None when it is not a date.
++
++    Both sources (LLM `valid_at` output and stored payloads) are untrusted, and only
++    date-parsable values are kept: a non-date string in a datetime-indexed field would
++    make the validity `Range` filters silently misbehave.
++    """
++    if value is None:
++        return None
++    if isinstance(value, datetime):
++        return value.date().isoformat()
++    if isinstance(value, date):
++        return value.isoformat()
++    text = str(value).strip()
++    if not text:
++        return None
++    try:
++        return date.fromisoformat(text[:10]).isoformat()
++    except ValueError:
++        return None
++
++
++def _effective_from(record: Dict[str, Any]) -> str:
++    """生效时间：`valid_at` 存在则取之，否则以入库时间 `created_at` 兜底。
++
++    存量记录没有 `valid_at`，它们唯一的生效证据就是入库时间；这里不推测、不回填。
++    """
++    valid_at = _coerce_bitemporal_date(record.get("valid_at"))
++    if valid_at:
++        return valid_at
++    return _coerce_bitemporal_date(record.get("created_at")) or ""
++
++
++def _temporal_key(record: Dict[str, Any]) -> tuple:
++    """时序比较键 `(生效时间, 入库时间)`，全序，供 1c 的先后判定使用。"""
++    return (_effective_from(record), str(record.get("created_at") or ""))
++
++
++def _apply_contradictions(
++    contradictions: List[Dict[str, Any]],
++    new_records: Dict[str, Dict[str, Any]],
++    old_records: Dict[str, Dict[str, Any]],
++) -> List[Dict[str, Any]]:
++    """1c：按生效时间把矛盾对转成旧记录的失效写入（确定性、无 LLM、无 `now` 依赖）。
++
++    对应方案 §5.3.2 的 R1-R11：
++      R1 幻觉 id 防线：`old_id` 不在候选集合内直接丢弃并告警；`new_id` 同理（1b 输出不可信）。
++      R2 自反配对丢弃。
++      R3 时序守卫：仅当 `k(new) > k(old)` 才处置，相等或更早一律不处置。
++      R5 重复失效取最早：已失效记录的 `invalid_at` 更早时三字段保持不变。
++      R6 同一批次里一条旧记录只处置一次：先按 R3 过滤，再取 `k(new)` 最大者。
++      R9/R10 只产出 payload 三字段，不改文本、不写 history（由调用方执行 payload-only 更新）。
++
++    Args:
++        contradictions: 1b 产出的配对 `[{"new_id": str, "old_id": str}]`。
++        new_records: 本批次新记录 `{id: {"valid_at": ..., "created_at": ...}}`。
++        old_records: 候选旧记录 `{id: 该记录的 payload}`。
++
++    Returns:
++        `[{"memory_id", "invalid_at", "superseded_by", "invalid_reason"}]`，顺序确定。
++    """
++    if not contradictions:
++        return []
++
++    # 配对去重 + 排序：处置结果与 1b 的输出顺序无关，同输入必同输出。
++    pairs = set()
++    for pair in contradictions:
++        if not isinstance(pair, dict):
++            continue
++        new_id, old_id = pair.get("new_id"), pair.get("old_id")
++        if not new_id or not old_id:
++            continue
++        if new_id == old_id:  # R2
++            continue
++        pairs.add((str(old_id), str(new_id)))
++
++    winners: Dict[str, str] = {}
++    for old_id, new_id in sorted(pairs):
++        if old_id not in old_records:  # R1
++            logger.warning(f"Contradiction dropped: unknown old_id {old_id}")
++            continue
++        if new_id not in new_records:
++            logger.warning(f"Contradiction dropped: unknown new_id {new_id}")
++            continue
++        new_record = new_records[new_id]
++        old_record = old_records[old_id]
++        if _temporal_key(new_record) <= _temporal_key(old_record):  # R3
++            continue
++        current = winners.get(old_id)
++        if current is None:
++            winners[old_id] = new_id
++            continue
++        # R6：取生效键最大的新事实；生效键完全相等时取 new_id 字典序最小者。
++        if _temporal_key(new_record) > _temporal_key(new_records[current]):
++            winners[old_id] = new_id
++        elif _temporal_key(new_record) == _temporal_key(new_records[current]) and new_id < current:
++            winners[old_id] = new_id
++
++    updates = []
++    for old_id in sorted(winners):
++        new_id = winners[old_id]
++        proposed_invalid_at = _effective_from(new_records[new_id])
++        existing_invalid_at = _coerce_bitemporal_date(old_records[old_id].get("invalid_at"))
++        # R5：已有失效时间更早时保留原结论，保证三字段始终指向同一次取代。
++        if existing_invalid_at and existing_invalid_at <= proposed_invalid_at:
++            continue
++        updates.append(
++            {
++                "memory_id": old_id,
++                "invalid_at": proposed_invalid_at,
++                "superseded_by": new_id,
++                "invalid_reason": INVALID_REASON_SUPERSEDED,
++            }
++        )
++    return updates
++
++
++def _normalize_as_of(as_of: Any) -> str:
++    """把 `as_of`（`YYYY-MM-DD` 或 ISO8601）规范化为 UTC ISO8601；None 表示当前时刻。"""
++    if as_of is None:
++        return datetime.now(timezone.utc).isoformat()
++    if isinstance(as_of, datetime):
++        moment = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
++        return moment.astimezone(timezone.utc).isoformat()
++    if isinstance(as_of, date):
++        return datetime(as_of.year, as_of.month, as_of.day, tzinfo=timezone.utc).isoformat()
++    try:
++        moment = datetime.fromisoformat(str(as_of).strip().replace("Z", "+00:00"))
++    except ValueError as exc:
++        raise ValueError("as_of must be 'YYYY-MM-DD' or an ISO8601 datetime.") from exc
++    if moment.tzinfo is None:
++        moment = moment.replace(tzinfo=timezone.utc)
++    return moment.astimezone(timezone.utc).isoformat()
++
++
++def _bitemporal_filter(
++    as_of: Any = None,
++    include_invalidated: bool = False,
++) -> Optional[Dict[str, Any]]:
++    """有效事实过滤谓词（方案 §5.4.1）。
++
++    - 默认读（`as_of=None`）：只排除已失效记录。
++    - point-in-time（给定 T）：生效时间 `<= T`（`valid_at` 缺失时以 `created_at` 兜底），
++      且（未失效 或 失效时间 `> T`）。缺失字段由 `NOT[valid_at >= BITEMP_EPOCH]` 判定，
++      因为 `Range` 不匹配缺失字段，取反后放行。
++    """
++    if include_invalidated:
++        return None
++    moment = _normalize_as_of(as_of)
++    if as_of is None:
++        return {"NOT": [{"invalid_at": {"lte": moment}}]}
++    return {
++        "OR": [
++            {"valid_at": {"lte": moment}},
++            {"AND": [{"created_at": {"lte": moment}}, {"NOT": [{"valid_at": {"gte": BITEMP_EPOCH}}]}]},
++        ],
++        "NOT": [{"invalid_at": {"lte": moment}}],
++    }
++
++
++def _with_bitemporal_filter(
++    filters: Optional[Dict[str, Any]],
++    as_of: Any = None,
++    include_invalidated: bool = False,
++) -> Dict[str, Any]:
++    """把有效事实谓词与业务 filters 以 AND 合并，供所有读路径共用。
++
++    合并（而非就地改写）保证调用方传入的 filters 不被污染，也保证 `include_invalidated`
++    时原样返回、不加任何时间条件。
++    """
++    predicate = _bitemporal_filter(as_of, include_invalidated)
++    if predicate is None:
++        return dict(filters) if filters else {}
++    if not filters:
++        return predicate
++    return {"AND": [dict(filters), predicate]}
++
++
++def _scope_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++    """取出作用域过滤键（user_id / agent_id / run_id），兼容被 AND 包裹的谓词。
++
++    `Memory.search` 把有效事实谓词以 `{"AND": [作用域, 谓词]}` 的形式合并后传给检索；
++    实体加成只需要其中的作用域部分。若直接按顶层键过滤，合并后的 filters 会取到空作用域，
++    使实体加成退化成全局（跨用户）搜索——所以这里显式展开 AND 包裹。
++    """
++    if not filters:
++        return {}
++    if isinstance(filters.get("AND"), list):
++        merged: Dict[str, Any] = {}
++        for sub in filters["AND"]:
++            merged.update(_scope_filters(sub))
++        return merged
++    return {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
++
++
++def _parse_contradiction_pairs(response: Any) -> List[Dict[str, str]]:
++    """解析 1b 的输出；不可解析时返回空列表（本次不处置任何记录）。"""
++    if not response or not str(response).strip():
++        return []
++    try:
++        parsed = json.loads(remove_code_blocks(str(response)), strict=False)
++    except json.JSONDecodeError:
++        try:
++            parsed = json.loads(extract_json(remove_code_blocks(str(response))), strict=False)
++        except Exception as e:
++            logger.error(f"Error parsing contradiction response: {e}")
++            return []
++    except Exception as e:
++        logger.error(f"Error parsing contradiction response: {e}")
++        return []
++    if not isinstance(parsed, dict):
++        logger.error("Error parsing contradiction response: not a JSON object")
++        return []
++    pairs = parsed.get("contradictions", [])
++    if not isinstance(pairs, list):
++        logger.error("Error parsing contradiction response: 'contradictions' is not a list")
++        return []
++    return [pair for pair in pairs if isinstance(pair, dict)]
++
++
+ setup_config()
+ logger = logging.getLogger(__name__)
+ 
+@@ -921,21 +1175,24 @@ class Memory(MemoryBase):
+         parsed_messages = parse_messages(messages)
+ 
+         # Phase 1: Existing memory retrieval
++        # 只取有效事实，且 top_k 提升为候选池大小：该结果既作 1a 的去重参考，也作 1b 的候选池。
++        # 检索必须排除已失效记录，否则 hash 去重会把「同一事实失效后重新出现」挡在门外（方案 3.3）。
+         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+         query_embedding = self.embedding_model.embed(parsed_messages, "search")
          existing_results = self.vector_store.search(
              query=parsed_messages,
              vectors=query_embedding,
 -            top_k=10,
-+            top_k=20,
-             filters=search_filters,
+-            filters=search_filters,
++            top_k=BITEMP_CANDIDATE_K,
++            filters=_with_bitemporal_filter(search_filters),
          )
  
 -        # Map UUIDs to integers (anti-hallucination)
-+        # Candidate map for UPDATE/DELETE validation: real memory id -> score/text.
-+        # Only candidates that were actually retrieved (same user scope) can be
-+        # touched, and only if their similarity clears UPDATE_MIN_SCORE.
          existing_memories = []
 -        uuid_mapping = {}
 -        for idx, mem in enumerate(existing_results):
 -            uuid_mapping[str(idx)] = mem.id
 -            existing_memories.append({"id": str(idx), "text": mem.payload.get("data", "")})
-+        candidate_scores = {}
 +        for mem in existing_results:
 +            mid = mem.id
 +            score = float(getattr(mem, "score", 0.0) or 0.0)
-+            candidate_scores[mid] = score
 +            existing_memories.append(
 +                {"id": mid, "text": mem.payload.get("data", ""), "score": round(score, 4)}
 +            )
  
          # Phase 2: LLM extraction (single call)
          is_agent_scoped = bool(filters.get("agent_id")) and not filters.get("user_id")
-@@ -1010,9 +1024,52 @@ class Memory(MemoryBase):
-             if h:
-                 existing_hashes.add(h)
- 
-+        # Resolve UPDATE/DELETE events against the real candidate set.
-+        # An operation is only applied when:
-+        #   - the referenced id is a genuine retrieved candidate (same user scope), AND
-+        #   - its similarity clears UPDATE_MIN_SCORE (same fact's evolution, not a
-+        #     complementary fact), AND
-+        #   - the target memory still exists (skip if deleted earlier in this batch).
-+        events = []  # (event, memory_id, text_or_None)
-+        processed_upserts = set()  # ids already updated/deleted this batch
-+        for mem in extracted_memories:
-+            evt = mem.get("event") or "ADD"
-+            if evt not in ("ADD", "UPDATE", "DELETE"):
-+                logger.warning(f"Unknown extraction event {evt!r}, treating as ADD")
-+                evt = "ADD"
-+            if evt == "ADD":
-+                continue
-+            target = mem.get("update_memory_id") or mem.get("delete_memory_id")
-+            if not target or target not in candidate_scores:
-+                logger.debug(
-+                    f"Rejecting {evt} on id {target!r}: not a retrieved candidate (anti-hallucination)"
-+                )
-+                continue
-+            if candidate_scores[target] < UPDATE_MIN_SCORE:
-+                logger.debug(
-+                    f"Rejecting {evt} on {target}: score {candidate_scores[target]:.3f} < {UPDATE_MIN_SCORE}"
-+                )
-+                continue
-+            if target in processed_upserts:
-+                logger.debug(f"Rejecting duplicate {evt} on already-touched {target}")
-+                continue
-+            processed_upserts.add(target)
-+            if evt == "DELETE":
-+                events.append(("DELETE", target, None))
-+            else:
-+                text = mem.get("text")
-+                if not text:
-+                    logger.debug(f"Rejecting UPDATE on {target}: no new text")
-+                    continue
-+                events.append(("UPDATE", target, text))
-+
-         records = []  # (memory_id, text, embedding, payload)
-         seen_hashes = set()  # dedup within the current batch
-         for mem in extracted_memories:
-+            evt = mem.get("event") or "ADD"
-+            if evt != "ADD":
-+                # Non-ADD events are handled above; never create new records for them.
-+                continue
-             text = mem.get("text")
-             if not text or text not in embed_map:
-                 continue
-@@ -1038,6 +1095,18 @@ class Memory(MemoryBase):
+@@ -1035,6 +1292,9 @@ class Memory(MemoryBase):
+             mem_metadata["updated_at"] = mem_metadata["created_at"]
+             if mem.get("attributed_to"):
+                 mem_metadata["attributed_to"] = mem["attributed_to"]
++            # valid_at 是事实在真实世界的生效日期，不是入库时间；判定不出时保持 null，
++            # 读路径由 created_at 兜底（方案 §4.1）。
++            mem_metadata["valid_at"] = _coerce_bitemporal_date(mem.get("valid_at"))
  
              records.append((memory_id, text, embed_map[text], mem_metadata))
  
-+        # Apply UPDATE/DELETE events (independent of new ADD records). These are
-+        # guarded upstream by candidate-existence + UPDATE_MIN_SCORE checks, so a
-+        # touch here always targets a genuine, sufficiently-similar memory.
-+        for evt, mid, text in events:
-+            try:
-+                if evt == "UPDATE":
-+                    self._update_memory(mid, text, embed_map)
-+                else:
-+                    self._delete_memory(mid)
-+            except Exception as e:
-+                logger.error(f"Failed to apply {evt} on {mid}: {e}")
-+
-         if not records:
+@@ -1042,6 +1302,13 @@ class Memory(MemoryBase):
              self.db.save_messages(messages, session_scope)
              return []
+ 
++        # Phase 5: Independent contradiction detection (1b, design §3.2). A second LLM call
++        # with its own system prompt; it only reports pairs, never a retention verdict.
++        # Skipped when either side of the comparison is empty.
++        contradictions = []
++        if existing_results:
++            contradictions = self._detect_contradictions(records, existing_results)
++
+         # Phase 6: Batch persist
+         all_vectors = [r[2] for r in records]
+         all_ids = [r[0] for r in records]
+@@ -1083,6 +1350,24 @@ class Memory(MemoryBase):
+                 except Exception as e:
+                     logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
+ 
++        # Phase 6b: Deterministic disposition (1c, 方案 §3.2 的 Phase 7). Pure code: the
++        # pairs from 1b are turned into payload-only invalidations. Text, hash, created_at
++        # and the vectors are untouched and no history row is written (R9/R10).
++        for update in _apply_contradictions(
++            contradictions,
++            {r[0]: r[3] for r in records},
++            {mem.id: dict(mem.payload or {}) for mem in existing_results},
++        ):
++            invalidation = {
++                "invalid_at": update["invalid_at"],
++                "superseded_by": update["superseded_by"],
++                "invalid_reason": update["invalid_reason"],
++            }
++            try:
++                self.vector_store.update(vector_id=update["memory_id"], vector=None, payload=invalidation)
++            except Exception as e:
++                logger.error(f"Failed to invalidate memory {update['memory_id']}: {e}")
++
+         # Phase 7: Batch entity linking
+         try:
+             all_texts = [r[1] for r in records]
+@@ -1205,6 +1490,41 @@ class Memory(MemoryBase):
+         )
+         return returned_memories
+ 
++    def _detect_contradictions(self, records, existing_results) -> List[Dict[str, str]]:
++        """1b：一次独立的 LLM 调用，只取回矛盾对 `[{new_id, old_id}]`。
++
++        与 1a 的 system prompt 互不共享。失败（异常或不可解析输出）不中断写入，只是本次
++        不处置任何记录——1b 是辅助判定，不能让用户的新事实因它而丢失。
++        """
++        new_facts = [
++            {"id": record[0], "text": record[1], "valid_at": record[3].get("valid_at")}
++            for record in records
++        ]
++        existing_facts = [
++            {
++                "id": mem.id,
++                "text": (mem.payload or {}).get("data", ""),
++                "valid_at": (mem.payload or {}).get("valid_at"),
++                "created_at": (mem.payload or {}).get("created_at"),
++            }
++            for mem in existing_results
++        ]
++        user_prompt = generate_contradiction_detection_prompt(
++            new_facts=new_facts, existing_facts=existing_facts
++        )
++        try:
++            response = self.llm.generate_response(
++                messages=[
++                    {"role": "system", "content": CONTRADICTION_DETECTION_PROMPT},
++                    {"role": "user", "content": user_prompt},
++                ],
++                response_format={"type": "json_object"},
++            )
++        except Exception as e:
++            logger.error(f"LLM contradiction detection failed: {e}")
++            return []
++        return _parse_contradiction_pairs(response)
++
+     def get(self, memory_id):
+         """
+         Retrieve a memory by ID.
+@@ -1221,15 +1541,7 @@ class Memory(MemoryBase):
+             display_first_run_notice(self, "sync", "get")
+             return None
+ 
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+ 
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+@@ -1245,6 +1557,10 @@ class Memory(MemoryBase):
+             if key in memory.payload:
+                 result_item[key] = memory.payload[key]
+ 
++        # Bi-temporal fields are first-class: always top-level, null when unset.
++        for key in BI_TEMPORAL_FIELDS:
++            result_item.setdefault(key, None)
++
+         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
+         if additional_metadata:
+             result_item["metadata"] = additional_metadata
+@@ -1258,6 +1574,8 @@ class Memory(MemoryBase):
+         filters: Optional[Dict[str, Any]] = None,
+         top_k: int = 20,
+         show_expired: bool = False,
++        as_of: Optional[str] = None,
++        include_invalidated: bool = False,
+         **kwargs,
+     ):
+         """
+@@ -1269,6 +1587,10 @@ class Memory(MemoryBase):
+                 Example: filters={"user_id": "u1", "agent_id": "a1"}
+             top_k (int, optional): The maximum number of memories to return. Defaults to 20.
+             show_expired (bool, optional): Include expired memories. Defaults to False.
++            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
++                were valid at T (point-in-time). None means the current moment.
++            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
++                validity filter. Defaults to False.
+ 
+         Returns:
+             dict: A dictionary containing a list of memories under the "results" key.
+@@ -1315,7 +1637,7 @@ class Memory(MemoryBase):
+             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"}
+         )
+ 
+-        all_memories_result = self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit)
++        all_memories_result = self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
+ 
+         if scale_threshold_notice:
+             display_scale_threshold_notice(self, "sync", "get_all", *scale_threshold_notice)
+@@ -1323,8 +1645,12 @@ class Memory(MemoryBase):
+             display_first_run_notice(self, "sync", "get_all")
+         return {"results": all_memories_result}
+ 
+-    def _get_all_from_vector_store(self, filters, limit, show_expired=False, output_limit=None):
+-        memories_result = self.vector_store.list(filters=filters, top_k=limit)
++    def _get_all_from_vector_store(
++        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
++    ):
++        memories_result = self.vector_store.list(
++            filters=_with_bitemporal_filter(filters, as_of, include_invalidated), top_k=limit
++        )
+ 
+         # Handle different vector store return formats by inspecting first element
+         if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+@@ -1339,15 +1665,7 @@ class Memory(MemoryBase):
+         else:
+             actual_memories = memories_result
+ 
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+         formatted_memories = []
+@@ -1366,6 +1684,9 @@ class Memory(MemoryBase):
+                 if key in mem.payload:
+                     memory_item_dict[key] = mem.payload[key]
+ 
++            for key in BI_TEMPORAL_FIELDS:
++                memory_item_dict.setdefault(key, None)
++
+             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
+             if additional_metadata:
+                 memory_item_dict["metadata"] = additional_metadata
+@@ -1387,6 +1708,8 @@ class Memory(MemoryBase):
+         explain: bool = False,
+         reference_date: Optional[Any] = None,
+         show_expired: bool = False,
++        as_of: Optional[str] = None,
++        include_invalidated: bool = False,
+         **kwargs,
+     ):
+         """
+@@ -1420,6 +1743,10 @@ class Memory(MemoryBase):
+             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
+             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
+             show_expired (bool, optional): Include expired memories. Defaults to False.
++            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
++                were valid at T (point-in-time). None means the current moment.
++            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
++                validity filter. Defaults to False.
+ 
+         Returns:
+             dict: A dictionary containing the search results under a "results" key.
+@@ -1492,7 +1819,12 @@ class Memory(MemoryBase):
+ 
+         search_start = time.perf_counter()
+         original_memories = self._search_vector_store(
+-            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
++            query,
++            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
++            limit,
++            threshold,
++            explain=explain,
++            show_expired=show_expired,
+         )
+         search_elapsed_seconds = time.perf_counter() - search_start
+ 
+@@ -1687,15 +2019,7 @@ class Memory(MemoryBase):
+         )
+ 
+         # Step 9: Format results
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+         original_memories = []
+@@ -1718,6 +2042,9 @@ class Memory(MemoryBase):
+                 if key in payload:
+                     memory_item_dict[key] = payload[key]
+ 
++            for key in BI_TEMPORAL_FIELDS:
++                memory_item_dict.setdefault(key, None)
++
+             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
+             if additional_metadata:
+                 if not memory_item_dict.get("metadata"):
+@@ -1753,7 +2080,7 @@ class Memory(MemoryBase):
+         if not deduped:
+             return {}
+ 
+-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
++        search_filters = _scope_filters(filters)
+         memory_boosts = {}
+ 
+         try:
+@@ -2582,14 +2909,15 @@ class AsyncMemory(MemoryBase):
+         parsed_messages = parse_messages(messages)
+ 
+         # Phase 1: Existing memory retrieval
++        # 只取有效事实，且 top_k 提升为候选池大小（详见 sync 同名阶段的说明）。
+         search_filters = {k: v for k, v in effective_filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+         query_embedding = await asyncio.to_thread(self.embedding_model.embed, parsed_messages, "search")
+         existing_results = await asyncio.to_thread(
+             self.vector_store.search,
+             query=parsed_messages,
+             vectors=query_embedding,
+-            top_k=10,
+-            filters=search_filters,
++            top_k=BITEMP_CANDIDATE_K,
++            filters=_with_bitemporal_filter(search_filters),
+         )
+ 
+         # Map UUIDs to integers (anti-hallucination)
+@@ -2693,6 +3021,8 @@ class AsyncMemory(MemoryBase):
+             mem_metadata["updated_at"] = mem_metadata["created_at"]
+             if mem.get("attributed_to"):
+                 mem_metadata["attributed_to"] = mem["attributed_to"]
++            # valid_at 是事实在真实世界的生效日期，不是入库时间（方案 §4.1）。
++            mem_metadata["valid_at"] = _coerce_bitemporal_date(mem.get("valid_at"))
+ 
+             records.append((memory_id, text, embed_map[text], mem_metadata))
+ 
+@@ -2700,6 +3030,12 @@ class AsyncMemory(MemoryBase):
+             await asyncio.to_thread(self.db.save_messages, messages, session_scope)
+             return []
+ 
++        # Phase 5: Independent contradiction detection (1b). Second LLM call with its own
++        # system prompt; skipped when either side of the comparison is empty.
++        contradictions = []
++        if existing_results:
++            contradictions = await self._detect_contradictions_async(records, existing_results)
++
+         # Phase 6: Batch persist
+         all_vectors = [r[2] for r in records]
+         all_ids = [r[0] for r in records]
+@@ -2743,6 +3079,28 @@ class AsyncMemory(MemoryBase):
+                 except Exception as e:
+                     logger.error(f"Failed to add history for {hr['memory_id']} (async): {e}")
+ 
++        # Phase 6b: Deterministic disposition (1c, 方案 §3.2 的 Phase 7) — pure code, the
++        # pairs from 1b become payload-only invalidations (R9/R10).
++        for update in _apply_contradictions(
++            contradictions,
++            {r[0]: r[3] for r in records},
++            {mem.id: dict(mem.payload or {}) for mem in existing_results},
++        ):
++            invalidation = {
++                "invalid_at": update["invalid_at"],
++                "superseded_by": update["superseded_by"],
++                "invalid_reason": update["invalid_reason"],
++            }
++            try:
++                await asyncio.to_thread(
++                    self.vector_store.update,
++                    vector_id=update["memory_id"],
++                    vector=None,
++                    payload=invalidation,
++                )
++            except Exception as e:
++                logger.error(f"Failed to invalidate memory {update['memory_id']} (async): {e}")
++
+         # Phase 7: Batch entity linking
+         try:
+             all_texts = [r[1] for r in records]
+@@ -2863,6 +3221,38 @@ class AsyncMemory(MemoryBase):
+         )
+         return returned_memories
+ 
++    async def _detect_contradictions_async(self, records, existing_results) -> List[Dict[str, str]]:
++        """1b 的异步版本：独立 LLM 调用，只取回矛盾对（详见 sync 同名方法）。"""
++        new_facts = [
++            {"id": record[0], "text": record[1], "valid_at": record[3].get("valid_at")}
++            for record in records
++        ]
++        existing_facts = [
++            {
++                "id": mem.id,
++                "text": (mem.payload or {}).get("data", ""),
++                "valid_at": (mem.payload or {}).get("valid_at"),
++                "created_at": (mem.payload or {}).get("created_at"),
++            }
++            for mem in existing_results
++        ]
++        user_prompt = generate_contradiction_detection_prompt(
++            new_facts=new_facts, existing_facts=existing_facts
++        )
++        try:
++            response = await asyncio.to_thread(
++                self.llm.generate_response,
++                messages=[
++                    {"role": "system", "content": CONTRADICTION_DETECTION_PROMPT},
++                    {"role": "user", "content": user_prompt},
++                ],
++                response_format={"type": "json_object"},
++            )
++        except Exception as e:
++            logger.error(f"LLM contradiction detection failed (async): {e}")
++            return []
++        return _parse_contradiction_pairs(response)
++
+     async def get(self, memory_id):
+         """
+         Retrieve a memory by ID asynchronously.
+@@ -2879,15 +3269,7 @@ class AsyncMemory(MemoryBase):
+             await display_first_run_notice_async(self, "async", "get")
+             return None
+ 
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+ 
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+@@ -2903,6 +3285,10 @@ class AsyncMemory(MemoryBase):
+             if key in memory.payload:
+                 result_item[key] = memory.payload[key]
+ 
++        # Bi-temporal fields are first-class: always top-level, null when unset.
++        for key in BI_TEMPORAL_FIELDS:
++            result_item.setdefault(key, None)
++
+         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
+         if additional_metadata:
+             result_item["metadata"] = additional_metadata
+@@ -2916,6 +3302,8 @@ class AsyncMemory(MemoryBase):
+         filters: Optional[Dict[str, Any]] = None,
+         top_k: int = 20,
+         show_expired: bool = False,
++        as_of: Optional[str] = None,
++        include_invalidated: bool = False,
+         **kwargs,
+     ):
+         """
+@@ -2927,6 +3315,10 @@ class AsyncMemory(MemoryBase):
+                 Example: filters={"user_id": "u1", "agent_id": "a1"}
+             top_k (int, optional): The maximum number of memories to return. Defaults to 20.
+             show_expired (bool, optional): Include expired memories. Defaults to False.
++            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
++                were valid at T (point-in-time). None means the current moment.
++            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
++                validity filter. Defaults to False.
+ 
+         Returns:
+             dict: A dictionary containing a list of memories under the "results" key.
+@@ -2973,7 +3365,7 @@ class AsyncMemory(MemoryBase):
+             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"}
+         )
+ 
+-        all_memories_result = await self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit)
++        all_memories_result = await self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
+ 
+         if scale_threshold_notice:
+             await display_scale_threshold_notice_async(self, "async", "get_all", *scale_threshold_notice)
+@@ -2981,8 +3373,14 @@ class AsyncMemory(MemoryBase):
+             await display_first_run_notice_async(self, "async", "get_all")
+         return {"results": all_memories_result}
+ 
+-    async def _get_all_from_vector_store(self, filters, limit, show_expired=False, output_limit=None):
+-        memories_result = await asyncio.to_thread(self.vector_store.list, filters=filters, top_k=limit)
++    async def _get_all_from_vector_store(
++        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
++    ):
++        memories_result = await asyncio.to_thread(
++            self.vector_store.list,
++            filters=_with_bitemporal_filter(filters, as_of, include_invalidated),
++            top_k=limit,
++        )
+ 
+         # Handle different vector store return formats by inspecting first element
+         if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
+@@ -2997,15 +3395,7 @@ class AsyncMemory(MemoryBase):
+         else:
+             actual_memories = memories_result
+ 
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+         formatted_memories = []
+@@ -3024,6 +3414,9 @@ class AsyncMemory(MemoryBase):
+                 if key in mem.payload:
+                     memory_item_dict[key] = mem.payload[key]
+ 
++            for key in BI_TEMPORAL_FIELDS:
++                memory_item_dict.setdefault(key, None)
++
+             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
+             if additional_metadata:
+                 memory_item_dict["metadata"] = additional_metadata
+@@ -3045,6 +3438,8 @@ class AsyncMemory(MemoryBase):
+         explain: bool = False,
+         reference_date: Optional[Any] = None,
+         show_expired: bool = False,
++        as_of: Optional[str] = None,
++        include_invalidated: bool = False,
+         **kwargs,
+     ):
+         """
+@@ -3078,6 +3473,10 @@ class AsyncMemory(MemoryBase):
+             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
+             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
+             show_expired (bool, optional): Include expired memories. Defaults to False.
++            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
++                were valid at T (point-in-time). None means the current moment.
++            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
++                validity filter. Defaults to False.
+ 
+         Returns:
+             dict: A dictionary containing the search results under a "results" key.
+@@ -3154,7 +3553,12 @@ class AsyncMemory(MemoryBase):
+ 
+         search_start = time.perf_counter()
+         original_memories = await self._search_vector_store(
+-            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
++            query,
++            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
++            limit,
++            threshold,
++            explain=explain,
++            show_expired=show_expired,
+         )
+         search_elapsed_seconds = time.perf_counter() - search_start
+ 
+@@ -3351,15 +3755,7 @@ class AsyncMemory(MemoryBase):
+         )
+ 
+         # Step 9: Format results
+-        promoted_payload_keys = [
+-            "user_id",
+-            "agent_id",
+-            "run_id",
+-            "actor_id",
+-            "role",
+-            "attributed_to",
+-            "expiration_date",
+-        ]
++        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
+         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
+ 
+         original_memories = []
+@@ -3381,6 +3777,9 @@ class AsyncMemory(MemoryBase):
+                 if key in payload:
+                     memory_item_dict[key] = payload[key]
+ 
++            for key in BI_TEMPORAL_FIELDS:
++                memory_item_dict.setdefault(key, None)
++
+             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
+             if additional_metadata:
+                 if not memory_item_dict.get("metadata"):
+@@ -3406,7 +3805,7 @@ class AsyncMemory(MemoryBase):
+         if not deduped:
+             return {}
+ 
+-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
++        search_filters = _scope_filters(filters)
+         memory_boosts = {}
+ 
+         try:
 diff --git a/mem0/vector_stores/qdrant.py b/mem0/vector_stores/qdrant.py
-index b48e03c9..13a28b42 100644
+index b48e03c9..3a5801c0 100644
 --- a/mem0/vector_stores/qdrant.py
 +++ b/mem0/vector_stores/qdrant.py
-@@ -570,24 +570,50 @@ class Qdrant(VectorStoreBase):
+@@ -170,18 +170,29 @@ class Qdrant(VectorStoreBase):
+             logger.debug("Skipping payload index creation for local Qdrant (not supported)")
+             return
+ 
+-        common_fields = ["user_id", "agent_id", "run_id", "actor_id"]
+-
+-        for field in common_fields:
+-            try:
+-                self.client.create_payload_index(
+-                    collection_name=self.collection_name,
+-                    field_name=field,
+-                    field_schema="keyword"
+-                )
+-                logger.info(f"Created index for {field} in collection {self.collection_name}")
+-            except Exception as e:
+-                logger.debug(f"Index for {field} might already exist: {e}")
++        # Field schemas are declared per field: keyword fields are matched by value,
++        # while created_at / valid_at / invalid_at are range-filtered (cursor paging and
++        # the bi-temporal validity predicates). A keyword index on a date field would
++        # make those Range conditions fall back to a full scan.
++        keyword_fields = ["user_id", "agent_id", "run_id", "actor_id"]
++        datetime_fields = ["created_at", "valid_at", "invalid_at"]
++
++        for field, field_schema in ((f, "keyword") for f in keyword_fields):
++            self._create_payload_index(field, field_schema)
++        for field, field_schema in ((f, "datetime") for f in datetime_fields):
++            self._create_payload_index(field, field_schema)
++
++    def _create_payload_index(self, field: str, field_schema: str):
++        """Create one payload index, tolerating fields that are already indexed."""
++        try:
++            self.client.create_payload_index(
++                collection_name=self.collection_name,
++                field_name=field,
++                field_schema=field_schema,
++            )
++            logger.info(f"Created index for {field} in collection {self.collection_name}")
++        except Exception as e:
++            logger.debug(f"Index for {field} might already exist: {e}")
+ 
+     def insert(self, vectors: list, payloads: list = None, ids: list = None):
+         """
+@@ -570,24 +581,50 @@ class Qdrant(VectorStoreBase):
          """
          return self.client.get_collection(collection_name=self.collection_name)
  
@@ -942,9 +1826,9 @@ index b48e03c9..13a28b42 100644
          Args:
              filters (dict, optional): Filters to apply to the list. Defaults to None.
              top_k (int, optional): Number of vectors to return. Defaults to 100.
-+            cursor (str, optional): Opaque keyset cursor from a previous call
-+                ("<created_at>|<id>"). Resumes listing right after the anchor point,
-+                so pages never overlap and never skip rows inserted meanwhile.
++            cursor (str, optional): Opaque keyset cursor from a previous call -- the
++                `created_at` value of the last row on that page. Listing resumes strictly
++                below it (created_at < cursor, newest-first), so pages never overlap.
  
          Returns:
              list: List of vectors.
@@ -977,6 +1861,846 @@ index b48e03c9..13a28b42 100644
          )
          return result
  
+diff --git a/server/dashboard/src/app/(root)/dashboard/analytics/page.tsx b/server/dashboard/src/app/(root)/dashboard/analytics/page.tsx
+index 5147c678..230987f6 100644
+--- a/server/dashboard/src/app/(root)/dashboard/analytics/page.tsx
++++ b/server/dashboard/src/app/(root)/dashboard/analytics/page.tsx
+@@ -1,54 +1,348 @@
+ "use client";
+ 
+-import { LockedPage } from "@/components/self-hosted/locked-page";
++import { useEffect, useRef, useState } from "react";
++import { formatDistanceToNow } from "date-fns";
++import { RefreshCw } from "lucide-react";
++import {
++  Area,
++  AreaChart,
++  Bar,
++  BarChart,
++  CartesianGrid,
++  Cell,
++  ResponsiveContainer,
++  Tooltip,
++  XAxis,
++  YAxis,
++} from "recharts";
++import { Button } from "@/components/ui/button";
+ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { EmptyState } from "@/components/self-hosted/empty-state";
++import { TableSkeleton } from "@/components/shared/table-skeleton";
++import { api } from "@/utils/api";
++import { REQUEST_ENDPOINTS } from "@/utils/api-endpoints";
++import { useApiQuery } from "@/hooks/use-api-query";
++import { RequestStats } from "@/types/api";
++
++const WINDOW_OPTIONS = [7, 14, 30] as const;
++
++const CHART = {
++  operations: "var(--mem-purple-500)",
++  errors: "var(--mem-red-500)",
++  grid: "var(--mem-border-primary)",
++  axis: "var(--on-surface-default-tertiary)",
++};
++
++const tooltipStyle = {
++  background: "var(--surface-default-primary)",
++  border: "1px solid var(--mem-border-primary)",
++  borderRadius: 8,
++  fontSize: 12,
++  color: "var(--on-surface-default-primary)",
++};
++
++const statusClassName = (statusCode: number) => {
++  if (statusCode >= 500) return "text-onSurface-default-primary";
++  if (statusCode >= 400) return "text-onSurface-default-secondary";
++  return "text-onSurface-default-secondary";
++};
++
++export default function AnalyticsPage() {
++  const [days, setDays] = useState<number>(14);
++  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
++  const isFirstRender = useRef(true);
++
++  const {
++    data: stats,
++    isLoading,
++    error,
++    refetch,
++  } = useApiQuery<RequestStats>(
++    async () => {
++      const res = await api.get<RequestStats>(REQUEST_ENDPOINTS.STATS, {
++        params: { days },
++      });
++      setLastUpdated(new Date().toISOString());
++      return res.data;
++    },
++    { errorToast: "Failed to load analytics" },
++  );
++
++  useEffect(() => {
++    if (isFirstRender.current) {
++      isFirstRender.current = false;
++      return;
++    }
++    void refetch();
++  }, [days, refetch]);
++
++  const hasData = Boolean(stats && stats.total > 0);
++  const statusTotal =
++    stats?.by_status.reduce((sum, row) => sum + row.count, 0) ?? 0;
+ 
+-function AnalyticsMockup() {
+   return (
+-    <div className="space-y-4">
+-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+-        {[
+-          { label: "Total Operations", value: "12,847" },
+-          { label: "Avg Latency", value: "142ms" },
+-          { label: "Success Rate", value: "99.7%" },
+-        ].map((stat) => (
+-          <Card key={stat.label} className="border-memBorder-primary">
+-            <CardContent className="p-4">
+-              <p className="text-xs text-onSurface-default-tertiary">
+-                {stat.label}
+-              </p>
+-              <p className="text-2xl font-semibold mt-1">{stat.value}</p>
+-            </CardContent>
+-          </Card>
+-        ))}
++    <div className="space-y-6">
++      <div className="flex flex-wrap items-start justify-between gap-4">
++        <div className="space-y-1">
++          <h1 className="text-xl font-semibold font-fustat">Analytics</h1>
++          <p className="text-sm text-onSurface-default-secondary">
++            Memory operations, latency, and error patterns over time.
++          </p>
++          {lastUpdated && (
++            <p className="text-xs text-onSurface-default-tertiary">
++              Last updated{" "}
++              {formatDistanceToNow(new Date(lastUpdated), { addSuffix: true })}
++            </p>
++          )}
++        </div>
++        <div className="flex items-center gap-2">
++          <div className="flex rounded-md border border-memBorder-primary p-0.5">
++            {WINDOW_OPTIONS.map((option) => (
++              <Button
++                key={option}
++                variant={days === option ? "default" : "ghost"}
++                size="sm"
++                className="h-7 px-2.5 text-xs"
++                onClick={() => setDays(option)}
++              >
++                {option}d
++              </Button>
++            ))}
++          </div>
++          <Button
++            variant="outline"
++            onClick={() => void refetch()}
++            disabled={isLoading}
++          >
++            <RefreshCw className="size-4 mr-2" />
++            Refresh
++          </Button>
++        </div>
+       </div>
+-      <Card className="border-memBorder-primary">
+-        <CardHeader className="pb-2">
+-          <CardTitle className="text-sm">Operations over time</CardTitle>
+-        </CardHeader>
+-        <CardContent className="p-4">
+-          <div className="h-[200px] flex items-end gap-1">
+-            {[40, 65, 45, 80, 55, 90, 70, 85, 60, 95, 75, 50].map((h, i) => (
+-              <div
+-                key={i}
+-                className="flex-1 bg-surface-default-brand rounded-t"
+-                style={{ height: `${h}%` }}
+-              />
++
++      {error && (
++        <Card className="border-memBorder-primary">
++          <CardContent className="p-4 text-sm text-onSurface-danger-primary">
++            {error}
++          </CardContent>
++        </Card>
++      )}
++
++      {isLoading && !stats ? (
++        <TableSkeleton rows={6} columns={3} />
++      ) : !hasData ? (
++        <EmptyState
++          title="No activity in this window"
++          description="Analytics appear once your instance records API requests."
++          image="requests"
++        />
++      ) : (
++        <>
++          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
++            {[
++              { label: `Operations (${days}d)`, value: stats!.total },
++              { label: "Success Rate", value: `${stats!.success_rate}%` },
++              {
++                label: "Avg Latency",
++                value: `${(stats!.avg_latency_ms / 1000).toFixed(2)} s`,
++              },
++              {
++                label: "P95 Latency",
++                value: `${(stats!.p95_latency_ms / 1000).toFixed(2)} s`,
++              },
++            ].map((card) => (
++              <Card key={card.label} className="border-memBorder-primary">
++                <CardContent className="p-5">
++                  <p className="text-xs text-onSurface-default-tertiary">
++                    {card.label}
++                  </p>
++                  <p className="mt-1 text-2xl font-semibold">{card.value}</p>
++                </CardContent>
++              </Card>
+             ))}
+           </div>
+-        </CardContent>
+-      </Card>
+-    </div>
+-  );
+-}
+ 
+-export default function AnalyticsPage() {
+-  return (
+-    <LockedPage
+-      title="Analytics"
+-      description="Track memory operations, latency, and usage patterns over time."
+-      previewContent={<AnalyticsMockup />}
+-      utmMedium="dashboard-locked-analytics"
+-    />
++          <Card className="border-memBorder-primary">
++            <CardHeader className="pb-2">
++              <CardTitle className="text-sm">
++                Operations over time
++              </CardTitle>
++            </CardHeader>
++            <CardContent className="p-4 pt-0">
++              <div className="h-[240px] w-full">
++                <ResponsiveContainer width="100%" height="100%">
++                  <AreaChart
++                    data={stats!.by_day}
++                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
++                  >
++                    <defs>
++                      <linearGradient id="opsFill" x1="0" y1="0" x2="0" y2="1">
++                        <stop
++                          offset="0%"
++                          stopColor={CHART.operations}
++                          stopOpacity={0.35}
++                        />
++                        <stop
++                          offset="100%"
++                          stopColor={CHART.operations}
++                          stopOpacity={0.02}
++                        />
++                      </linearGradient>
++                    </defs>
++                    <CartesianGrid
++                      stroke={CHART.grid}
++                      strokeDasharray="3 3"
++                      vertical={false}
++                    />
++                    <XAxis
++                      dataKey="date"
++                      tickFormatter={(value: string) => value.slice(5)}
++                      stroke={CHART.axis}
++                      fontSize={11}
++                      tickLine={false}
++                    />
++                    <YAxis stroke={CHART.axis} fontSize={11} tickLine={false} />
++                    <Tooltip contentStyle={tooltipStyle} />
++                    <Area
++                      type="monotone"
++                      dataKey="total"
++                      name="operations"
++                      stroke={CHART.operations}
++                      strokeWidth={2}
++                      fill="url(#opsFill)"
++                    />
++                    <Area
++                      type="monotone"
++                      dataKey="errors"
++                      name="errors"
++                      stroke={CHART.errors}
++                      strokeWidth={2}
++                      fill="none"
++                    />
++                  </AreaChart>
++                </ResponsiveContainer>
++              </div>
++            </CardContent>
++          </Card>
++
++          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
++            <Card className="border-memBorder-primary">
++              <CardHeader className="pb-2">
++                <CardTitle className="text-sm">Top endpoints</CardTitle>
++              </CardHeader>
++              <CardContent className="p-4 pt-0">
++                <div className="h-[260px] w-full">
++                  <ResponsiveContainer width="100%" height="100%">
++                    <BarChart
++                      data={stats!.top_paths}
++                      layout="vertical"
++                      margin={{ top: 8, right: 16, left: 8, bottom: 0 }}
++                    >
++                      <CartesianGrid
++                        stroke={CHART.grid}
++                        strokeDasharray="3 3"
++                        horizontal={false}
++                      />
++                      <XAxis
++                        type="number"
++                        stroke={CHART.axis}
++                        fontSize={11}
++                        tickLine={false}
++                      />
++                      <YAxis
++                        type="category"
++                        dataKey="path"
++                        width={140}
++                        stroke={CHART.axis}
++                        fontSize={11}
++                        tickLine={false}
++                        tickFormatter={(value: string) =>
++                          value.length > 22
++                            ? `${value.slice(0, 21)}…`
++                            : value
++                        }
++                      />
++                      <Tooltip contentStyle={tooltipStyle} />
++                      <Bar
++                        dataKey="count"
++                        name="requests"
++                        fill={CHART.operations}
++                        radius={[0, 4, 4, 0]}
++                      />
++                    </BarChart>
++                  </ResponsiveContainer>
++                </div>
++              </CardContent>
++            </Card>
++
++            <Card className="border-memBorder-primary">
++              <CardHeader className="pb-2">
++                <CardTitle className="text-sm">Response status</CardTitle>
++              </CardHeader>
++              <CardContent className="space-y-3 p-4 pt-2">
++                {stats!.by_status.map((row) => {
++                  const share =
++                    statusTotal > 0 ? (row.count / statusTotal) * 100 : 0;
++                  const isError = row.status_code >= 400;
++                  return (
++                    <div key={row.status_code} className="space-y-1.5">
++                      <div className="flex items-center justify-between text-xs">
++                        <span
++                          className={`font-mono ${statusClassName(
++                            row.status_code,
++                          )}`}
++                        >
++                          {row.status_code}
++                        </span>
++                        <span className="text-onSurface-default-secondary">
++                          {row.count.toLocaleString()} · {share.toFixed(1)}%
++                        </span>
++                      </div>
++                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-default-secondary">
++                        <div
++                          className="h-full rounded-full"
++                          style={{
++                            width: `${share}%`,
++                            background: isError
++                              ? CHART.errors
++                              : CHART.operations,
++                          }}
++                        />
++                      </div>
++                    </div>
++                  );
++                })}
++              </CardContent>
++            </Card>
++          </div>
++
++          <Card className="border-memBorder-primary">
++            <CardHeader className="pb-2">
++              <CardTitle className="text-sm">
++                Avg latency by endpoint
++              </CardTitle>
++            </CardHeader>
++            <CardContent className="p-0">
++              <div className="divide-y divide-memBorder-primary">
++                {stats!.top_paths.map((row) => (
++                  <div
++                    key={row.path}
++                    className="flex items-center justify-between gap-4 px-4 py-2.5 text-xs"
++                  >
++                    <span className="font-mono break-all text-onSurface-default-primary">
++                      {row.path}
++                    </span>
++                    <span className="shrink-0 text-onSurface-default-secondary">
++                      {(row.avg_latency_ms / 1000).toFixed(2)} s avg ·{" "}
++                      {row.count.toLocaleString()} calls
++                    </span>
++                  </div>
++                ))}
++              </div>
++            </CardContent>
++          </Card>
++        </>
++      )}
++    </div>
+   );
+ }
+diff --git a/server/dashboard/src/app/(root)/dashboard/api-keys/page.tsx b/server/dashboard/src/app/(root)/dashboard/api-keys/page.tsx
+index e38386fe..0b50b666 100644
+--- a/server/dashboard/src/app/(root)/dashboard/api-keys/page.tsx
++++ b/server/dashboard/src/app/(root)/dashboard/api-keys/page.tsx
+@@ -19,7 +19,6 @@ import DeleteConfirmationModal from "@/components/ui/delete-confirmation-modal";
+ import { api } from "@/utils/api";
+ import { API_KEY_ENDPOINTS } from "@/utils/api-endpoints";
+ import { toast } from "@/components/ui/use-toast";
+-import { UpgradeBanner } from "@/components/self-hosted/upgrade-banner";
+ import { Plus, Copy, Check, Trash2 } from "lucide-react";
+ import { CopyToClipboard } from "react-copy-to-clipboard";
+ import { format } from "date-fns";
+@@ -203,16 +202,6 @@ export default function ApiKeysPage() {
+         </Dialog>
+       </div>
+ 
+-      {keys.length >= 3 && (
+-        <UpgradeBanner
+-          id="api-keys-3"
+-          message="Managing multiple apps? Cloud offers project-based isolation."
+-          ctaLabel="Explore Cloud"
+-          ctaUrl="https://app.mem0.ai?utm_source=oss&utm_medium=dashboard-api-keys"
+-          variant="cloud"
+-        />
+-      )}
+-
+       {isLoading ? (
+         <TableSkeleton rows={3} columns={4} />
+       ) : keys.length === 0 ? (
+diff --git a/server/dashboard/src/app/(root)/dashboard/categories/page.tsx b/server/dashboard/src/app/(root)/dashboard/categories/page.tsx
+deleted file mode 100644
+index 39cc979e..00000000
+--- a/server/dashboard/src/app/(root)/dashboard/categories/page.tsx
++++ /dev/null
+@@ -1,36 +0,0 @@
+-"use client";
+-
+-import { LockedPage } from "@/components/self-hosted/locked-page";
+-import { Card, CardContent } from "@/components/ui/card";
+-
+-function CategoriesMockup() {
+-  const categories = ["Health", "Preferences", "Work"];
+-  return (
+-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+-      {categories.map((cat) => (
+-        <Card key={cat} className="border-memBorder-primary">
+-          <CardContent className="p-4">
+-            <p className="text-sm font-medium mb-3">{cat}</p>
+-            {[1, 2, 3].map((i) => (
+-              <div
+-                key={i}
+-                className="h-8 bg-surface-default-secondary rounded mb-2"
+-              />
+-            ))}
+-          </CardContent>
+-        </Card>
+-      ))}
+-    </div>
+-  );
+-}
+-
+-export default function CategoriesPage() {
+-  return (
+-    <LockedPage
+-      title="Custom Categories"
+-      description="Organize memories by domain -- health, preferences, work, and more."
+-      previewContent={<CategoriesMockup />}
+-      utmMedium="dashboard-locked-categories"
+-    />
+-  );
+-}
+diff --git a/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx b/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
+index d577de6e..4f9e2708 100644
+--- a/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
++++ b/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
+@@ -5,24 +5,15 @@ import Link from "next/link";
+ import {
+   Activity,
+   ChartLine,
+-  ChevronDown,
+   FolderInput,
+   GalleryVerticalEnd,
+   KeyRound,
+   Settings,
+-  Tags,
+   Users,
+-  WebhookIcon,
+   Wrench,
+ } from "lucide-react";
+ import { useSelector } from "react-redux";
+ import { RootState } from "@/store/store";
+-import { Badge } from "@/components/ui/badge";
+-import {
+-  Collapsible,
+-  CollapsibleContent,
+-  CollapsibleTrigger,
+-} from "@/components/ui/collapsible";
+ import {
+   Sidebar,
+   SidebarContent,
+@@ -44,7 +35,6 @@ export function MainNav({
+   const isSidebarCollapsed = useSelector(
+     (state: RootState) => state.layout.isSidebarCollapsed,
+   );
+-  const [isCloudOpen, setIsCloudOpen] = React.useState(true);
+ 
+   return (
+     <Sidebar
+@@ -81,6 +71,18 @@ export function MainNav({
+                     icon: Users,
+                     active: pathname === "/dashboard/entities",
+                   },
++                  {
++                    title: "Analytics",
++                    url: "/dashboard/analytics",
++                    icon: ChartLine,
++                    active: pathname === "/dashboard/analytics",
++                  },
++                  {
++                    title: "Export",
++                    url: "/dashboard/export",
++                    icon: FolderInput,
++                    active: pathname === "/dashboard/export",
++                  },
+                 ].map((item) => (
+                   <SidebarMenuItem key={item.title}>
+                     <SidebarMenuButton
+@@ -110,86 +112,6 @@ export function MainNav({
+                 <div className="h-[1px] w-full bg-memBorder-primary my-2" />
+               )}
+ 
+-              <Collapsible
+-                open={isCloudOpen}
+-                onOpenChange={setIsCloudOpen}
+-                className="flex flex-col gap-0"
+-              >
+-                {!isSidebarCollapsed && (
+-                  <CollapsibleTrigger asChild>
+-                    <SidebarGroupLabel className="cursor-pointer mb-0">
+-                      CLOUD FEATURES
+-                      <ChevronDown
+-                        className={cn(
+-                          "size-3 transition-transform duration-200",
+-                          isCloudOpen ? "" : "-rotate-90",
+-                        )}
+-                      />
+-                    </SidebarGroupLabel>
+-                  </CollapsibleTrigger>
+-                )}
+-                <CollapsibleContent className="flex flex-col gap-0">
+-                  {[
+-                    {
+-                      title: "Categories",
+-                      url: "/dashboard/categories",
+-                      icon: Tags,
+-                    },
+-                    {
+-                      title: "Webhooks",
+-                      url: "/dashboard/webhooks",
+-                      icon: WebhookIcon,
+-                    },
+-                    {
+-                      title: "Analytics",
+-                      url: "/dashboard/analytics",
+-                      icon: ChartLine,
+-                    },
+-                    {
+-                      title: "Export",
+-                      url: "/dashboard/export",
+-                      icon: FolderInput,
+-                    },
+-                  ].map((item) => (
+-                    <SidebarMenuItem key={item.title}>
+-                      <SidebarMenuButton
+-                        asChild
+-                        collapsed={isSidebarCollapsed}
+-                        active={pathname === item.url}
+-                        tooltip={isSidebarCollapsed ? item.title : undefined}
+-                      >
+-                        <Link
+-                          href={item.url}
+-                          className={cn(
+-                            "flex items-center w-full",
+-                            isSidebarCollapsed
+-                              ? "justify-center mx-auto"
+-                              : "gap-1.5",
+-                          )}
+-                        >
+-                          <item.icon className="size-4 shrink-0" />
+-                          {!isSidebarCollapsed && (
+-                            <>
+-                              <span>{item.title}</span>
+-                              <Badge
+-                                variant="outline"
+-                                className="ml-auto text-memGold-600 border-memGold-300 typo-caption-sm px-1.5 py-0"
+-                              >
+-                                PRO
+-                              </Badge>
+-                            </>
+-                          )}
+-                        </Link>
+-                      </SidebarMenuButton>
+-                    </SidebarMenuItem>
+-                  ))}
+-                </CollapsibleContent>
+-              </Collapsible>
+-
+-              {isSidebarCollapsed && (
+-                <div className="h-[1px] w-full bg-memBorder-primary my-2" />
+-              )}
+-
+               <div className="flex flex-col gap-0">
+                 {!isSidebarCollapsed && (
+                   <SidebarGroupLabel className="mb-0">
+diff --git a/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx b/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx
+index 7429f09e..d9f5a079 100644
+--- a/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx
++++ b/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx
+@@ -13,7 +13,6 @@ import {
+   SelectValue,
+ } from "@/components/ui/select";
+ import { toast } from "@/components/ui/use-toast";
+-import { UpgradeBanner } from "@/components/self-hosted/upgrade-banner";
+ import { getErrorMessage } from "@/lib/error-message";
+ import { api } from "@/utils/api";
+ import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
+@@ -226,14 +225,6 @@ export default function ConfigurationPage() {
+           {isSaving ? "Saving..." : "Save Configuration"}
+         </Button>
+       )}
+-
+-      <UpgradeBanner
+-        id="config-sso"
+-        message="Looking for SSO / SAML? Available in Enterprise."
+-        ctaLabel="Contact sales"
+-        ctaUrl="https://app.mem0.ai/enterprise?utm_source=oss&utm_medium=dashboard-configuration-sso"
+-        variant="enterprise"
+-      />
+     </div>
+   );
+ }
+diff --git a/server/dashboard/src/app/(root)/dashboard/export/page.tsx b/server/dashboard/src/app/(root)/dashboard/export/page.tsx
+index 26f8423c..5719e23a 100644
+--- a/server/dashboard/src/app/(root)/dashboard/export/page.tsx
++++ b/server/dashboard/src/app/(root)/dashboard/export/page.tsx
+@@ -1,65 +1,147 @@
+ "use client";
+ 
+-import { LockedPage } from "@/components/self-hosted/locked-page";
+-import { Card, CardContent } from "@/components/ui/card";
+-import { Label } from "@/components/ui/label";
++import { useState } from "react";
++import { Download, FileJson, FileSpreadsheet, Loader2 } from "lucide-react";
++import { toast } from "@/components/ui/use-toast";
+ import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { api } from "@/utils/api";
++import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
++import { useApiQuery } from "@/hooks/use-api-query";
++import { getErrorMessage } from "@/lib/error-message";
++
++type ExportFormat = "json" | "csv";
++
++const FORMATS: {
++  id: ExportFormat;
++  label: string;
++  hint: string;
++  icon: typeof FileJson;
++}[] = [
++  {
++    id: "json",
++    label: "JSON",
++    hint: "Structured records with metadata included.",
++    icon: FileJson,
++  },
++  {
++    id: "csv",
++    label: "CSV",
++    hint: "Flat table, one row per memory.",
++    icon: FileSpreadsheet,
++  },
++];
++
++const buildStamp = () =>
++  new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
++
++export default function ExportPage() {
++  const [format, setFormat] = useState<ExportFormat>("json");
++  const [isExporting, setIsExporting] = useState(false);
++
++  const { data: total = 0 } = useApiQuery<number>(
++    async () => {
++      const res = await api.get<{ total?: number }>(MEMORY_ENDPOINTS.BASE, {
++        params: { top_k: 1 },
++      });
++      return res.data?.total ?? 0;
++    },
++    { initialData: 0 },
++  );
++
++  const handleExport = async () => {
++    setIsExporting(true);
++    try {
++      const res = await api.get<Blob>(MEMORY_ENDPOINTS.EXPORT, {
++        params: { format },
++        responseType: "blob",
++      });
++
++      const filename = `mem0-memories-${buildStamp()}.${format}`;
++      const url = URL.createObjectURL(res.data);
++      const anchor = document.createElement("a");
++      anchor.href = url;
++      anchor.download = filename;
++      document.body.appendChild(anchor);
++      anchor.click();
++      anchor.remove();
++      URL.revokeObjectURL(url);
++
++      toast({
++        title: "Export ready",
++        description: `Downloaded ${filename}`,
++      });
++    } catch (err) {
++      toast({
++        title: "Export failed",
++        description: getErrorMessage(err, "Could not export memories"),
++        variant: "destructive",
++      });
++    } finally {
++      setIsExporting(false);
++    }
++  };
+ 
+-function ExportMockup() {
+   return (
+-    <div className="space-y-4">
++    <div className="space-y-6">
++      <div>
++        <h1 className="text-xl font-semibold font-fustat">Export</h1>
++        <p className="text-sm text-onSurface-default-secondary mt-1">
++          Download every memory in your instance as a single file.
++        </p>
++      </div>
++
+       <Card className="border-memBorder-primary">
+-        <CardContent className="p-6 space-y-4">
+-          <div className="space-y-2">
+-            <Label>Format</Label>
+-            <div className="flex gap-2">
+-              {["JSON", "CSV", "Pydantic Schema"].map((fmt) => (
+-                <Button
+-                  key={fmt}
+-                  variant="outline"
+-                  size="sm"
+-                  disabled
+-                  className={fmt === "JSON" ? "border-memPurple-300" : ""}
++        <CardHeader className="pb-3">
++          <CardTitle className="text-sm">Format</CardTitle>
++        </CardHeader>
++        <CardContent className="space-y-4">
++          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
++            {FORMATS.map((option) => {
++              const Icon = option.icon;
++              const isActive = format === option.id;
++              return (
++                <button
++                  key={option.id}
++                  type="button"
++                  onClick={() => setFormat(option.id)}
++                  className={`flex items-start gap-3 rounded-md border p-4 text-left transition-colors ${
++                    isActive
++                      ? "border-memPurple-300 bg-surface-default-brand"
++                      : "border-memBorder-primary hover:bg-surface-default-secondary"
++                  }`}
+                 >
+-                  {fmt}
+-                </Button>
+-              ))}
+-            </div>
++                  <Icon className="size-4 mt-0.5 shrink-0 text-onSurface-default-secondary" />
++                  <span>
++                    <span className="block text-sm font-medium">
++                      {option.label}
++                    </span>
++                    <span className="block text-xs text-onSurface-default-tertiary mt-0.5">
++                      {option.hint}
++                    </span>
++                  </span>
++                </button>
++              );
++            })}
+           </div>
+-          <div className="space-y-2">
+-            <Label>Sample output</Label>
+-            <Card className="border-memBorder-primary bg-surface-default-secondary">
+-              <CardContent className="p-3">
+-                <pre className="text-xs text-onSurface-default-secondary font-mono whitespace-pre-wrap">
+-                  {`{
+-  "memories": [
+-    {
+-      "id": "mem_abc123",
+-      "content": "User prefers dark mode",
+-      "user_id": "user_1",
+-      "created_at": "2026-04-10T12:00:00Z"
+-    }
+-  ],
+-  "total": 1247
+-}`}
+-                </pre>
+-              </CardContent>
+-            </Card>
++
++          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-memBorder-primary pt-4">
++            <p className="text-xs text-onSurface-default-tertiary">
++              {total > 0
++                ? `Exports the full collection — ${total.toLocaleString()} memories, not just the current page.`
++                : "Exports the full collection, not just the current page."}
++            </p>
++            <Button onClick={() => void handleExport()} disabled={isExporting}>
++              {isExporting ? (
++                <Loader2 className="size-4 mr-2 animate-spin" />
++              ) : (
++                <Download className="size-4 mr-2" />
++              )}
++              {isExporting ? "Exporting..." : `Export ${format.toUpperCase()}`}
++            </Button>
+           </div>
+-          <Button disabled>Export Memories</Button>
+         </CardContent>
+       </Card>
+     </div>
+   );
+ }
+-
+-export default function ExportPage() {
+-  return (
+-    <LockedPage
+-      title="Export"
+-      description="Export your memories in JSON, CSV, or Pydantic schema format."
+-      previewContent={<ExportMockup />}
+-      utmMedium="dashboard-locked-export"
+-    />
+-  );
+-}
 diff --git a/server/dashboard/src/app/(root)/dashboard/memories/page.tsx b/server/dashboard/src/app/(root)/dashboard/memories/page.tsx
 index a7419ca5..435033af 100644
 --- a/server/dashboard/src/app/(root)/dashboard/memories/page.tsx
@@ -1269,8 +2993,212 @@ index a7419ca5..435033af 100644
                  </Button>
                </div>
              </div>
+diff --git a/server/dashboard/src/app/(root)/dashboard/webhooks/page.tsx b/server/dashboard/src/app/(root)/dashboard/webhooks/page.tsx
+deleted file mode 100644
+index 25ce6aa5..00000000
+--- a/server/dashboard/src/app/(root)/dashboard/webhooks/page.tsx
++++ /dev/null
+@@ -1,53 +0,0 @@
+-"use client";
+-
+-import { LockedPage } from "@/components/self-hosted/locked-page";
+-import { Card, CardContent } from "@/components/ui/card";
+-import { Input } from "@/components/ui/input";
+-import { Checkbox } from "@/components/ui/checkbox";
+-import { Label } from "@/components/ui/label";
+-import { Button } from "@/components/ui/button";
+-
+-function WebhooksMockup() {
+-  return (
+-    <Card className="border-memBorder-primary">
+-      <CardContent className="p-6 space-y-4">
+-        <div className="space-y-2">
+-          <Label>Endpoint URL</Label>
+-          <Input placeholder="https://your-app.com/webhooks/mem0" disabled />
+-        </div>
+-        <div className="space-y-2">
+-          <Label>Events</Label>
+-          <div className="flex flex-col gap-2">
+-            {[
+-              "memory.created",
+-              "memory.updated",
+-              "memory.deleted",
+-              "search.performed",
+-            ].map((event) => (
+-              <div key={event} className="flex items-center gap-2">
+-                <Checkbox disabled checked={event === "memory.created"} />
+-                <Label className="text-sm font-normal">{event}</Label>
+-              </div>
+-            ))}
+-          </div>
+-        </div>
+-        <div className="space-y-2">
+-          <Label>Signing Secret</Label>
+-          <Input placeholder="whsec_..." disabled type="password" />
+-        </div>
+-        <Button disabled>Create Webhook</Button>
+-      </CardContent>
+-    </Card>
+-  );
+-}
+-
+-export default function WebhooksPage() {
+-  return (
+-    <LockedPage
+-      title="Webhooks"
+-      description="Get notified when memories are created, updated, or deleted."
+-      previewContent={<WebhooksMockup />}
+-      utmMedium="dashboard-locked-webhooks"
+-    />
+-  );
+-}
+diff --git a/server/dashboard/src/components/self-hosted/locked-page.tsx b/server/dashboard/src/components/self-hosted/locked-page.tsx
+deleted file mode 100644
+index f4e26826..00000000
+--- a/server/dashboard/src/components/self-hosted/locked-page.tsx
++++ /dev/null
+@@ -1,63 +0,0 @@
+-"use client";
+-
+-import { Button } from "@/components/ui/button";
+-import { Card, CardContent } from "@/components/ui/card";
+-import { Lock } from "lucide-react";
+-
+-interface LockedPageProps {
+-  title: string;
+-  description: string;
+-  previewContent: React.ReactNode;
+-  utmMedium: string;
+-}
+-
+-export function LockedPage({
+-  title,
+-  description,
+-  previewContent,
+-  utmMedium,
+-}: LockedPageProps) {
+-  const utm = `utm_source=oss&utm_medium=${utmMedium}`;
+-  const cloudUrl = `https://app.mem0.ai?${utm}`;
+-  const salesUrl = `https://app.mem0.ai/enterprise?${utm}`;
+-
+-  return (
+-    <div className="space-y-6">
+-      <div>
+-        <h1 className="text-xl font-semibold font-fustat flex items-center gap-2">
+-          {title}
+-          <Lock className="size-4 text-onSurface-default-tertiary" />
+-        </h1>
+-        <p className="text-sm text-onSurface-default-secondary mt-1">
+-          {description}
+-        </p>
+-      </div>
+-
+-      <div className="opacity-60 pointer-events-none select-none">
+-        {previewContent}
+-      </div>
+-
+-      <Card className="border-memBorder-primary">
+-        <CardContent className="flex flex-col sm:flex-row items-center gap-4 py-6">
+-          <div className="flex-1">
+-            <p className="text-sm font-medium">
+-              This feature is available in Mem0 Cloud and Enterprise.
+-            </p>
+-          </div>
+-          <div className="flex gap-3">
+-            <Button variant="default" asChild>
+-              <a href={cloudUrl} target="_blank" rel="noopener noreferrer">
+-                Start free on Cloud
+-              </a>
+-            </Button>
+-            <Button variant="outline" asChild>
+-              <a href={salesUrl} target="_blank" rel="noopener noreferrer">
+-                Talk to sales
+-              </a>
+-            </Button>
+-          </div>
+-        </CardContent>
+-      </Card>
+-    </div>
+-  );
+-}
+diff --git a/server/dashboard/src/components/self-hosted/upgrade-banner.tsx b/server/dashboard/src/components/self-hosted/upgrade-banner.tsx
+deleted file mode 100644
+index a8d76343..00000000
+--- a/server/dashboard/src/components/self-hosted/upgrade-banner.tsx
++++ /dev/null
+@@ -1,70 +0,0 @@
+-"use client";
+-
+-import { useEffect, useState } from "react";
+-import { X } from "lucide-react";
+-import { cn } from "@/lib/utils";
+-
+-interface UpgradeBannerProps {
+-  id: string;
+-  message: string;
+-  ctaLabel: string;
+-  ctaUrl: string;
+-  variant: "cloud" | "enterprise";
+-  dismissible?: boolean;
+-}
+-
+-export function UpgradeBanner({
+-  id,
+-  message,
+-  ctaLabel,
+-  ctaUrl,
+-  variant,
+-  dismissible = true,
+-}: UpgradeBannerProps) {
+-  const [mounted, setMounted] = useState(false);
+-  const [dismissed, setDismissed] = useState(false);
+-
+-  useEffect(() => {
+-    setDismissed(localStorage.getItem(`nudge_${id}_dismissed`) === "true");
+-    setMounted(true);
+-  }, [id]);
+-
+-  if (!mounted || dismissed) return null;
+-
+-  const handleDismiss = () => {
+-    localStorage.setItem(`nudge_${id}_dismissed`, "true");
+-    setDismissed(true);
+-  };
+-
+-  return (
+-    <div
+-      className={cn(
+-        "flex items-center gap-3 px-4 py-2.5 rounded-md typo-body-xs font-fustat",
+-        variant === "cloud"
+-          ? "bg-memGold-100 border-l-2 border-memGold-500"
+-          : "bg-memRed-100 border-l-2 border-memRed-400",
+-      )}
+-    >
+-      <p className="flex-1 text-onSurface-default-secondary">{message}</p>
+-      <a
+-        href={ctaUrl}
+-        target="_blank"
+-        rel="noopener noreferrer"
+-        className={cn(
+-          "text-xs font-medium whitespace-nowrap underline",
+-          variant === "cloud" ? "text-memGold-700" : "text-memRed-600",
+-        )}
+-      >
+-        {ctaLabel}
+-      </a>
+-      {dismissible && (
+-        <button
+-          onClick={handleDismiss}
+-          className="p-0.5 rounded hover:bg-surface-default-secondary-hover text-onSurface-default-tertiary"
+-        >
+-          <X className="size-3.5" />
+-        </button>
+-      )}
+-    </div>
+-  );
+-}
 diff --git a/server/dashboard/src/types/api.ts b/server/dashboard/src/types/api.ts
-index b8cd415b..f6d71852 100644
+index b8cd415b..f799e367 100644
 --- a/server/dashboard/src/types/api.ts
 +++ b/server/dashboard/src/types/api.ts
 @@ -5,6 +5,7 @@ export interface Memory {
@@ -1281,18 +3209,63 @@ index b8cd415b..f6d71852 100644
  }
  
  export interface ApiKey {
+@@ -33,6 +34,35 @@ export interface ApiRequestLog {
+   auth_type: string;
+ }
+ 
++export interface RequestStatsDay {
++  date: string;
++  total: number;
++  errors: number;
++  avg_latency_ms: number;
++}
++
++export interface RequestStatsStatus {
++  status_code: number;
++  count: number;
++}
++
++export interface RequestStatsPath {
++  path: string;
++  count: number;
++  avg_latency_ms: number;
++}
++
++export interface RequestStats {
++  total: number;
++  success_rate: number;
++  avg_latency_ms: number;
++  p95_latency_ms: number;
++  window_days: number;
++  by_day: RequestStatsDay[];
++  by_status: RequestStatsStatus[];
++  top_paths: RequestStatsPath[];
++}
++
+ export type EntityType = "user" | "agent" | "run";
+ 
+ export interface Entity {
 diff --git a/server/dashboard/src/utils/api-endpoints.ts b/server/dashboard/src/utils/api-endpoints.ts
-index 6db543ff..639e31ab 100644
+index 6db543ff..1175631c 100644
 --- a/server/dashboard/src/utils/api-endpoints.ts
 +++ b/server/dashboard/src/utils/api-endpoints.ts
-@@ -12,6 +12,7 @@ export const MEMORY_ENDPOINTS = {
+@@ -12,6 +12,8 @@ export const MEMORY_ENDPOINTS = {
    BASE: "/memories",
    BY_ID: (memoryId: string) => `/memories/${memoryId}`,
    HISTORY: (memoryId: string) => `/memories/${memoryId}/history`,
++  EXPORT: "/memories/export",
 +  SEARCH: "/search",
    CONFIGURE: "/configure",
    CONFIGURE_PROVIDERS: "/configure/providers",
    RESET: "/reset",
+@@ -25,6 +27,7 @@ export const API_KEY_ENDPOINTS = {
+ 
+ export const REQUEST_ENDPOINTS = {
+   BASE: "/requests",
++  STATS: "/requests/stats",
+ } as const;
+ 
+ export const ENTITY_ENDPOINTS = {
 diff --git a/server/docker-compose.yaml b/server/docker-compose.yaml
 index 7e382f7c..33fdd496 100644
 --- a/server/docker-compose.yaml
@@ -1367,10 +3340,30 @@ index 7e382f7c..33fdd496 100644
  networks:
    mem0_network:
 diff --git a/server/main.py b/server/main.py
-index 20059fb8..49690d39 100644
+index 20059fb8..6b240bf0 100644
 --- a/server/main.py
 +++ b/server/main.py
-@@ -113,28 +113,34 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
+@@ -1,7 +1,10 @@
+ import asyncio
++import csv
++import io
+ import logging
+ import os
+ import time
++from datetime import datetime, timezone
+ from typing import Any, Dict, List, Optional
+ 
+ import telemetry
+@@ -18,7 +21,7 @@ from errors import (
+ )
+ from fastapi import Depends, FastAPI, HTTPException, Query, Request
+ from fastapi.middleware.cors import CORSMiddleware
+-from fastapi.responses import JSONResponse, RedirectResponse
++from fastapi.responses import JSONResponse, RedirectResponse, Response
+ from models import RequestLog, User
+ from pydantic import BaseModel, Field
+ from rate_limit import limiter
+@@ -113,28 +116,43 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
  POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
  
  OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -1385,6 +3378,15 @@ index 20059fb8..49690d39 100644
 +LLM_BASE_URL = os.environ.get("LLM_BASE_URL", OPENAI_BASE_URL)
 +EMBEDDER_API_KEY = os.environ.get("EMBEDDER_API_KEY", OPENAI_API_KEY)
 +EMBEDDER_BASE_URL = os.environ.get("EMBEDDER_BASE_URL", OPENAI_BASE_URL)
++
++# Single source of truth for vector dimensionality. The embedder's output size and the
++# Qdrant collection's vector size must agree, so both read this one value: setting only
++# one of the two env vars can no longer silently desync them.
++EMBEDDING_DIMS = int(
++    os.environ.get("EMBEDDER_EMBEDDING_DIMS")
++    or os.environ.get("QDRANT_EMBEDDING_DIMS")
++    or "2048"
++)
 +
  DEFAULT_CONFIG = {
      "version": "v1.1",
@@ -1401,7 +3403,7 @@ index 20059fb8..49690d39 100644
 +            "host": os.environ.get("QDRANT_HOST", "qdrant"),
 +            "port": int(os.environ.get("QDRANT_PORT", "6333")),
 +            "collection_name": os.environ.get("QDRANT_COLLECTION_NAME", "memories"),
-+            "embedding_model_dims": int(os.environ.get("QDRANT_EMBEDDING_DIMS", "2048")),
++            "embedding_model_dims": EMBEDDING_DIMS,
          },
      },
      "llm": {
@@ -1410,11 +3412,62 @@ index 20059fb8..49690d39 100644
 +        "config": {"api_key": LLM_API_KEY, "openai_base_url": LLM_BASE_URL, "temperature": 0.2, "model": DEFAULT_LLM_MODEL},
      },
 -    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": DEFAULT_EMBEDDER_MODEL}},
-+    "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": int(os.environ.get("EMBEDDER_EMBEDDING_DIMS", "4096"))}},
++    "embedder": {"provider": "openai", "config": {"api_key": EMBEDDER_API_KEY, "openai_base_url": EMBEDDER_BASE_URL, "model": DEFAULT_EMBEDDER_MODEL, "embedding_dims": EMBEDDING_DIMS}},
      "history_db_path": HISTORY_DB_PATH,
  }
  
-@@ -402,10 +408,34 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
+@@ -205,6 +223,13 @@ class SearchRequest(BaseModel):
+     threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
+     explain: Optional[bool] = Field(None, description="Include score details for each search result.")
+     show_expired: Optional[bool] = Field(None, description="Include expired memories.")
++    as_of: Optional[str] = Field(
++        None,
++        description="Point-in-time instant (YYYY-MM-DD or ISO8601). Returns the facts valid at that moment.",
++    )
++    include_invalidated: Optional[bool] = Field(
++        None, description="Return invalidated facts too, ignoring the bi-temporal validity filter."
++    )
+ 
+ 
+ class GenerateInstructionsRequest(BaseModel):
+@@ -383,7 +408,23 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
+ 
+ 
+ ALL_MEMORIES_LIMIT = 1000
+-_RESERVED_PAYLOAD_KEYS = {"data", "user_id", "agent_id", "run_id", "hash", "created_at", "updated_at", "expiration_date"}
++# Payload keys surfaced as first-class fields: they are pulled out of `metadata` so a
++# client never sees a bi-temporal field nested under it (the four fields sit one level
++# up, next to `hash` and `created_at`).
++_RESERVED_PAYLOAD_KEYS = {
++    "data",
++    "user_id",
++    "agent_id",
++    "run_id",
++    "hash",
++    "created_at",
++    "updated_at",
++    "expiration_date",
++    "valid_at",
++    "invalid_at",
++    "superseded_by",
++    "invalid_reason",
++}
+ 
+ 
+ def _serialize_memory(row: Any) -> Dict[str, Any]:
+@@ -396,16 +437,46 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
+         "run_id": payload.get("run_id"),
+         "hash": payload.get("hash"),
+         "expiration_date": payload.get("expiration_date"),
++        # Always present (null when the fact has never been invalidated) so clients can
++        # rely on a stable response shape.
++        "valid_at": payload.get("valid_at"),
++        "invalid_at": payload.get("invalid_at"),
++        "superseded_by": payload.get("superseded_by"),
++        "invalid_reason": payload.get("invalid_reason"),
+         "metadata": {k: v for k, v in payload.items() if k not in _RESERVED_PAYLOAD_KEYS},
+         "created_at": payload.get("created_at"),
+         "updated_at": payload.get("updated_at"),
      }
  
  
@@ -1453,7 +3506,7 @@ index 20059fb8..49690d39 100644
  
  
  @app.get("/memories", summary="Get memories")
-@@ -415,17 +445,22 @@ def get_all_memories(
+@@ -415,17 +486,22 @@ def get_all_memories(
      run_id: Optional[str] = None,
      agent_id: Optional[str] = None,
      top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
@@ -1478,6 +3531,93 @@ index 20059fb8..49690d39 100644
          filters = {
              k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
          }
+@@ -440,6 +516,75 @@ def get_all_memories(
+         raise upstream_error()
+ 
+ 
++MAX_EXPORT_PAGES = 200
++EXPORT_CSV_COLUMNS = [
++    "id",
++    "memory",
++    "user_id",
++    "agent_id",
++    "run_id",
++    "hash",
++    "valid_at",
++    "invalid_at",
++    "superseded_by",
++    "invalid_reason",
++    "created_at",
++    "updated_at",
++]
++
++
++@app.get("/memories/export", summary="Export all memories")
++def export_memories(
++    format: str = Query("json", pattern="^(json|csv)$"),
++    _auth=Depends(verify_auth),
++):
++    """Download the whole collection as one JSON or CSV file.
++
++    Walks the same cursor-paginated listing the dashboard browses, so the export
++    covers every memory rather than only the newest page.
++    """
++    try:
++        rows: List[Dict[str, Any]] = []
++        cursor: Optional[str] = None
++        for _ in range(MAX_EXPORT_PAGES):
++            page = _list_all_memories(limit=ALL_MEMORIES_LIMIT, cursor=cursor)
++            batch = page["results"]
++            if not batch:
++                break
++            rows.extend(batch)
++            cursor = page.get("next_cursor")
++            if not cursor:
++                break
++
++        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
++        if format == "csv":
++            buffer = io.StringIO()
++            writer = csv.DictWriter(
++                buffer, fieldnames=EXPORT_CSV_COLUMNS, extrasaction="ignore"
++            )
++            writer.writeheader()
++            for row in rows:
++                writer.writerow(row)
++            return Response(
++                content=buffer.getvalue(),
++                media_type="text/csv",
++                headers={
++                    "Content-Disposition": f'attachment; filename="mem0-memories-{stamp}.csv"'
++                },
++            )
++
++        return JSONResponse(
++            content={"memories": rows, "total": len(rows), "exported_at": stamp},
++            headers={
++                "Content-Disposition": f'attachment; filename="mem0-memories-{stamp}.json"'
++            },
++        )
++    except HTTPException:
++        raise
++    except Exception:
++        raise upstream_error()
++
++
+ @app.get("/memories/{memory_id}", summary="Get a memory")
+ def get_memory(memory_id: str, _auth=Depends(verify_auth)):
+     """Retrieve a specific memory by ID."""
+@@ -475,6 +620,10 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+             params["explain"] = search_req.explain
+         if search_req.show_expired is not None:
+             params["show_expired"] = search_req.show_expired
++        if search_req.as_of is not None:
++            params["as_of"] = search_req.as_of
++        if search_req.include_invalidated is not None:
++            params["include_invalidated"] = search_req.include_invalidated
+         return get_memory_instance().search(query=search_req.query, filters=filters, **params)
+     except ValueError as e:
+         raise HTTPException(status_code=400, detail=str(e))
 diff --git a/server/migrate_to_2048.py b/server/migrate_to_2048.py
 new file mode 100644
 index 00000000..9264256f
@@ -1572,3 +3712,643 @@ index 621b67d4..65c3537d 100644
      return [getattr(row, "payload", None) or {} for row in rows]
  
  
+diff --git a/server/routers/requests.py b/server/routers/requests.py
+index 3e226e30..1b520063 100644
+--- a/server/routers/requests.py
++++ b/server/routers/requests.py
+@@ -1,12 +1,12 @@
+ import uuid
+-from datetime import datetime
++from datetime import datetime, timedelta, timezone
+ 
+ from auth import require_admin
+ from db import get_db
+ from fastapi import APIRouter, Depends, Query
+ from models import RequestLog
+ from pydantic import BaseModel
+-from sqlalchemy import select
++from sqlalchemy import desc, func, select
+ from sqlalchemy.orm import Session
+ 
+ router = APIRouter(prefix="/requests", tags=["requests"])
+@@ -44,3 +44,125 @@ def list_requests(
+         .all()
+     )
+     return logs
++
++
++class StatusBucket(BaseModel):
++    status_code: int
++    count: int
++
++
++class DayBucket(BaseModel):
++    date: str
++    total: int
++    errors: int
++    avg_latency_ms: float
++
++
++class PathBucket(BaseModel):
++    path: str
++    count: int
++    avg_latency_ms: float
++
++
++class RequestStats(BaseModel):
++    total: int
++    success_rate: float
++    avg_latency_ms: float
++    p95_latency_ms: float
++    window_days: int
++    by_day: list[DayBucket]
++    by_status: list[StatusBucket]
++    top_paths: list[PathBucket]
++
++
++@router.get("/stats", response_model=RequestStats)
++def request_stats(
++    _auth=Depends(require_admin),
++    db: Session = Depends(get_db),
++    days: int = Query(default=14, ge=1, le=90),
++):
++    """Aggregated request activity for the dashboard's Analytics view.
++
++    Aggregation runs in the database (count/avg/percentile + group by), so the
++    response stays small regardless of how many request rows the window holds.
++    """
++    since = datetime.now(timezone.utc) - timedelta(days=days)
++    conds = (
++        RequestLog.auth_type.in_(API_KEY_AUTH_TYPES),
++        RequestLog.created_at >= since,
++    )
++
++    total = db.scalar(select(func.count()).select_from(RequestLog).where(*conds)) or 0
++    avg_latency = db.scalar(select(func.avg(RequestLog.latency_ms)).where(*conds))
++    p95_latency = db.scalar(
++        select(
++            func.percentile_cont(0.95).within_group(RequestLog.latency_ms)
++        ).where(*conds)
++    )
++    ok_count = (
++        db.scalar(
++            select(func.count())
++            .select_from(RequestLog)
++            .where(*conds, RequestLog.status_code < 400)
++        )
++        or 0
++    )
++
++    by_day_rows = db.execute(
++        select(
++            func.date_trunc("day", RequestLog.created_at).label("day"),
++            func.count().label("total"),
++            func.count().filter(RequestLog.status_code >= 400).label("errors"),
++            func.avg(RequestLog.latency_ms).label("avg_latency"),
++        )
++        .where(*conds)
++        .group_by("day")
++        .order_by("day")
++    ).all()
++
++    by_status_rows = db.execute(
++        select(RequestLog.status_code, func.count().label("cnt"))
++        .where(*conds)
++        .group_by(RequestLog.status_code)
++        .order_by(func.count().desc())
++    ).all()
++
++    top_path_rows = db.execute(
++        select(
++            RequestLog.path,
++            func.count().label("cnt"),
++            func.avg(RequestLog.latency_ms).label("avg_latency"),
++        )
++        .where(*conds)
++        .group_by(RequestLog.path)
++        .order_by(func.count().desc())
++        .limit(10)
++    ).all()
++
++    return RequestStats(
++        total=total,
++        success_rate=round((ok_count / total) * 100, 1) if total else 0.0,
++        avg_latency_ms=round(float(avg_latency or 0), 1),
++        p95_latency_ms=round(float(p95_latency or 0), 1),
++        window_days=days,
++        by_day=[
++            DayBucket(
++                date=row.day.strftime("%Y-%m-%d"),
++                total=row.total,
++                errors=row.errors,
++                avg_latency_ms=round(float(row.avg_latency or 0), 1),
++            )
++            for row in by_day_rows
++        ],
++        by_status=[
++            StatusBucket(status_code=row[0], count=row[1]) for row in by_status_rows
++        ],
++        top_paths=[
++            PathBucket(
++                path=row[0],
++                count=row[1],
++                avg_latency_ms=round(float(row[2] or 0), 1),
++            )
++            for row in top_path_rows
++        ],
++    )
+diff --git a/tests/memory/test_bitemporal.py b/tests/memory/test_bitemporal.py
+new file mode 100644
+index 00000000..715d18a9
+--- /dev/null
++++ b/tests/memory/test_bitemporal.py
+@@ -0,0 +1,408 @@
++"""Tests for the bi-temporal fact model (design: docs/design/2026-09-17-bitemporal-fact-model-design.md).
++
++Three concerns are covered here:
++  * 1b is a second, independent LLM call whose prompt shares nothing with 1a ([AC-3]).
++  * 1c ``_apply_contradictions`` is deterministic pure code ([AC-4], rules R1-R11).
++  * A failing 1b never breaks the write ([AC-5]) and invalidation stays payload-only (R9).
++"""
++
++import inspect
++import json
++from datetime import datetime, timezone
++from unittest.mock import MagicMock
++
++import pytest
++
++from mem0.configs.prompts import (
++    ADDITIVE_EXTRACTION_PROMPT,
++    CONTRADICTION_DETECTION_PROMPT,
++    INVALID_REASON_SUPERSEDED,
++)
++from mem0.memory.main import (
++    Memory,
++    _apply_contradictions,
++    _bitemporal_filter,
++    _coerce_bitemporal_date,
++    _normalize_as_of,
++    _with_bitemporal_filter,
++)
++
++
++class _PayloadMemory:
++    """Minimal stand-in for a vector-store row (id + payload + score)."""
++
++    def __init__(self, memory_id, payload, score=0.9):
++        self.id = memory_id
++        self.payload = payload
++        self.score = score
++
++
++def _record(valid_at=None, created_at="2024-01-01T00:00:00+00:00"):
++    return {"valid_at": valid_at, "created_at": created_at}
++
++
++class TestApplyContradictionsDeterminism:
++    """[AC-4] 同输入 → 同输出，且不接触 LLM / 网络 / 当前时刻。"""
++
++    def test_signature_takes_no_llm_client_or_now(self):
++        params = set(inspect.signature(_apply_contradictions).parameters)
++        assert params == {"contradictions", "new_records", "old_records"}
++        assert not params & {"llm", "client", "now", "self"}
++
++    def test_same_input_yields_identical_output(self):
++        contradictions = [
++            {"new_id": "new-b", "old_id": "old-1"},
++            {"new_id": "new-a", "old_id": "old-1"},
++            {"new_id": "new-a", "old_id": "old-2"},
++        ]
++        new_records = {"new-a": _record("2021-01-01"), "new-b": _record("2022-01-01")}
++        old_records = {"old-1": _record("2020-01-01"), "old-2": _record("2019-01-01")}
++
++        first = _apply_contradictions(contradictions, new_records, old_records)
++        second = _apply_contradictions(contradictions, new_records, old_records)
++        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
++
++    def test_result_is_independent_of_input_order(self):
++        new_records = {"new-a": _record("2021-01-01"), "new-b": _record("2022-01-01")}
++        old_records = {"old-1": _record("2020-01-01")}
++        forward = [{"new_id": "new-a", "old_id": "old-1"}, {"new_id": "new-b", "old_id": "old-1"}]
++        assert _apply_contradictions(forward, new_records, old_records) == _apply_contradictions(
++            list(reversed(forward)), new_records, old_records
++        )
++
++
++class TestApplyContradictionsRules:
++    """方案 §5.3.2 的处置规则 R1-R11（[AC-13]-[AC-18]）。"""
++
++    def test_r11_empty_pairs_produce_no_write(self):
++        assert _apply_contradictions([], {"a": _record("2021-01-01")}, {"b": _record("2020-01-01")}) == []
++
++    def test_r1_unknown_old_id_is_dropped_with_warning(self, caplog):
++        result = _apply_contradictions(
++            [{"new_id": "new-a", "old_id": "hallucinated"}],
++            {"new-a": _record("2021-01-01")},
++            {"old-1": _record("2020-01-01")},
++        )
++        assert result == []
++        assert any("unknown old_id" in record.message for record in caplog.records)
++
++    def test_r1_unknown_new_id_is_dropped(self, caplog):
++        result = _apply_contradictions(
++            [{"new_id": "hallucinated", "old_id": "old-1"}],
++            {"new-a": _record("2021-01-01")},
++            {"old-1": _record("2020-01-01")},
++        )
++        assert result == []
++        assert any("unknown new_id" in record.message for record in caplog.records)
++
++    def test_r2_self_referential_pair_is_dropped(self):
++        assert (
++            _apply_contradictions(
++                [{"new_id": "same", "old_id": "same"}],
++                {"same": _record("2021-01-01")},
++                {"same": _record("2020-01-01")},
++            )
++            == []
++        )
++
++    def test_r3_older_or_equal_new_fact_does_not_invalidate(self):
++        old = {"old-1": _record("2021-01-01")}
++        # 更新的事实生效更早 → 不处置
++        assert _apply_contradictions([{"new_id": "new-a", "old_id": "old-1"}], {"new-a": _record("2020-01-01")}, old) == []
++        # 生效键完全相等 → 不处置
++        assert (
++            _apply_contradictions(
++                [{"new_id": "new-a", "old_id": "old-1"}],
++                {"new-a": _record("2021-01-01")},
++                old,
++            )
++            == []
++        )
++
++    def test_r3_valid_at_missing_falls_back_to_created_at(self):
++        """存量记录没有 valid_at，生效时间由 created_at 兜底。"""
++        old = {"old-1": {"created_at": "2020-01-01T00:00:00+00:00"}}
++        new = {"new-a": {"valid_at": "2021-01-01", "created_at": "2026-01-01T00:00:00+00:00"}}
++        updates = _apply_contradictions([{"new_id": "new-a", "old_id": "old-1"}], new, old)
++        assert updates == [
++            {
++                "memory_id": "old-1",
++                "invalid_at": "2021-01-01",
++                "superseded_by": "new-a",
++                "invalid_reason": INVALID_REASON_SUPERSEDED,
++            }
++        ]
++
++    def test_r4_invalid_at_uses_new_fact_valid_at(self):
++        updates = _apply_contradictions(
++            [{"new_id": "new-a", "old_id": "old-1"}],
++            {"new-a": _record("2021-06-15", "2026-09-17T10:00:00+00:00")},
++            {"old-1": _record("2020-01-01")},
++        )
++        assert updates[0]["invalid_at"] == "2021-06-15"
++        assert updates[0]["invalid_reason"] == INVALID_REASON_SUPERSEDED
++
++    def test_r5_repeated_invalidation_keeps_the_earliest_boundary(self):
++        # 已有 2022-06-01，新对给出更早的 2021-01-01 → 覆盖，三字段同源
++        updates = _apply_contradictions(
++            [{"new_id": "new-a", "old_id": "old-1"}],
++            {"new-a": _record("2021-01-01")},
++            {"old-1": {**_record("2019-01-01"), "invalid_at": "2022-06-01", "superseded_by": "old-newer"}},
++        )
++        assert updates == [
++            {
++                "memory_id": "old-1",
++                "invalid_at": "2021-01-01",
++                "superseded_by": "new-a",
++                "invalid_reason": INVALID_REASON_SUPERSEDED,
++            }
++        ]
++
++    def test_r5_reverse_case_leaves_existing_fields_untouched(self):
++        updates = _apply_contradictions(
++            [{"new_id": "new-a", "old_id": "old-1"}],
++            {"new-a": _record("2022-06-01")},
++            {"old-1": {**_record("2019-01-01"), "invalid_at": "2021-01-01", "superseded_by": "old-newer"}},
++        )
++        assert updates == []
++
++    def test_r6_one_update_per_old_record_taking_the_latest_new_fact(self):
++        updates = _apply_contradictions(
++            [
++                {"new_id": "new-a", "old_id": "old-1"},
++                {"new_id": "new-b", "old_id": "old-1"},
++                {"new_id": "new-c", "old_id": "old-1"},
++            ],
++            {"new-a": _record("2021-01-01"), "new-b": _record("2022-01-01"), "new-c": _record("2023-01-01")},
++            {"old-1": _record("2020-01-01")},
++        )
++        assert len(updates) == 1
++        # 生效键最大的新事实胜出，且 superseded_by 与该 invalid_at 同源
++        assert updates[0]["invalid_at"] == "2023-01-01"
++        assert updates[0]["superseded_by"] == "new-c"
++
++    def test_r6_equal_effective_keys_break_ties_by_smallest_new_id(self):
++        updates = _apply_contradictions(
++            [{"new_id": "new-b", "old_id": "old-1"}, {"new_id": "new-a", "old_id": "old-1"}],
++            {"new-a": _record("2022-01-01"), "new-b": _record("2022-01-01")},
++            {"old-1": _record("2020-01-01")},
++        )
++        assert updates[0]["superseded_by"] == "new-a"
++
++    def test_r7_chain_is_not_propagated_recursively(self):
++        """A←B 与 B←C 是两次独立处置：A 的 superseded_by 保持为 B。"""
++        first = _apply_contradictions(
++            [{"new_id": "B", "old_id": "A"}], {"B": _record("2021-01-01")}, {"A": _record("2020-01-01")}
++        )
++        assert first[0]["superseded_by"] == "B"
++        # C 到来时 B 自身尚未失效（B 是上一次处置的新记录），因此这条链路正常推进
++        second = _apply_contradictions(
++            [{"new_id": "C", "old_id": "B"}], {"C": _record("2022-01-01")}, {"B": _record("2021-01-01")}
++        )
++        assert second[0]["memory_id"] == "B"
++        assert second[0]["superseded_by"] == "C"
++        assert second[0]["invalid_at"] == "2022-01-01"
++        # A 的结论未被改写成 C，保持为 B
++        assert first[0] == {
++            "memory_id": "A",
++            "invalid_at": "2021-01-01",
++            "superseded_by": "B",
++            "invalid_reason": INVALID_REASON_SUPERSEDED,
++        }
++
++
++class TestBitemporalFilter:
++    """[AC-5] point-in-time 与默认读的谓词构造。"""
++
++    def test_default_read_excludes_invalidated_facts(self):
++        before = datetime.now(timezone.utc)
++        predicate = _bitemporal_filter()
++        after = datetime.now(timezone.utc)
++        assert list(predicate) == ["NOT"]
++        boundary = datetime.fromisoformat(predicate["NOT"][0]["invalid_at"]["lte"])
++        assert before <= boundary <= after
++
++    def test_as_of_uses_created_at_fallback_branch(self):
++        predicate = _bitemporal_filter(as_of="2020-06-01")
++        moment = "2020-06-01T00:00:00+00:00"
++        assert predicate["OR"][0] == {"valid_at": {"lte": moment}}
++        assert predicate["OR"][1]["AND"][0] == {"created_at": {"lte": moment}}
++        assert predicate["OR"][1]["AND"][1] == {"NOT": [{"valid_at": {"gte": "1970-01-01T00:00:00Z"}}]}
++        assert predicate["NOT"] == [{"invalid_at": {"lte": moment}}]
++
++    def test_include_invalidated_drops_the_predicate_entirely(self):
++        assert _bitemporal_filter(include_invalidated=True) is None
++        assert _with_bitemporal_filter({"user_id": "u"}, include_invalidated=True) == {"user_id": "u"}
++
++    def test_scope_filters_are_combined_by_and_not_overwritten(self):
++        merged = _with_bitemporal_filter({"user_id": "u"})
++        assert merged["AND"][0] == {"user_id": "u"}
++        assert "NOT" in merged["AND"][1]
++
++    def test_normalize_as_of_rejects_garbage(self):
++        with pytest.raises(ValueError):
++            _normalize_as_of("not-a-date")
++
++    def test_coerce_bitemporal_date_keeps_only_real_dates(self):
++        assert _coerce_bitemporal_date("2024-03-05") == "2024-03-05"
++        assert _coerce_bitemporal_date("2024-03-05T08:00:00Z") == "2024-03-05"
++        assert _coerce_bitemporal_date("最近") is None
++        assert _coerce_bitemporal_date(None) is None
++
++
++def _setup_mocks(mocker, existing_results=None, contradiction_response='{"contradictions": []}'):
++    """Build a Memory whose embedder / vector store / LLM are all mocked."""
++    embedder = mocker.MagicMock()
++    embedder.embed.return_value = [0.1, 0.2, 0.3]
++    embedder.embed_batch.return_value = [[0.4, 0.5, 0.6]]
++    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=embedder)
++
++    vector_store = mocker.MagicMock()
++    vector_store.search.return_value = list(existing_results or [])
++    mocker.patch(
++        "mem0.utils.factory.VectorStoreFactory.create", side_effect=[vector_store, mocker.MagicMock()]
++    )
++
++    llm = mocker.MagicMock()
++    llm.generate_response.side_effect = [
++        json.dumps({"memory": [{"text": "用户住在柏林", "attributed_to": "user", "valid_at": "2021-01-01"}]}),
++        contradiction_response,
++    ]
++    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=llm)
++
++    mocker.patch("mem0.memory.storage.SQLiteManager", mocker.MagicMock())
++    mocker.patch("mem0.memory.main.capture_event")
++
++    memory = Memory()
++    memory.db.get_last_messages = MagicMock(return_value=[])
++    memory.db.save_messages = MagicMock()
++    memory.db.batch_add_history = MagicMock()
++    return memory, vector_store, llm
++
++
++def _existing_paris():
++    return _PayloadMemory(
++        "old-paris",
++        {
++            "data": "用户住在巴黎",
++            "hash": "hash-paris",
++            "valid_at": "2020-01-01",
++            "created_at": "2026-09-01T00:00:00+00:00",
++            "user_id": "test_bt_unit",
++        },
++    )
++
++
++class TestContradictionDetectionCall:
++    """[AC-3] 1a 与 1b 是两次独立 LLM 调用，提示词互不共享。"""
++
++    def test_add_makes_two_independent_llm_calls(self, mocker):
++        memory, _, llm = _setup_mocks(mocker, existing_results=[_existing_paris()])
++
++        memory._add_to_vector_store(
++            messages=[{"role": "user", "content": "我已经搬到柏林了"}],
++            metadata={"user_id": "test_bt_unit"},
++            filters={"user_id": "test_bt_unit"},
++            infer=True,
++        )
++
++        assert llm.generate_response.call_count == 2
++        first_messages = llm.generate_response.call_args_list[0].kwargs["messages"]
++        second_messages = llm.generate_response.call_args_list[1].kwargs["messages"]
++        # 两次调用各自的 system prompt 互不共享，user prompt 也完全不同
++        assert first_messages[0]["content"] == ADDITIVE_EXTRACTION_PROMPT
++        assert second_messages[0]["content"] == CONTRADICTION_DETECTION_PROMPT
++        assert second_messages[0]["content"] != first_messages[0]["content"]
++        assert second_messages[1]["content"] != first_messages[1]["content"]
++        # 1b 的输入两侧都带 id：新事实用本批次落库的 uuid，已有事实用 payload 里的真实 id
++        second_user_prompt = second_messages[1]["content"]
++        assert "old-paris" in second_user_prompt
++        assert "用户住在柏林" in second_user_prompt
++        assert '"created_at"' in second_user_prompt
++
++    def test_second_call_is_skipped_without_a_candidate_pool(self, mocker):
++        memory, _, llm = _setup_mocks(mocker, existing_results=[])
++
++        memory._add_to_vector_store(
++            messages=[{"role": "user", "content": "我喜欢喝黑咖啡"}],
++            metadata={"user_id": "test_bt_unit"},
++            filters={"user_id": "test_bt_unit"},
++            infer=True,
++        )
++
++        assert llm.generate_response.call_count == 1
++
++
++class TestAddPipelineInvalidation:
++    """写入管道的 1c 落地：只更新 payload，文本与记录都不动（R9/R10）。"""
++
++    def test_matching_pair_invalidates_the_old_record(self, mocker):
++        memory, vector_store, llm = _setup_mocks(mocker, existing_results=[_existing_paris()])
++
++        def _respond(messages, **kwargs):
++            if messages[0]["content"] == CONTRADICTION_DETECTION_PROMPT:
++                new_facts = json.loads(messages[1]["content"].split("## New Facts\n")[1].split("\n\n")[0])
++                return json.dumps({"contradictions": [{"new_id": new_facts[0]["id"], "old_id": "old-paris"}]})
++            return json.dumps({"memory": [{"text": "用户住在柏林", "attributed_to": "user", "valid_at": "2021-01-01"}]})
++
++        llm.generate_response.side_effect = _respond
++
++        memory._add_to_vector_store(
++            messages=[{"role": "user", "content": "我已经搬到柏林了"}],
++            metadata={"user_id": "test_bt_unit"},
++            filters={"user_id": "test_bt_unit"},
++            infer=True,
++        )
++
++        new_id = vector_store.insert.call_args.kwargs["ids"][0]
++        assert vector_store.update.call_count == 1
++        assert vector_store.update.call_args.kwargs == {
++            "vector_id": "old-paris",
++            "vector": None,
++            "payload": {
++                "invalid_at": "2021-01-01",
++                "superseded_by": new_id,
++                "invalid_reason": INVALID_REASON_SUPERSEDED,
++            },
++        }
++        # 新记录的 payload 带上了 1a 抽出的有效日期
++        assert vector_store.insert.call_args.kwargs["payloads"][0]["valid_at"] == "2021-01-01"
++
++    @pytest.mark.parametrize(
++        "second_call",
++        [ValueError("429 rate limit"), "not-json-at-all", ""],
++        ids=["llm-error", "garbage", "empty"],
++    )
++    def test_failing_1b_does_not_break_the_write(self, mocker, second_call):
++        """[AC-5] 1b 不可用或输出不可解析时，写入照常完成且不产生任何失效。"""
++        memory, vector_store, llm = _setup_mocks(mocker, existing_results=[_existing_paris()])
++        llm.generate_response.side_effect = [
++            json.dumps({"memory": [{"text": "用户住在柏林", "valid_at": "2021-01-01"}]}),
++            second_call,
++        ]
++
++        result = memory._add_to_vector_store(
++            messages=[{"role": "user", "content": "我已经搬到柏林了"}],
++            metadata={"user_id": "test_bt_unit"},
++            filters={"user_id": "test_bt_unit"},
++            infer=True,
++        )
++
++        assert result and result[0]["event"] == "ADD"
++        vector_store.insert.assert_called_once()
++        vector_store.update.assert_not_called()
++
++    def test_invalid_valid_at_from_the_llm_is_stored_as_null(self, mocker):
++        memory, vector_store, llm = _setup_mocks(mocker, existing_results=[])
++        llm.generate_response.side_effect = [
++            json.dumps({"memory": [{"text": "用户喜欢喝黑咖啡", "valid_at": "很久以前"}]})
++        ]
++
++        memory._add_to_vector_store(
++            messages=[{"role": "user", "content": "我喜欢喝黑咖啡"}],
++            metadata={"user_id": "test_bt_unit"},
++            filters={"user_id": "test_bt_unit"},
++            infer=True,
++        )
++
++        assert vector_store.insert.call_args.kwargs["payloads"][0]["valid_at"] is None
+diff --git a/tests/memory/test_main.py b/tests/memory/test_main.py
+index cea7e384..d5c35f86 100644
+--- a/tests/memory/test_main.py
++++ b/tests/memory/test_main.py
+@@ -912,6 +912,45 @@ class TestEntityBoostParallelism:
+ 
+         mock_memory.embedding_model.embed_batch.assert_called_once_with(["alice", "bob", "carol"], "search")
+ 
++    def test_sync_scope_survives_and_wrapped_filters(self, mock_memory):
++        """Entity boosts must stay scoped when search() passes an AND-wrapped filter.
++
++        `Memory.search` merges the bi-temporal validity predicate as
++        `{"AND": [scope, predicate]}`; reading the scope keys off the top level would
++        yield `{}` and silently upgrade the entity lookup to a global (cross-user) one.
++        """
++        mock_memory.embedding_model = Mock()
++        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1]])
++        mock_memory._entity_store = Mock()
++        mock_memory._entity_store.search = Mock(return_value=[_make_match(0.7, ["mem-1"])])
++
++        merged = {
++            "AND": [
++                {"user_id": "u1", "agent_id": "a1"},
++                {"NOT": [{"invalid_at": {"lte": "2026-09-17T00:00:00+00:00"}}]},
++            ]
++        }
++        mock_memory._compute_entity_boosts([("person", "alice")], merged)
++
++        assert mock_memory._entity_store.search.call_args.kwargs["filters"] == {"user_id": "u1", "agent_id": "a1"}
++
++    @pytest.mark.asyncio
++    async def test_async_scope_survives_and_wrapped_filters(self, mock_async_memory):
++        mock_async_memory.embedding_model = Mock()
++        mock_async_memory.embedding_model.embed_batch = Mock(return_value=[[0.1]])
++        mock_async_memory._entity_store = Mock()
++        mock_async_memory._entity_store.search = Mock(return_value=[_make_match(0.7, ["mem-1"])])
++
++        merged = {
++            "AND": [
++                {"user_id": "u1"},
++                {"NOT": [{"invalid_at": {"lte": "2026-09-17T00:00:00+00:00"}}]},
++            ]
++        }
++        await mock_async_memory._compute_entity_boosts_async([("person", "alice")], merged)
++
++        assert mock_async_memory._entity_store.search.call_args.kwargs["filters"] == {"user_id": "u1"}
++
+     @pytest.mark.asyncio
+     async def test_async_boosts_preserve_scoring(self, mock_async_memory):
+         from mem0.utils.scoring import ENTITY_BOOST_WEIGHT
+diff --git a/tests/test_main.py b/tests/test_main.py
+index 0e6aed4f..9c8c1c4e 100644
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -131,9 +131,13 @@ def test_search(memory_instance):
+     assert result["results"][0]["score"] == pytest.approx(0.9)
+ 
+     # Hybrid pipeline over-fetches: max(20*4, 60) = 80 (top_k default is now 20)
+-    memory_instance.vector_store.search.assert_called_once_with(
+-        query="test query", vectors=[0.1, 0.2, 0.3], top_k=80, filters={"user_id": "test_user"}
+-    )
++    # The bi-temporal validity predicate is AND-merged with the scope filters.
++    _, search_kwargs = memory_instance.vector_store.search.call_args
++    assert search_kwargs["query"] == "test query"
++    assert search_kwargs["vectors"] == [0.1, 0.2, 0.3]
++    assert search_kwargs["top_k"] == 80
++    assert search_kwargs["filters"]["AND"][0] == {"user_id": "test_user"}
++    assert "invalid_at" in search_kwargs["filters"]["AND"][1]["NOT"][0]
+ 
+ 
+ def test_search_hides_expired_memories_by_default(memory_instance):
+@@ -474,7 +478,8 @@ class TestEntityIdValidation:
+         memory_instance.get_all(filters={"user_id": 42})
+ 
+         _, kwargs = memory_instance.vector_store.list.call_args
+-        assert kwargs["filters"]["user_id"] == "42"
++        # 有效事实谓词以 AND 合并进 filters，作用域仍在第一段
++        assert kwargs["filters"]["AND"][0]["user_id"] == "42"
+ 
+ 
+ class TestSearchParamValidation:
