@@ -545,10 +545,10 @@ index 00000000..ccfe0a39
 +
 diff --git a/docs/design/graph-memory-evidence/README.md b/docs/design/graph-memory-evidence/README.md
 new file mode 100644
-index 00000000..a7ce39ac
+index 00000000..00eff796
 --- /dev/null
 +++ b/docs/design/graph-memory-evidence/README.md
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,31 @@
 +# graph-memory 实测证据
 +
 +本目录是 `docs/design/graph-memory.md` 第 10 节「实测证据」的原始材料，采集于 2026-09-17，
@@ -562,6 +562,7 @@ index 00000000..a7ce39ac
 +| `graphiti_e2e.py` | 端到端：FalkorDB 容器 + 本机 LLM 与 embedder，写 5 条中文事实、检索、导出图统计 | 需 FalkorDB 可达（脚本内置 `127.0.0.1:16379`，按环境调整） |
 +| `joinkey_probe.py` | join key 与幂等：预建 `EpisodicNode(uuid=memory_id)` → `add_episode(uuid=同)` → 检索边 `episodes` 校验 → 重放表现 | 同上；脚本内 `driver.database` 必须与 `group_id` 相同 |
 +| `falkor_scale.py` | 图库规模内存模型：直连 Redis 协议压 8150 实体 + 3545 边，读 `INFO memory` | 需 FalkorDB 可达；不调用 LLM |
++| `bridge_search_latency.py` | 图桥 `/search` 尾部分位：自建探针图键（实体 + 关系边）后连续采样，给 `timeout_seconds` 选值 | 在 mem0 容器内跑（图桥不发布宿主端口）：`docker cp` 后 `docker exec mem0-dev-mem0-1 python /tmp/bridge_search_latency.py 100`；跑完 `DELETE /graph/test_graph_rect_lat` |
 +
 +脚本仅写探针图键（`gm-*`），不触碰 mem0 的 Qdrant 数据与线上记忆。
 +
@@ -573,11 +574,137 @@ index 00000000..a7ce39ac
 +| `e2e_responses.txt` | E6（端到端时延、实体/边规模、检索时延） |
 +| `joinkey_probe.txt` | E11（join key）、E12（幂等）、E13（图键机制） |
 +| `falkor_scale.txt` | E4（目标规模内存模型） |
++| `bridge_search_latency.txt` | E6（`/search` 时延的修订口径）、E17（尾部分位与预算选值） |
 +| `vm_resource.txt` | E1–E3、E5、E14–E15（VM 与容器资源、Neo4j 对照、镜像体积） |
 +| `official_image_probe.txt` | E8–E10（官方镜像三处缺口 G1–G3） |
 +
 +`E16`（graphiti-core 版本与构造器签名）来自 PyPI JSON API、GitHub release 与 clone 源码核对，
 +无独立日志文件。
+diff --git a/docs/design/graph-memory-evidence/bridge_search_latency.py b/docs/design/graph-memory-evidence/bridge_search_latency.py
+new file mode 100644
+index 00000000..a3d4b0b6
+--- /dev/null
++++ b/docs/design/graph-memory-evidence/bridge_search_latency.py
+@@ -0,0 +1,95 @@
++"""图桥 `/search` 尾部分位实测（核验整改卡 t_362c77d2 第 3 项）。
++
++先按真实形态建一个有实体与关系边的图键，再连续调 `/search` 采样，输出分位数与
++超过各档预算的条数——0.4s 与选定的 1.0s 两个候选值都按同一份样本判定。
++
++只写自己的探针图键（`test_graph_rect_lat`），不触碰任何既有图键与事实数据；跑完用
++`DELETE /graph/test_graph_rect_lat` 清理。
++
++在 mem0 容器内执行（图桥不发布宿主端口）：
++
++    docker cp bridge_search_latency.py mem0-dev-mem0-1:/tmp/
++    docker exec mem0-dev-mem0-1 python /tmp/bridge_search_latency.py 100
++"""
++
++import json
++import statistics
++import sys
++import time
++
++import httpx
++
++BRIDGE = "http://graph-bridge:8000"
++GROUP_ID = "test_graph_rect_lat"
++QUERY = "学科网基础应用中心 授权 登录"
++
++FACTS = [
++    "学科网基础应用中心依赖统一身份认证中心完成用户登录，授权页退出登录后必须重新走一遍授权流程。",
++    "影（架构师）负责为墨（执行者）产出实现方案，鉴（核验者）独立复核墨的交付物，三者同属 xkw 工程链路。",
++    "umbrellaedge 仓库的 graph-memory 阶段使用 FalkorDB 作为图库，graph-bridge 服务通过 Redis 协议访问它。",
++]
++
++
++def main() -> None:
++    samples = int(sys.argv[1]) if len(sys.argv) > 1 else 100
++    client = httpx.Client(base_url=BRIDGE, timeout=180.0)
++
++    for index, text in enumerate(FACTS):
++        started = time.perf_counter()
++        response = client.post(
++            "/episodes",
++            json={
++                "uuid": f"rect-lat2-probe-{index}",
++                "group_id": GROUP_ID,
++                "text": text,
++                "source_description": "rect latency probe 2",
++            },
++        )
++        print(f"ingest[{index}] {response.status_code} {time.perf_counter() - started:.2f}s {response.text[:140]}")
++
++    print("stats:", client.get("/stats", params={"group_id": GROUP_ID}).text)
++
++    for index in range(3):
++        response = client.post(
++            "/search", json={"group_ids": [GROUP_ID], "query": QUERY, "max_facts": 10}, timeout=60.0
++        )
++        print(f"warmup[{index}] facts={len(response.json().get('facts', []))}")
++
++    values = []
++    for index in range(samples):
++        started = time.perf_counter()
++        response = client.post(
++            "/search", json={"group_ids": [GROUP_ID], "query": QUERY, "max_facts": 10}, timeout=60.0
++        )
++        elapsed = time.perf_counter() - started
++        if response.status_code != 200:
++            print(f"  !! sample {index} status={response.status_code} {response.text[:120]}")
++            continue
++        values.append(elapsed)
++
++    ordered = sorted(values)
++    n = len(ordered)
++
++    def pct(q: float) -> float:
++        return ordered[min(n - 1, int(round(q * (n - 1))))]
++
++    report = {
++        "n": n,
++        "min": round(ordered[0], 3),
++        "p50": round(pct(0.50), 3),
++        "p90": round(pct(0.90), 3),
++        "p95": round(pct(0.95), 3),
++        "p99": round(pct(0.99), 3),
++        "max": round(ordered[-1], 3),
++        "mean": round(statistics.fmean(ordered), 3),
++        "over_0.4": sum(1 for value in ordered if value >= 0.4),
++        "over_0.6": sum(1 for value in ordered if value >= 0.6),
++        "over_0.8": sum(1 for value in ordered if value >= 0.8),
++        "over_1.0": sum(1 for value in ordered if value >= 1.0),
++    }
++    print("SAMPLES", json.dumps([round(value, 3) for value in ordered]))
++    print("REPORT", json.dumps(report))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/design/graph-memory-evidence/bridge_search_latency.txt b/docs/design/graph-memory-evidence/bridge_search_latency.txt
+new file mode 100644
+index 00000000..fe583bee
+--- /dev/null
++++ b/docs/design/graph-memory-evidence/bridge_search_latency.txt
+@@ -0,0 +1,18 @@
++=== 第 1 轮：图键 test_graph_rect_lat（2 条 episode，无关系边），n=60 ===
++health: {'status': 'healthy', 'backend': 'falkordb', 'falkordb': 'ok'}
++ingest[0] 200 7.22s {"status":"synced","uuid":"rect-lat-probe-0","group_id":"test_graph_rect_lat","nodes":1,"edges":0}
++ingest[1] 200 10.84s {"status":"synced","uuid":"rect-lat-probe-1","group_id":"test_graph_rect_lat","nodes":1,"edges":0}
++SAMPLES [0.083, 0.086, 0.086, 0.09, 0.092, 0.094, 0.096, 0.097, 0.098, 0.098, 0.098, 0.099, 0.1, 0.101, 0.103, 0.104, 0.104, 0.105, 0.105, 0.107, 0.108, 0.108, 0.109, 0.113, 0.115, 0.117, 0.121, 0.122, 0.126, 0.126, 0.131, 0.132, 0.133, 0.133, 0.136, 0.14, 0.14, 0.141, 0.142, 0.145, 0.145, 0.146, 0.153, 0.161, 0.164, 0.167, 0.167, 0.188, 0.19, 0.202, 0.204, 0.205, 0.238, 0.258, 0.263, 0.275, 0.343, 0.367, 0.425, 0.472]
++REPORT {"n": 60, "min": 0.083, "p50": 0.131, "p90": 0.258, "p95": 0.343, "p99": 0.425, "max": 0.472, "mean": 0.154, "over_0.4": 2, "over_0.8": 0, "over_1.0": 0}
++
++=== 第 2 轮：同一图键补入 3 条事实（实体与关系边齐备），n=100 ===
++ingest[0] 200 15.31s {"status":"synced","uuid":"rect-lat2-probe-0","group_id":"test_graph_rect_lat","nodes":2,"edges":1}
++ingest[1] 200 23.45s {"status":"synced","uuid":"rect-lat2-probe-1","group_id":"test_graph_rect_lat","nodes":4,"edges":5}
++ingest[2] 200 30.07s {"status":"synced","uuid":"rect-lat2-probe-2","group_id":"test_graph_rect_lat","nodes":5,"edges":4}
++stats: {"group_id":"test_graph_rect_lat","episodes":5,"entity_nodes":11,"entity_edges":10}
++SAMPLES [0.105, 0.108, 0.111, 0.116, 0.118, 0.119, 0.119, 0.12, 0.12, 0.121, 0.122, 0.123, 0.123, 0.123, 0.124, 0.125, 0.126, 0.128, 0.128, 0.128, 0.129, 0.129, 0.13, 0.13, 0.131, 0.133, 0.133, 0.134, 0.135, 0.136, 0.137, 0.139, 0.141, 0.143, 0.143, 0.144, 0.145, 0.145, 0.146, 0.148, 0.149, 0.149, 0.15, 0.151, 0.152, 0.154, 0.156, 0.158, 0.16, 0.16, 0.163, 0.166, 0.177, 0.179, 0.182, 0.183, 0.185, 0.188, 0.189, 0.19, 0.193, 0.197, 0.198, 0.204, 0.207, 0.209, 0.223, 0.23, 0.233, 0.235, 0.235, 0.237, 0.247, 0.252, 0.279, 0.281, 0.285, 0.3, 0.302, 0.322, 0.325, 0.369, 0.393, 0.396, 0.397, 0.397, 0.415, 0.44, 0.442, 0.445, 0.503, 0.504, 0.507, 0.512, 0.514, 0.547, 0.604, 0.611, 0.812, 0.842]
++REPORT {"n": 100, "min": 0.105, "p50": 0.163, "p90": 0.445, "p95": 0.514, "p99": 0.812, "max": 0.842, "mean": 0.233, "over_0.4": 14, "over_0.6": 4, "over_0.8": 2, "over_1.0": 0}
++
++=== 判定（设计 §6.5 的 timeout_seconds 默认值） ===
++0.4s：第 2 轮超预算 14/100（14.0%），只覆盖到约 p85 —— 正常请求会落进超时区（第 1 轮 2/60）。
++1.0s：两轮全部样本（max 0.678s / 0.842s）都在预算内，对 p99（0.812s）与 max 仍有 ~19% 裕度。
 diff --git a/docs/design/graph-memory-evidence/e2e_responses.txt b/docs/design/graph-memory-evidence/e2e_responses.txt
 new file mode 100644
 index 00000000..d85ea2c1
@@ -1279,10 +1406,10 @@ index 00000000..ef6b8c8b
 +points_count=3612  indexed_vectors_count=3606  vectors.size=2048  sparse=bm25(idf)  on_disk_payload=true
 diff --git a/docs/design/graph-memory.md b/docs/design/graph-memory.md
 new file mode 100644
-index 00000000..d3796579
+index 00000000..dcbdc633
 --- /dev/null
 +++ b/docs/design/graph-memory.md
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,606 @@
 +# graph-memory 设计（mem0 自托管记忆·阶段 3：Graphiti 旁路图检索）
 +
 +| 项 | 值 |
@@ -1296,6 +1423,13 @@ index 00000000..d3796579
 +| 影响面 | SDK 新增图同步模块、SDK 打分器与检索路径、SDK 配置层、REST 配置透传与 `explain` 输出、新增图桥服务与两个 compose 服务 |
 +| 实现形态 | 仅本地改动（相对 `upstream/main`），不提交上游 PR |
 +| 资源结论 | **就地可跑**，VM 维持 2 CPU / 8GiB（第 3 节） |
++
++> **2026-09-17 修订（核验整改卡 `t_362c77d2`，基于独立核验卡 `t_e6669818` 的未通过项）。**
++> 四处与实测不符的判据/表述已按实测改写：`[AC-12]` 后半句的占比上界写进了前提（§11.3）、
++> `[AC-34]` 拆成「健康路径确定 + 降级路径显式」两条（§11.3）、§10 的 E6 换成实测尾部分位并
++> 据此把 `timeout_seconds` 默认值由 0.4 抬到 1.0（§6.5、§10）、两项未申报的实现偏离如实
++> 记录（§7）。同时补齐两处观测面：图派发计数器的服务侧只读端点（§8、§7）与检索响应里的
++> `graph_status`（§6.4、§8）——超时此前与「无命中」在响应上完全同形，无法诊断。
 +
 +> 本文档为本地设计文档，位于仓库 `docs/design/`，与 Mintlify 文档站（`docs/**/*.mdx`）无关，不参与 `llms.txt` 收录检查。
 +
@@ -1336,10 +1470,11 @@ index 00000000..d3796579
 +- `server/docker-compose.yaml`：新增 `falkordb` 与 `graph-bridge` 两个服务。
 +- `mem0/memory/graph_sync.py`：新增图同步模块（派发队列、串行 worker、重试、幂等判据、熔断）。
 +- `mem0/utils/scoring.py`：打分器接受图加分，分母随启用信号增长。
-+- `mem0/memory/main.py`：写入路径派发入图、检索路径调用图检索并计算加分（sync / async 两份实现）。
++- `mem0/memory/main.py`：写入路径派发入图、检索路径调用图检索并计算加分（sync / async 两份实现），并把本次图分支状态随每条结果发布。
 +- `mem0/configs/base.py`：新增图检索配置段。
 +- `server/main.py`：配置默认值透传、`score_details` 序列化。
-+- `server/docker-compose.yaml` / `server/.env`：图能力相关的环境变量透传。
++- `server/routers/graph.py`（新增）：图派发计数器的只读端点（`GET /graph/stats`）。
++- `server/docker-compose.yaml` / `server/.env.example`：图能力相关的环境变量透传。
 +- `tests/`：新增单测与端到端验证。
 +
 +---
@@ -1366,11 +1501,11 @@ index 00000000..d3796579
 +| 项 | 要求 |
 +| --- | --- |
 +| 主写入在线路径 | 图派发为内存队列投递，O(1) 且不抛异常；图不可用时写入响应时延与关闭态同量级 |
-+| 主检索在线路径 | 图分支有硬超时预算（默认 0.4s，实测一次图检索 0.12–0.23s）；超时即放弃该次图信号，不延长响应 |
++| 主检索在线路径 | 图分支有硬超时预算（默认 1.0s；实测图桥 `/search` n=100 的 p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s，见 §10 E17）；超时即放弃该次图信号，响应最多被延长到预算上限，且该次状态在响应里标为 `timeout` |
 +| 并发模型 | 入图单 worker 串行（Graphiti 要求同一分区的 episode 顺序摄入）；图库连接按作用域缓存复用 |
 +| 新增 LLM 调用 | 仅在图侧（写入路径），主检索路径零 LLM 调用 |
 +| 幂等性 | 同一 memory id 的 episode 在图侧唯一；重复派发不产生重复边 |
-+| 可观测 | 派发/成功/失败/丢弃/熔断计数、图库节点边数、图检索时延与命中数均可查 |
++| 可观测 | 派发/成功/失败/丢弃/熔断计数（`GET /graph/stats`）、图分支状态（每条检索结果的 `graph_status`）、图库节点边数（图桥 `/stats`）、图检索时延与命中数均可查 |
 +| 资源 | 新增常驻内存 ≤ 215MiB（实测基数，第 3 节）；新容器均设内存上限，防止挤占主链路 |
 +| 隔离 | 图分区键由作用域派生，按 `user_id` 天然隔离；测试数据可按分区整体删除 |
 +| 可复现 | 图信号计算为纯函数（给定图检索结果与候选池，输出确定），不依赖 LLM |
@@ -1493,7 +1628,7 @@ index 00000000..d3796579
 +                     ┌────────────────────────▼──────┐
 +   POST /search  ───▶│  graph-bridge (新增，≤512m)    │
 +     （图分支，       │   ├─ /episodes  入图           │
-+       0.4s 预算）    │   ├─ /search    图检索         │
++       1.0s 预算）    │   ├─ /search    图检索         │
 +                     │   ├─ /health    /stats         │
 +                     │   └─ graphiti-core 0.30.2      │
 +                     └────────────────────────┬──────┘
@@ -1571,7 +1706,7 @@ index 00000000..d3796579
 +
 +位置：`_search_vector_store` 的候选集（`candidates`，语义检索过 `threshold` 之后）构建完成、进入 `score_and_rank` 之前。图分支与既有 BM25 / 实体加分的取数并列，互不依赖。
 +
-+调用：`POST {endpoint}/search {group_ids: [作用域键], query, max_facts}`，在**硬超时预算**内（默认 0.4s；实测 0.12–0.23s，E6）同步取回；超时或异常返回空结果。
++调用：`POST {endpoint}/search {group_ids: [作用域键], query, max_facts}`，在**硬超时预算**内（默认 1.0s；实测分位见 §10 E17）同步取回；超时或异常返回空结果，并把该次状态带走。
 +
 +图侧结果的采用规则：
 +
@@ -1580,6 +1715,7 @@ index 00000000..d3796579
 +| 失效事实 | `invalid_at` 非空的事实默认不参与加分（与主通道失效语义一致，可由配置放开） |
 +| 映射范围 | 事实 `episodes` 中的 id 只有在**本次候选池内**才产生加分；池外 id 忽略 |
 +| 条数 | 采用 `max_facts` 条（默认 10），按图检索返回顺序定权 |
++| 本次状态 | 每次调用带一个状态值（`ok` / `skipped` / `timeout` / `error` / `disabled`），随检索结果的 `graph_status` 发布（§6.4） |
 +
 +## 6.2 融合公式
 +
@@ -1648,7 +1784,19 @@ index 00000000..d3796579
 +| 图侧内存超限被 cgroup 截断 | 主链路不受影响（独立容器） | 容器重启，恢复后队列继续按序入图 |
 +| 网络分区（VM 内部网络异常） | 同「图桥进程停止」 | 同 |
 +
-+统一原则：**入图失败不回滚事实写入；检索缺图信号即按无信号打分；任何图侧异常的可见面是计数器与日志，而不是响应内容或响应时延。**
++统一原则：**入图失败不回滚事实写入；检索缺图信号即按无信号打分；图侧的每一次降级都是显式状态——状态值、计数器与日志共同构成可见面，而不是被静默吞掉。**
++
++状态值的判定面（`graph_status`，随每条检索结果发布；图能力关闭时也发布，取值为 `disabled`）：
++
++| 状态 | 含义 | 对打分的影响 |
++| --- | --- | --- |
++| `ok` | 图桥在预算内返回了结果（命中数可能为 0） | 命中即加分，未命中即 0（分母不增长） |
++| `timeout` | 图桥未在预算内返回 | 本次无图信号 |
++| `error` | 图桥在预算内失败（连接失败 / 非 2xx / 畸形响应） | 本次无图信号 |
++| `skipped` | 能力开启，但无作用域键或候选池为空，未发起调用 | 本次无图信号 |
++| `disabled` | 能力关闭，未发起任何图调用 | 无图分量，分数与关闭态逐位一致 |
++
++降级路径下「结果等于关闭态」的准确含义是 **id 序与分数**等于关闭态（`[AC-20]`/`[AC-21]` 的判定面）；`graph_status` 正是两者唯一的差别，也是这次降级可被诊断的依据——7.5% 的静默降级在调用方视角曾是「同一查询时而带图增强时而不带」且无从查因。
 +
 +## 6.5 开关与回退
 +
@@ -1660,13 +1808,13 @@ index 00000000..d3796579
 +| `endpoint` | `http://graph-bridge:8000` | 图桥地址 |
 +| `weight` | 0.5 | `W_g`，图加分上限 |
 +| `max_facts` | 10 | 每次图检索取用的事实条数 |
-+| `timeout_seconds` | 0.4 | 图检索硬超时预算 |
++| `timeout_seconds` | 1.0 | 图检索硬超时预算（0.4 → 1.0：实测尾部见 §10 E6/E17） |
 +| `include_invalidated` | `false` | 是否采用 `invalid_at` 非空的事实 |
 +| `queue_size` | 1000 | 派发队列容量 |
 +| `max_retries` | 3 | 单条 episode 最大重试次数 |
 +| `circuit_breaker_failures` / `circuit_cooldown_seconds` | 5 / 60 | 熔断阈值与冷却窗口 |
 +
-+回退语义：关闭开关后不产生任何图调用与图写入；`max_possible` 与 `final_score` 回到无图形态；`score_details` 中不出现图分量键，`explain` 输出与引入本机制之前逐位一致。
++回退语义：关闭开关后不产生任何图调用与图写入；`max_possible` 与 `final_score` 回到无图形态；`score_details` 中不出现图分量键，`explain` 输出与引入本机制之前逐位一致；每条结果只多一个只读字段 `graph_status = "disabled"`（不参与打分，也不进入 `score_details`），使「能力关闭」与「图没答上来」在响应上不再同形。
 +
 +---
 +
@@ -1677,15 +1825,17 @@ index 00000000..d3796579
 +| `server/graph-bridge/app.py`（新增） | 图桥 | FastAPI 薄壳：装配 graphiti-core 客户端（LLM 用 `OpenAIClient` 的 `/responses` 通道，embedder 用 OpenAI 兼容 embedder 客户端）、作用域→图键映射、driver 缓存、`/episodes`（含幂等前置）、`/search`、`/stats`、`/health`、`/graph/{group_id}` |
 +| `server/graph-bridge/requirements.txt`、`Dockerfile`、`README.md`（新增） | 图桥 | 依赖固定 `graphiti-core[falkordb]==0.30.2`；镜像基于 `python:3.12-slim` |
 +| `server/docker-compose.yaml` | 部署 | 新增 `falkordb`（`mem_limit: 384m`，仅内网）与 `graph-bridge`（`mem_limit: 512m`，仅内网，`depends_on` falkordb）；`mem0` 服务透传 `MEM0_GRAPH_*` 并 `depends_on` graph-bridge（软依赖） |
-+| `server/.env` | 部署 | 新增图能力环境变量（默认 `MEM0_GRAPH_ENABLED=false`） |
-+| `mem0/memory/graph_sync.py`（新增） | 同步 | 作用域→图键纯函数、有界队列、单 worker（线程 + 事件循环）、HTTP 客户端、重试与熔断、计数器 |
++| `server/.env.example` | 部署 | 新增图能力环境变量（默认 `MEM0_GRAPH_ENABLED=false`）。**实际做法**：`server/.env` 未新增变量——它未纳入版本控制（`.gitignore`），运行行为由 compose 的 `${MEM0_GRAPH_ENABLED:-false}` 等默认值兜底；`.env.example` 是模板与文档面 |
++| `server/routers/graph.py`（新增） | REST | `GET /graph/stats`：图派发计数与熔断状态的只读端点（`[AC-9]`/`[AC-25]` 的判定面，§8） |
++| `mem0/memory/graph_sync.py`（新增） | 同步 | 作用域→图键纯函数、有界队列、单 worker（线程 + 事件循环）、HTTP 客户端、重试与熔断、计数器、图分支状态值 |
 +| `mem0/configs/base.py` | 配置 | `MemoryConfig` 新增 `graph` 配置段与其默认值 |
 +| `mem0/utils/scoring.py` | 打分 | `score_and_rank` 接受 `graph_boosts`；`max_possible` 条件增长；`score_details` 输出版本分量 |
-+| `mem0/memory/main.py` | 逻辑 | 写入路径两份实现的收尾派发；`_search_vector_store` 两份实现（sync/async）调用图检索并折算加分、传入打分器 |
-+| `server/main.py` | REST | `DEFAULT_CONFIG` 增加 `graph` 段（读环境变量）；`score_details` 透传新键 |
-+| `tests/memory/test_graph_sync.py`（新增） | 测试 | 图键派生、队列容量与丢弃、重试与熔断、幂等前置判据、降级 |
-+| `tests/utils/test_scoring.py` | 测试 | 打分器新增参数与分母条件增长的断言 |
-+| `tests/memory/test_graph_search.py`（新增） | 测试 | 图加分折算、失效事实过滤、候选池外 id 忽略、关闭态一致 |
++| `mem0/memory/main.py` | 逻辑 | 写入路径两份实现的收尾派发；`_search_vector_store` 两份实现（sync/async）调用图检索并折算加分、传入打分器，并把 `graph_status` 发布到每条结果 |
++| `server/main.py` | REST | `DEFAULT_CONFIG` 增加 `graph` 段（读环境变量）；`score_details` 透传新键；挂载图观测路由 |
++| `tests/memory/test_graph_sync.py`（新增） | 测试 | 图键派生、队列容量与丢弃、重试与熔断、幂等前置判据、降级与状态值 |
++| `tests/memory/test_graph_search.py`（新增） | 测试 | 图加分折算、失效事实过滤、候选池外 id 忽略、关闭态一致，以及打分器的新增参数与分母条件增长的断言（§6.2）。**实际做法**：打分断言落在本文件，`tests/utils/test_scoring.py` 本阶段零改动——落点与既有的打分器用例（`tests/utils/test_scoring.py` 只覆盖通用打分）同层，但与本文原先的清单不一致 |
++| `tests/test_graph_router.py`（新增） | 测试 | 图计数器只读端点：读数透传、关闭态/未派发态零读数、读数不创建派发器 |
++| `docs/design/graph-memory-evidence/bridge_search_latency.{py,txt}`（新增） | 证据 | 图桥 `/search` 尾部分位实测的脚本与原始输出（§10 E17） |
 +
 +接口契约保持：`/search`、`/memories`、`/memories/{id}`、`/memories/export` 的请求参数与既有响应字段全部保持；`explain` 只增键不改键。Qdrant 集合、payload schema、既有索引不变（join key 在图上，不需要新增 payload 字段）。
 +
@@ -1695,13 +1845,14 @@ index 00000000..d3796579
 +
 +| 观测项 | 方式 | 期望 |
 +| --- | --- | --- |
-+| 派发与丢弃 | 进程计数器（`graph_dispatched` / `graph_synced` / `graph_failed` / `graph_dropped`） | 常态 `dispatched ≈ synced`；图不可用时 `dropped` 上升，`synced` 停增 |
-+| 熔断状态 | 计数器 + 日志（进入/退出冷却） | 图不可用 60s 内进入冷却，恢复后自动放行 |
-+| 图规模 | `GET /stats?group_id=` | `episodes` 单调上升并与新增事实数同阶；`entity_nodes` / `entity_edges` 随之增长 |
-+| 图检索时延与命中 | 图桥访问日志（时延 + `max_facts` 命中数）+ 检索侧计时 | 单次 ≤ 超时预算；命中数 > 0 的比例随时间上升 |
++| 派发与丢弃 | `GET /graph/stats`（mem0 侧的只读端点，5 项计数 + 熔断状态 + 队列长度） | 常态 `dispatched ≈ synced`；图不可用时 `dropped` 上升，`synced` 停增 |
++| 图分支状态 | `POST /search` 每条结果的 `graph_status` | 取 `ok` / `skipped` / `timeout` / `error` / `disabled`；`timeout` 与 `error` 的比例是「图没答上来」的量化面 |
++| 熔断状态 | `GET /graph/stats` 的 `circuit_open` / `consecutive_failures` + 日志（进入/退出冷却） | 图不可用 60s 内进入冷却，恢复后自动放行 |
++| 图规模 | 图桥 `GET /stats?group_id=` | `episodes` 单调上升并与新增事实数同阶；`entity_nodes` / `entity_edges` 随之增长 |
++| 图检索时延与命中 | 图桥访问日志（时延 + `max_facts` 命中数）+ 检索侧计时 + `GET /graph/stats` 的 `timeout_seconds` | 单次 ≤ 超时预算（默认 1.0s，§10 E17）；命中数 > 0 的比例随时间上升 |
 +| 图信号参与度 | `POST /search?explain=true` 的 `score_details` | 含 `graph_boost` / `graph_facts`；图命中为 0 时 `graph_boost = 0.0` |
 +| 资源 | `docker stats` + VM `free -m` | 图桥 ≤ 512MiB、FalkorDB ≤ 384MiB；VM `available` ≥ 4GiB；swap 保持 0 |
-+| 图键隔离 | FalkorDB `GRAPH.LIST` / `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
++| 图键隔离 | 图桥 `GET /graphs` / FalkorDB `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
 +
 +---
 +
@@ -1723,7 +1874,7 @@ index 00000000..d3796579
 +
 +# 10. 实测证据
 +
-+全部数据采集于 2026-09-17，主机 macOS（vz），VM `docker`（aarch64，2 vCPU / 7922MiB），mem0 四服务在线，Qdrant 集合 `memories_2048`（3612 点）。探针脚本与原始输出留存于 `docs/design/graph-memory-evidence/`（`graphiti_e2e.py` / `llm_probe.py` / `joinkey_probe.py` / `falkor_scale.py` 及对应 `.txt` 原始输出、`vm_resource.txt`、`official_image_probe.txt`），可按脚本头部注释复跑。
++全部数据采集于 2026-09-17，主机 macOS（vz），VM `docker`（aarch64，2 vCPU / 7922MiB），mem0 四服务在线，Qdrant 集合 `memories_2048`（3612 点）。探针脚本与原始输出留存于 `docs/design/graph-memory-evidence/`（`graphiti_e2e.py` / `llm_probe.py` / `joinkey_probe.py` / `falkor_scale.py` / `bridge_search_latency.py` 及对应 `.txt` 原始输出、`vm_resource.txt`、`official_image_probe.txt`），可按脚本头部注释复跑。
 +
 +| 编号 | 证据 | 结论 |
 +| --- | --- | --- |
@@ -1732,7 +1883,7 @@ index 00000000..d3796579
 +| E3 | `docker stats`：`falkordb/falkordb:latest` 空载 62.43 → 67.5MiB（分步启动观测） | 图库常驻预算 |
 +| E4 | 规模化压测：8150 实体节点 + 3545 边写入后 `INFO memory`：`used_memory` 7.00MiB → 10.53MiB、`used_memory_dataset` 8.25MiB、`used_memory_rss` 37.46MiB 不变；`count(n)=8150`、`count(e)=3545` | 目标规模图数据的内存模型（3.2/4.3） |
 +| E5 | `docker stats`：`zepai/graphiti:0.30.2` 容器 idle 145.3MiB、CPU 0.23% | 图服务常驻与 CPU 预算 |
-+| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 选定的形态）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；`/search` 0.12–0.23s、RRF 检索 0.23s；进程峰值 RSS 155MB | 时延预算、LLM 负载；0.4s 超时预算的裕度 |
++| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 选定的形态）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；进程峰值 RSS 155MB。**`/search` 时延以 E17 的专门采样为准**——本条当时记录的「0.12–0.23s」只覆盖了轻载样本、未覆盖尾部，核验复跑 40 次即得 `p95 0.520 / max 0.678s`（超 0.4s 3/40），故 0.4s 预算不成立 | 时延预算、LLM 负载 |
 +| E7 | 结构化输出探测（`graphiti-core` 三种客户端 × 本机网关 `deepseek-v4.1-flash`）：`OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；`OpenAIGenericClient(json_object)` 短提示通过、长提示下出现 `EdgeDuplicate` 校验失败（`Extra data: line 1 column 847`）；`OpenAIClient(responses.parse)` → 通过 | 图桥按 `/responses` 通道装配 LLM 客户端 |
 +| E8 | 官方镜像内 `import falkordb` → `None`（不存在），`neo4j` → 存在；带 `db_backend=falkordb` 启动 → `ImportError: falkordb is required for FalkorDriver` | G1 |
 +| E9 | 官方镜像 + Neo4j 后端：`/healthcheck` → `{"status":"healthy"}`；`/messages` → 202；`/search` → `422 ... API密钥未配置该模型`（embedder 实际用默认 `text-embedding-3-small`） | G2 |
@@ -1743,6 +1894,7 @@ index 00000000..d3796579
 +| E14 | Neo4j 对照：`neo4j:5.26-community` 空载 328MiB（启动 33s）→ 507.1MiB；`dbms.listConfig()`：`pagecache.size = 512.00MiB` | 4.3 对照数据 |
 +| E15 | 镜像体积：本机展开 `falkordb/falkordb:latest` 570MB、`zepai/graphiti:0.30.2` 582MB、`neo4j:5.26-community` 660MB；Docker Hub arm64 拉取体积 FalkorDB 206.7MB、Graphiti 192.0MB | 3.2 磁盘预算 |
 +| E16 | `graphiti_core` 版本：PyPI 最新 `graphiti-core` 0.30.2（requires_python `>=3.10,<4`），镜像内为同一版本；`Graphiti` 构造器接受 `graph_driver` / `llm_client` / `embedder` / `cross_encoder` | 依赖锁版本与客户端装配方式 |
++| E17 | 图桥 `/search` 尾部分位（核验整改卡实测，`bridge_search_latency.py`）：第 1 轮 n=60 → `p50 0.131 / p90 0.258 / p95 0.343 / p99 0.425 / max 0.472s`；第 2 轮（图键补入实体与关系边）n=100 → `p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s`，其中超 0.4s 共 14/100（14.0%），超 0.6s 4/100，超 0.8s 2/100，无超 1.0s | `timeout_seconds` 默认值取 1.0 的依据：两轮 max 均在预算内，且对 p99/max 仍有 ~19% 裕度；0.4s 只覆盖到约 p85，属「正常请求会落进超时区」 |
 +
 +---
 +
@@ -1767,7 +1919,7 @@ index 00000000..d3796579
 +| [AC-6] | 入图不阻塞主写入：图桥正常运行与停止两种状态下，各连续 5 次 `POST /memories`（每次 1 条事实），两次的响应时延 p50 相对差 ≤ 50%（写入本身含多次 LLM 调用，判定看派发是否引入量级差异而非微秒级差异），且两种状态下事实均写入成功 | 两次计时输出对比 |
 +| [AC-7] | 幂等：同一 memory id 触发两次同步，图内该 uuid 的 Episodic 节点恰好 1 个；第二次调用返回 `already_synced`；该 uuid 关联的边数与首次完成后相比不增加 | 图键内查询 + 图桥响应字段 |
 +| [AC-8] | 失败可重试：停止图桥 30s，期间写入 3 条事实；恢复图桥后 3 分钟内 3 条事实全部可在图中查到 | 停止/恢复操作 + `/stats` 与图检索 |
-+| [AC-9] | 队列有界且可观测：把 `queue_size` 设为 5 并持续阻断图桥，写入 20 条事实 → 进程 RSS 增量 < 50MiB，且 `graph_dropped` 计数器 > 0；恢复后可查到的 episode 数 ≤ 5 | 计数器读数 + `/stats` |
++| [AC-9] | 队列有界且可观测：把 `queue_size` 设为 5 并持续阻断图桥，写入 20 条事实 → 进程 RSS 增量 < 50MiB，且 `graph_dropped` 计数器 > 0；恢复后可查到的 episode 数 ≤ 5 | `GET /graph/stats` 的 `graph_dropped` 读数（服务侧只读端点，§8、§7）+ 图桥 `/stats` |
 +| [AC-10] | 存量不受影响：图内 episode 数等于实施后新增事实数（与 3500+ 存量无关）；Qdrant `points_count` 只按期间新增量增长；`GET /memories?limit=1` 的 `total` 不回退 | Qdrant 与 REST 计数对比 |
 +
 +## 11.3 检索融合
@@ -1775,7 +1927,7 @@ index 00000000..d3796579
 +| 编号 | 验收内容 | 判定方式 |
 +| --- | --- | --- |
 +| [AC-11] | 图信号真实参与打分：隔离 `user_id` 构造两条近似候选（B 被图检索命中、A 未被命中）→ 开启图能力后 B 的 `final_score` 高于关闭态同名条目的 `final_score`，且 `explain` 中 B 的 `graph_boost > 0`、A 的 `graph_boost = 0.0` | 两态各跑一次 `POST /search?explain=true` 逐条比对 |
-+| [AC-12] | 图信号有上限：任一候选的 `graph_boost ≤ weight`（默认 0.5）；把 `explain` 的 `graph_boost` 与 `max_possible_score` 相除，占比 ≤ 0.167 | 读取响应 JSON 的 `score_details` |
++| [AC-12] | 图信号有上限：任一候选的 `graph_boost ≤ weight`（默认 0.5）；且 `graph_boost / max_possible_score ≤ W_g / (1.0 + has_bm25 + has_entity + W_g)`——**上界随实际启用的信号数变化**，四信号全开（分母 3.0）时收为 0.167，只启用图信号时（分母 1.5）为 0.333。判据把前提写进公式，不再是「无条件 ≤ 0.167」 | 读取响应 JSON 的 `score_details`，代入选定的 `W_g` 与本次分母 |
 +| [AC-13] | 不引入、不淘汰候选：`top_k` 取等于候选池规模时，开启与关闭图能力两种状态下返回的 id **集合完全相同**，仅顺序可能不同；开启态不存在 `threshold` 以下的候选进入结果 | 两态对比 id 集合 |
 +| [AC-14] | 保序判据成立：对真实语料 20 条 query × `top_k=50` 扫描，不存在 `s_A ≥ (s_B + 0.5)/0.90` 却被翻转的候选对（A 在前） | 用 `explain` 的 `semantic_score` 全对扫描 |
 +| [AC-15] | 与时间因子复合正确：开启两机制时 `explain` 同时含 `graph_boost` 与 `decay_weight` / `retention` / `memory_strength_days` / `elapsed_days` / `access_count`；单独关闭其中之一，另一机制的分量与行为不变 | 三种开关组合各跑一次比对 |
@@ -1788,12 +1940,12 @@ index 00000000..d3796579
 +
 +| 编号 | 验收内容 | 判定方式 |
 +| --- | --- | --- |
-+| [AC-20] | 图桥停止：`POST /memories` 与 `POST /search` 均返回 2xx；检索结果与关闭态逐条相等；日志出现跳过一次的计数 | 停容器 + 两态比对 |
++| [AC-20] | 图桥停止：`POST /memories` 与 `POST /search` 均返回 2xx；检索结果的 id 序与分数与关闭态逐条相等，且每条结果的 `graph_status` 标为 `error`（图桥不可达）或 `timeout`（未在预算内返回）；被跳过的派发计入 `graph_dropped` | 停容器 + 两态比对 + `GET /graph/stats` 读数 |
 +| [AC-21] | 图库停止（图桥在）：行为同 [AC-20]，结果与关闭态逐条相等 | 停 FalkorDB + 两态比对 |
 +| [AC-22] | 超时预算生效：把 `timeout_seconds` 设为 0.001 后连续 10 次 `POST /search`，响应时延 p95 与关闭态差 ≤ 5%，结果与关闭态一致 | 两态计时与结果比对 |
 +| [AC-23] | 畸形数据不致命：图桥返回空列表、缺字段、伪造 memory id 三种响应时，`POST /search` 返回 2xx、无 5xx、结果与关闭态一致（图分量按 0 计） | 注入响应 + 结果比对 |
 +| [AC-24] | 失败不回滚事实：图桥全阻断期间写入 5 条事实，解除阻断后 5 条在 Qdrant 中均可检索到（`GET /memories/{id}` 命中） | 写入 + 读取 |
-+| [AC-25] | 熔断生效并可恢复：连续 5 次失败后进入冷却，冷却窗口内的派发被记为丢弃（不发起新请求，图桥访问日志 0 次）；冷却结束后自动放行（访问日志恢复增长） | 计数器 + 图桥访问日志 |
++| [AC-25] | 熔断生效并可恢复：连续 5 次失败后进入冷却，冷却窗口内的派发被记为丢弃（不发起新请求，图桥访问日志 0 次）；冷却结束后自动放行（访问日志恢复增长） | `GET /graph/stats` 的 `circuit_open` / `consecutive_failures` / `graph_dropped` 读数 + 图桥访问日志 |
 +
 +## 11.5 开关、接口与范围
 +
@@ -1812,7 +1964,7 @@ index 00000000..d3796579
 +| --- | --- |
 +| [AC-32] | 全部端到端验证使用隔离 `user_id`（`test_graph_*`）及其派生图键；验证完毕后删除图键（`DELETE /graph/{group_id}`）并清理 Qdrant 测试点，`GET /memories?limit=1` 的 `total` 回到基线值 |
 +| [AC-33] | 存量 3500+ 条真实记忆全程无删除、无重建、无向量重算；`user_id=xue` 的 `points_count` 单调不减 |
-+| [AC-34] | 每次测试的 `explain` 输出中对同一 query 的两次调用，`graph_boost` 取值一致（纯函数，不依赖 LLM 采样） |
++| [AC-34] | 图信号的一致性分两条判定：**(a) 健康路径**——图服务可用且两次调用都未超时（结果 `graph_status` 均为 `ok`）时，同一 query 两次 `explain` 调用的 `graph_boost` 逐条相等（折算为纯函数，不依赖 LLM 采样）；**(b) 降级路径**——发生超时（或故障）时，响应必须把该次标为 `graph_status = "timeout"`（`error`），即「不一致」只允许出现在被显式标注的那一类里，不允许静默。判据的「一致」是「健康路径确定 + 降级路径显式」，不是「任何情况下都一致」——显式降级下两次取值必然不同，那是设计而非缺陷 | 两态响应比对 + `graph_status` 取值；预算取 §6.5 的默认值（1.0s，实测尾部见 E17） |
 +| [AC-35] | `make lint`（ruff，line length 120）对 `mem0/`、`server/` 改动零告警；`docker exec mem0-dev-mem0-1 python -c "from mem0.memory.graph_sync import <新符号>"` 成功 |
 +| [AC-36] | 实现完成后 `bash patches/generate-patch.sh` 成功刷新 `patches/mem0-local.patch`，覆盖本次全部改动文件 |
 +| [AC-37] | 图桥不修改 graphiti-core 源码：镜像内 `graphiti_core` 与 PyPI 0.30.2 的文件清单一致（无本地补丁文件） |
@@ -3618,10 +3770,10 @@ index 00000000..1f5be2bc
 +| mem0 上游 Dream / Synthesis（`docs/platform/features/dream.mdx`、`docs/api-reference/dream/*`） | 端点形态参照（preview / runs / sources 三分组）；**偏离点**：上游按纯 `user_id` 作用域且只处理启用后的新记忆，本机记忆全部带 `agent_id`，故作用域改为 `(user_id, agent_id)` 二元组；上游不区分观察与事实（pattern memory 与普通记忆同权返回），本方案以 `memory_kind` 区分并默认不返回观察 |
 +| bi-temporal 事实模型设计（`docs/design/bitemporal-fact-model.md`） | 条款同构：payload-only 更新、失效不删除、悬空指针不清洗、`invalid_reason` 枚举扩展、读侧一等字段提升 |
 diff --git a/mem0/configs/base.py b/mem0/configs/base.py
-index 5955ade6..e9a3828b 100644
+index 5955ade6..4ffa8ff6 100644
 --- a/mem0/configs/base.py
 +++ b/mem0/configs/base.py
-@@ -26,6 +26,119 @@ class MemoryItem(BaseModel):
+@@ -26,6 +26,124 @@ class MemoryItem(BaseModel):
      updated_at: Optional[str] = Field(None, description="The timestamp when the memory was updated")
  
  
@@ -3675,8 +3827,9 @@ index 5955ade6..e9a3828b 100644
 +    设计见 `docs/design/graph-memory.md`。事实主存仍是 Qdrant；本配置段只控制
 +    「新事实是否同步入图」与「检索时是否把图关联折算为补充加分」。
 +
-+    默认 `enabled=False`：关闭时不派发、不查询、不加分，检索与写入行为与引入本机制
-+    之前逐位一致（`explain` 输出也不出现图分量键）。
++    默认 `enabled=False`：关闭时不派发、不查询、不加分，分数与 `explain` 的 `score_details`
++    与引入本机制之前逐位一致；结果条目只多一个只读的 `graph_status = "disabled"`，用于把
++    「能力关闭」与「图没答上来」在响应上分开。
 +    """
 +
 +    enabled: bool = Field(
@@ -3698,8 +3851,12 @@ index 5955ade6..e9a3828b 100644
 +        ge=1,
 +    )
 +    timeout_seconds: float = Field(
-+        description="图检索硬超时预算（秒）。超时即本次无图信号，不延长响应。",
-+        default=0.4,
++        description=(
++            "图检索硬超时预算（秒）。超时即本次无图信号，不延长响应，本次状态在检索结果里标为 `timeout`。"
++            "默认 1.0：图桥 `/search` 实测 n=100 得 p50/p90/p95/p99/max = 0.163/0.445/0.514/0.812/0.842s"
++            "（另一轮 n=60 max 0.678s），0.4s 只覆盖到约 p85、正常请求会落进超时区（实测 14/100 超预算）。"
++        ),
++        default=1.0,
 +        gt=0,
 +    )
 +    include_invalidated: bool = Field(
@@ -3741,7 +3898,7 @@ index 5955ade6..e9a3828b 100644
  class MemoryConfig(BaseModel):
      vector_store: VectorStoreConfig = Field(
          description="Configuration for the vector store",
-@@ -55,6 +168,14 @@ class MemoryConfig(BaseModel):
+@@ -55,6 +173,14 @@ class MemoryConfig(BaseModel):
          description="Custom instructions for fact extraction",
          default=None,
      )
@@ -5911,10 +6068,10 @@ index 00000000..f6191f16
 +    return path
 diff --git a/mem0/memory/graph_sync.py b/mem0/memory/graph_sync.py
 new file mode 100644
-index 00000000..b3e17eca
+index 00000000..6c43309b
 --- /dev/null
 +++ b/mem0/memory/graph_sync.py
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,422 @@
 +"""图记忆同步：把新事实派发入图（Graphiti 图桥），并把图关联折算为补充加分。
 +
 +设计见 `docs/design/graph-memory.md`。本模块只负责与图桥相关的三件事，事实主存
@@ -5925,13 +6082,19 @@ index 00000000..b3e17eca
 +| 作用域 → 图键 | `derive_group_id` | 纯函数，写入派发与检索查询共用同一来源 |
 +| 事实入图 | `GraphSync.dispatch` / `GraphSync` 的串行 worker | 内存队列投递 O(1) 且不抛异常；失败重试、连续失败熔断 |
 +| 图检索与折算 | `search_graph_facts` / `compute_graph_boosts` | 硬超时预算；纯函数折算，不依赖 LLM |
++| 图分支状态 | `search_graph_facts_with_status` 的状态值 | 超时 / 故障 / 未命中 / 关闭互不同形，随检索结果发布 |
 +
 +两条不变量：
 +
-+* **降级**：图桥不可用时写入与检索照常，图分支静默跳过——派发失败只记计数器，
-+  图检索异常/超时一律按「本次无图信号」返回。
++* **降级**：图桥不可用时写入与检索照常，图分支按「本次无图信号」处理——派发失败只记
++  计数器，图检索异常/超时一律返回空事实。降级本身的可见面是状态值、计数器与日志：
++  调用方从响应里的 `graph_status` 就能区分「图确实没贡献」与「图没答上来」。
 +* **写路径零阻塞**：`dispatch` 只做一次内存入队；HTTP 调用发生在独立线程的事件循环里，
 +  与 FastAPI 的请求线程池互不占用。
++
++图分支状态常量（`GRAPH_STATUS_*`）：`disabled`（能力关闭）、`skipped`（无作用域键或候选
++池为空，未发起调用）、`ok`（预算内返回，命中数可能为 0）、`timeout`（未在预算内返回）、
++`error`（预算内失败：连接失败 / 非 2xx / 畸形响应）。
 +"""
 +
 +from __future__ import annotations
@@ -5962,6 +6125,15 @@ index 00000000..b3e17eca
 +
 +# 图检索事实的排序权重：w(k) = 1 / (1 + 0.5 × (k − 1))，k 从 1 起。
 +_RANK_DECAY_STEP = 0.5
++
++# 本次图分支的状态，随检索结果一起发布（设计 §6.4、§8）。此前「图桥没答上来」与
++# 「图桥答了但没命中」在响应上完全同形，「预算内超时」于调用方不可见、无法诊断；
++# 状态值把两者分开，并让「能力关闭」也成为一个显式取值。
++GRAPH_STATUS_DISABLED = "disabled"  # 能力关闭，未发起任何图调用
++GRAPH_STATUS_SKIPPED = "skipped"  # 能力开启，但本次无作用域键或候选池为空，未发起调用
++GRAPH_STATUS_OK = "ok"  # 图桥在预算内返回了结果（命中数可能为 0）
++GRAPH_STATUS_TIMEOUT = "timeout"  # 图桥未在预算内返回，本次按无图信号处理
++GRAPH_STATUS_ERROR = "error"  # 图桥在预算内失败（连接失败 / 非 2xx / 畸形响应）
 +
 +# 入队的最大尝试次数：队列被并发排空时的兜底上界，保证派发是 O(1) 且必然返回。
 +_QUEUE_PUSH_ATTEMPTS = 8
@@ -6092,6 +6264,51 @@ index 00000000..b3e17eca
 +        self._client.close()
 +
 +
++def search_graph_facts_with_status(
++    client: Any,
++    group_id: Optional[str],
++    query: str,
++    max_facts: int,
++    timeout_seconds: float,
++) -> Tuple[List[Dict[str, Any]], str]:
++    """取回一次图检索的事实列表，并回报本次的状态（设计 §6.4、§8）。
++
++    降级语义不变：任何失败（含超时、畸形响应）都按「本次无图信号」返回空列表，本函数
++    **不抛异常**。区别在于状态可被调用方带走——「预算内超时」因此不再与「图桥答了但
++    没命中」同形，而是作为显式状态进入检索响应。
++
++    Args:
++        client: 图桥客户端（`GraphBridgeClient` 或测试替身）。
++        group_id: 作用域派生的图键；为空时不发起调用。
++        query: 检索文本；为空时不发起调用。
++        max_facts: 取用的事实条数上限。
++        timeout_seconds: 本次调用的硬超时预算。
++
++    Returns:
++        `(facts, status)`。`status` 取 `GRAPH_STATUS_OK` / `GRAPH_STATUS_TIMEOUT` /
++        `GRAPH_STATUS_ERROR` / `GRAPH_STATUS_SKIPPED`。
++    """
++    if not group_id or not query:
++        return [], GRAPH_STATUS_SKIPPED
++    try:
++        payload = client.search(
++            {"group_ids": [group_id], "query": query, "max_facts": max_facts},
++            timeout_seconds,
++        )
++    except httpx.TimeoutException as exc:
++        logger.debug("Graph search exceeded its %.3fs budget (status=timeout): %s", timeout_seconds, exc)
++        return [], GRAPH_STATUS_TIMEOUT
++    except Exception as exc:  # noqa: BLE001 - 图侧任何异常都不得外溢到主检索
++        logger.debug("Graph search skipped (bridge unavailable, status=error): %s", exc)
++        return [], GRAPH_STATUS_ERROR
++
++    facts = payload.get("facts") if isinstance(payload, dict) else None
++    if not isinstance(facts, list):
++        logger.debug("Graph search returned a malformed payload (status=error): %r", payload)
++        return [], GRAPH_STATUS_ERROR
++    return [fact for fact in facts if isinstance(fact, dict)], GRAPH_STATUS_OK
++
++
 +def search_graph_facts(
 +    client: Any,
 +    group_id: Optional[str],
@@ -6101,24 +6318,11 @@ index 00000000..b3e17eca
 +) -> List[Dict[str, Any]]:
 +    """取回一次图检索的事实列表；任何失败（含超时、畸形响应）都返回空列表。
 +
-+    检索缺图信号按「无信号」打分，因此本函数**不抛异常**：图侧故障的可见面是日志与
-+    计数器，而不是响应内容或响应时延（设计 §6.4）。
++    本次状态见 `search_graph_facts_with_status`（本函数是它的薄封装，保留只需要事实
++    列表的调用形状）。
 +    """
-+    if not group_id or not query:
-+        return []
-+    try:
-+        payload = client.search(
-+            {"group_ids": [group_id], "query": query, "max_facts": max_facts},
-+            timeout_seconds,
-+        )
-+    except Exception as exc:  # noqa: BLE001 - 图侧任何异常都不得外溢到主检索
-+        logger.debug("Graph search skipped (bridge unavailable): %s", exc)
-+        return []
-+
-+    facts = payload.get("facts") if isinstance(payload, dict) else None
-+    if not isinstance(facts, list):
-+        return []
-+    return [fact for fact in facts if isinstance(fact, dict)]
++    facts, _status = search_graph_facts_with_status(client, group_id, query, max_facts, timeout_seconds)
++    return facts
 +
 +
 +class GraphSync:
@@ -6291,10 +6495,10 @@ index 00000000..b3e17eca
 +        except Exception:  # noqa: BLE001
 +            pass
 diff --git a/mem0/memory/main.py b/mem0/memory/main.py
-index a8b159f1..e0029ea5 100644
+index a8b159f1..96ddf383 100644
 --- a/mem0/memory/main.py
 +++ b/mem0/memory/main.py
-@@ -4,27 +4,42 @@ import gc
+@@ -4,27 +4,45 @@ import gc
  import hashlib
  import json
  import logging
@@ -6330,16 +6534,19 @@ index a8b159f1..e0029ea5 100644
  from mem0.exceptions import ValidationError as Mem0ValidationError
  from mem0.memory.base import MemoryBase
 +from mem0.memory.graph_sync import (
++    GRAPH_STATUS_DISABLED,
++    GRAPH_STATUS_ERROR,
++    GRAPH_STATUS_SKIPPED,
 +    GraphBridgeClient,
 +    GraphSync,
 +    compute_graph_boosts,
 +    derive_group_id,
-+    search_graph_facts,
++    search_graph_facts_with_status,
 +)
  from mem0.memory.notices import (
      PERFORMANCE_SLOW_QUERY_THRESHOLD_SECONDS,
      detect_decay_usage_from_delete,
-@@ -451,6 +466,634 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
+@@ -451,6 +469,642 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
          return False
  
  
@@ -6937,16 +7144,18 @@ index a8b159f1..e0029ea5 100644
 +    """取回一次图检索并按候选池折算加分（设计 §6.1–6.2）。
 +
 +    Returns:
-+        `(graph_boosts, graph_facts)`，或 `(None, None)` 表示图能力关闭——调用方把 None
-+        原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致。
++        `(graph_boosts, graph_facts, status)`。`graph_boosts` 为 None 表示图能力关闭——
++        调用方把 None 原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致；
++        否则为本次的加分映射（可能为空），`status` 为本次图分支的状态（`GRAPH_STATUS_*`，
++        由调用方随检索结果发布）。
 +    """
 +    config = _graph_config_of(memory)
 +    if config is None or not config.enabled:
-+        return None, None
++        return None, None, GRAPH_STATUS_DISABLED
 +    group_id = derive_group_id(filters)
 +    if not group_id or not candidates:
-+        return {}, {}
-+    facts = search_graph_facts(
++        return {}, {}, GRAPH_STATUS_SKIPPED
++    facts, status = search_graph_facts_with_status(
 +        _graph_client(memory),
 +        group_id,
 +        query,
@@ -6954,27 +7163,33 @@ index a8b159f1..e0029ea5 100644
 +        config.timeout_seconds,
 +    )
 +    candidate_ids = [str(candidate["id"]) for candidate in candidates if candidate.get("id") is not None]
-+    return compute_graph_boosts(
++    boosts, fact_counts = compute_graph_boosts(
 +        facts,
 +        candidate_ids,
 +        config.weight,
 +        config.include_invalidated,
 +    )
++    return boosts, fact_counts, status
 +
 +
 +def _compute_graph_hits(memory, query: str, candidates: List[Dict[str, Any]], filters) -> tuple:
-+    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。"""
++    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。
++
++    Returns:
++        `(graph_boosts, graph_facts, status)`；本层任何异常都降级为「本次无图信号」并把
++        状态标为 `GRAPH_STATUS_ERROR`（图侧异常不得外溢到主检索）。
++    """
 +    try:
 +        return _graph_hits(memory, query, candidates, filters)
 +    except Exception as exc:  # noqa: BLE001 - 图侧异常不得外溢到主检索
 +        logger.warning(f"Graph boost computation failed: {exc}")
-+        return {}, {}
++        return {}, {}, GRAPH_STATUS_ERROR
 +
 +
  setup_config()
  logger = logging.getLogger(__name__)
  
-@@ -513,6 +1156,11 @@ class Memory(MemoryBase):
+@@ -513,6 +1167,11 @@ class Memory(MemoryBase):
          # Entity store is initialized lazily on first use
          self._entity_store = None
  
@@ -6986,7 +7201,7 @@ index a8b159f1..e0029ea5 100644
          if MEM0_TELEMETRY:
              # Create telemetry config manually to avoid deepcopy issues with thread locks
              telemetry_config_dict = {}
-@@ -555,6 +1203,18 @@ class Memory(MemoryBase):
+@@ -555,6 +1214,18 @@ class Memory(MemoryBase):
      def project(self):
          return _OSSProject()
  
@@ -7005,7 +7220,7 @@ index a8b159f1..e0029ea5 100644
      @property
      def entity_store(self):
          """Lazily initialize entity store on first use."""
-@@ -921,21 +1581,26 @@ class Memory(MemoryBase):
+@@ -921,21 +1592,26 @@ class Memory(MemoryBase):
          parsed_messages = parse_messages(messages)
  
          # Phase 1: Existing memory retrieval
@@ -7039,7 +7254,7 @@ index a8b159f1..e0029ea5 100644
  
          # Phase 2: LLM extraction (single call)
          is_agent_scoped = bool(filters.get("agent_id")) and not filters.get("user_id")
-@@ -1035,6 +1700,9 @@ class Memory(MemoryBase):
+@@ -1035,6 +1711,9 @@ class Memory(MemoryBase):
              mem_metadata["updated_at"] = mem_metadata["created_at"]
              if mem.get("attributed_to"):
                  mem_metadata["attributed_to"] = mem["attributed_to"]
@@ -7049,7 +7264,7 @@ index a8b159f1..e0029ea5 100644
  
              records.append((memory_id, text, embed_map[text], mem_metadata))
  
-@@ -1042,6 +1710,13 @@ class Memory(MemoryBase):
+@@ -1042,6 +1721,13 @@ class Memory(MemoryBase):
              self.db.save_messages(messages, session_scope)
              return []
  
@@ -7063,7 +7278,7 @@ index a8b159f1..e0029ea5 100644
          # Phase 6: Batch persist
          all_vectors = [r[2] for r in records]
          all_ids = [r[0] for r in records]
-@@ -1083,6 +1758,24 @@ class Memory(MemoryBase):
+@@ -1083,6 +1769,24 @@ class Memory(MemoryBase):
                  except Exception as e:
                      logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
  
@@ -7088,7 +7303,7 @@ index a8b159f1..e0029ea5 100644
          # Phase 7: Batch entity linking
          try:
              all_texts = [r[1] for r in records]
-@@ -1192,6 +1885,9 @@ class Memory(MemoryBase):
+@@ -1192,6 +1896,9 @@ class Memory(MemoryBase):
          # Phase 8: Save messages + return
          self.db.save_messages(messages, session_scope)
  
@@ -7098,7 +7313,7 @@ index a8b159f1..e0029ea5 100644
          returned_memories = [
              {"id": r[0], "memory": r[1], "event": "ADD"}
              for r in records
-@@ -1205,6 +1901,41 @@ class Memory(MemoryBase):
+@@ -1205,6 +1912,41 @@ class Memory(MemoryBase):
          )
          return returned_memories
  
@@ -7140,7 +7355,7 @@ index a8b159f1..e0029ea5 100644
      def get(self, memory_id):
          """
          Retrieve a memory by ID.
-@@ -1221,15 +1952,7 @@ class Memory(MemoryBase):
+@@ -1221,15 +1963,7 @@ class Memory(MemoryBase):
              display_first_run_notice(self, "sync", "get")
              return None
  
@@ -7157,7 +7372,7 @@ index a8b159f1..e0029ea5 100644
  
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
-@@ -1245,6 +1968,10 @@ class Memory(MemoryBase):
+@@ -1245,6 +1979,10 @@ class Memory(MemoryBase):
              if key in memory.payload:
                  result_item[key] = memory.payload[key]
  
@@ -7168,7 +7383,7 @@ index a8b159f1..e0029ea5 100644
          additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
          if additional_metadata:
              result_item["metadata"] = additional_metadata
-@@ -1258,6 +1985,9 @@ class Memory(MemoryBase):
+@@ -1258,6 +1996,9 @@ class Memory(MemoryBase):
          filters: Optional[Dict[str, Any]] = None,
          top_k: int = 20,
          show_expired: bool = False,
@@ -7178,7 +7393,7 @@ index a8b159f1..e0029ea5 100644
          **kwargs,
      ):
          """
-@@ -1269,6 +1999,13 @@ class Memory(MemoryBase):
+@@ -1269,6 +2010,13 @@ class Memory(MemoryBase):
                  Example: filters={"user_id": "u1", "agent_id": "a1"}
              top_k (int, optional): The maximum number of memories to return. Defaults to 20.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -7192,7 +7407,7 @@ index a8b159f1..e0029ea5 100644
  
          Returns:
              dict: A dictionary containing a list of memories under the "results" key.
-@@ -1315,7 +2052,9 @@ class Memory(MemoryBase):
+@@ -1315,7 +2063,9 @@ class Memory(MemoryBase):
              "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"}
          )
  
@@ -7203,7 +7418,7 @@ index a8b159f1..e0029ea5 100644
  
          if scale_threshold_notice:
              display_scale_threshold_notice(self, "sync", "get_all", *scale_threshold_notice)
-@@ -1323,8 +2062,20 @@ class Memory(MemoryBase):
+@@ -1323,8 +2073,20 @@ class Memory(MemoryBase):
              display_first_run_notice(self, "sync", "get_all")
          return {"results": all_memories_result}
  
@@ -7226,7 +7441,7 @@ index a8b159f1..e0029ea5 100644
  
          # Handle different vector store return formats by inspecting first element
          if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
-@@ -1339,15 +2090,7 @@ class Memory(MemoryBase):
+@@ -1339,15 +2101,7 @@ class Memory(MemoryBase):
          else:
              actual_memories = memories_result
  
@@ -7243,7 +7458,7 @@ index a8b159f1..e0029ea5 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          formatted_memories = []
-@@ -1366,6 +2109,9 @@ class Memory(MemoryBase):
+@@ -1366,6 +2120,9 @@ class Memory(MemoryBase):
                  if key in mem.payload:
                      memory_item_dict[key] = mem.payload[key]
  
@@ -7253,7 +7468,7 @@ index a8b159f1..e0029ea5 100644
              additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  memory_item_dict["metadata"] = additional_metadata
-@@ -1387,6 +2133,9 @@ class Memory(MemoryBase):
+@@ -1387,6 +2144,9 @@ class Memory(MemoryBase):
          explain: bool = False,
          reference_date: Optional[Any] = None,
          show_expired: bool = False,
@@ -7263,7 +7478,7 @@ index a8b159f1..e0029ea5 100644
          **kwargs,
      ):
          """
-@@ -1420,6 +2169,14 @@ class Memory(MemoryBase):
+@@ -1420,6 +2180,14 @@ class Memory(MemoryBase):
              explain (bool, optional): Whether to include score_details for each result. Defaults to False.
              reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -7278,7 +7493,7 @@ index a8b159f1..e0029ea5 100644
  
          Returns:
              dict: A dictionary containing the search results under a "results" key.
-@@ -1492,7 +2249,12 @@ class Memory(MemoryBase):
+@@ -1492,7 +2260,12 @@ class Memory(MemoryBase):
  
          search_start = time.perf_counter()
          original_memories = self._search_vector_store(
@@ -7292,7 +7507,7 @@ index a8b159f1..e0029ea5 100644
          )
          search_elapsed_seconds = time.perf_counter() - search_start
  
-@@ -1504,6 +2266,10 @@ class Memory(MemoryBase):
+@@ -1504,6 +2277,10 @@ class Memory(MemoryBase):
              except Exception as e:
                  logger.warning(f"Reranking failed, using original results: {e}")
  
@@ -7303,17 +7518,17 @@ index a8b159f1..e0029ea5 100644
          if temporal_usage_notice:
              display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
          elif scale_threshold_notice:
-@@ -1677,6 +2443,9 @@ class Memory(MemoryBase):
+@@ -1677,6 +2454,9 @@ class Memory(MemoryBase):
              })
  
          # Step 8: Score and rank
 +        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
 +        # 图分支与 BM25 / 实体加分的取数并列：超时或异常一律按「本次无图信号」处理。
-+        graph_boosts, graph_facts = _compute_graph_hits(self, query, candidates, filters)
++        graph_boosts, graph_facts, graph_status = _compute_graph_hits(self, query, candidates, filters)
          scored_results = score_and_rank(
              semantic_results=candidates,
              bm25_scores=bm25_scores,
-@@ -1684,18 +2453,13 @@ class Memory(MemoryBase):
+@@ -1684,18 +2464,13 @@ class Memory(MemoryBase):
              threshold=threshold,
              top_k=limit,
              explain=explain,
@@ -7336,7 +7551,7 @@ index a8b159f1..e0029ea5 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          original_memories = []
-@@ -1718,6 +2482,9 @@ class Memory(MemoryBase):
+@@ -1718,6 +2493,9 @@ class Memory(MemoryBase):
                  if key in payload:
                      memory_item_dict[key] = payload[key]
  
@@ -7346,7 +7561,19 @@ index a8b159f1..e0029ea5 100644
              additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  if not memory_item_dict.get("metadata"):
-@@ -1753,7 +2520,7 @@ class Memory(MemoryBase):
+@@ -1726,6 +2504,11 @@ class Memory(MemoryBase):
+             if explain and "score_details" in scored:
+                 memory_item_dict["score_details"] = scored["score_details"]
+ 
++            # 图分支的本次状态随结果条目发布（设计 §6.4、§8）：调用方据此区分「图确实没
++            # 贡献」（`ok` 但加分为 0）与「图没答上来」（`timeout` / `error`），并在关闭态
++            # 直接读到 `disabled`，不必靠键缺失去猜。
++            memory_item_dict["graph_status"] = graph_status
++
+             original_memories.append(memory_item_dict)
+ 
+         return original_memories
+@@ -1753,7 +2536,7 @@ class Memory(MemoryBase):
          if not deduped:
              return {}
  
@@ -7355,7 +7582,7 @@ index a8b159f1..e0029ea5 100644
          memory_boosts = {}
  
          try:
-@@ -2188,6 +2955,11 @@ class AsyncMemory(MemoryBase):
+@@ -2188,6 +2971,11 @@ class AsyncMemory(MemoryBase):
          self.custom_instructions = self.config.custom_instructions
          self._entity_store = None
  
@@ -7367,7 +7594,7 @@ index a8b159f1..e0029ea5 100644
          # Initialize reranker if configured
          self.reranker = None
          if config.reranker:
-@@ -2220,6 +2992,18 @@ class AsyncMemory(MemoryBase):
+@@ -2220,6 +3008,18 @@ class AsyncMemory(MemoryBase):
      def project(self):
          return _AsyncOSSProject()
  
@@ -7386,7 +7613,7 @@ index a8b159f1..e0029ea5 100644
      @property
      def entity_store(self):
          """Lazily initialize entity store on first use."""
-@@ -2582,14 +3366,15 @@ class AsyncMemory(MemoryBase):
+@@ -2582,14 +3382,15 @@ class AsyncMemory(MemoryBase):
          parsed_messages = parse_messages(messages)
  
          # Phase 1: Existing memory retrieval
@@ -7404,7 +7631,7 @@ index a8b159f1..e0029ea5 100644
          )
  
          # Map UUIDs to integers (anti-hallucination)
-@@ -2693,6 +3478,8 @@ class AsyncMemory(MemoryBase):
+@@ -2693,6 +3494,8 @@ class AsyncMemory(MemoryBase):
              mem_metadata["updated_at"] = mem_metadata["created_at"]
              if mem.get("attributed_to"):
                  mem_metadata["attributed_to"] = mem["attributed_to"]
@@ -7413,7 +7640,7 @@ index a8b159f1..e0029ea5 100644
  
              records.append((memory_id, text, embed_map[text], mem_metadata))
  
-@@ -2700,6 +3487,12 @@ class AsyncMemory(MemoryBase):
+@@ -2700,6 +3503,12 @@ class AsyncMemory(MemoryBase):
              await asyncio.to_thread(self.db.save_messages, messages, session_scope)
              return []
  
@@ -7426,7 +7653,7 @@ index a8b159f1..e0029ea5 100644
          # Phase 6: Batch persist
          all_vectors = [r[2] for r in records]
          all_ids = [r[0] for r in records]
-@@ -2743,6 +3536,28 @@ class AsyncMemory(MemoryBase):
+@@ -2743,6 +3552,28 @@ class AsyncMemory(MemoryBase):
                  except Exception as e:
                      logger.error(f"Failed to add history for {hr['memory_id']} (async): {e}")
  
@@ -7455,7 +7682,7 @@ index a8b159f1..e0029ea5 100644
          # Phase 7: Batch entity linking
          try:
              all_texts = [r[1] for r in records]
-@@ -2850,6 +3665,9 @@ class AsyncMemory(MemoryBase):
+@@ -2850,6 +3681,9 @@ class AsyncMemory(MemoryBase):
          # Phase 8: Save messages + return
          await asyncio.to_thread(self.db.save_messages, messages, session_scope)
  
@@ -7465,7 +7692,7 @@ index a8b159f1..e0029ea5 100644
          returned_memories = [
              {"id": r[0], "memory": r[1], "event": "ADD"}
              for r in records
-@@ -2863,6 +3681,38 @@ class AsyncMemory(MemoryBase):
+@@ -2863,6 +3697,38 @@ class AsyncMemory(MemoryBase):
          )
          return returned_memories
  
@@ -7504,7 +7731,7 @@ index a8b159f1..e0029ea5 100644
      async def get(self, memory_id):
          """
          Retrieve a memory by ID asynchronously.
-@@ -2879,15 +3729,7 @@ class AsyncMemory(MemoryBase):
+@@ -2879,15 +3745,7 @@ class AsyncMemory(MemoryBase):
              await display_first_run_notice_async(self, "async", "get")
              return None
  
@@ -7521,7 +7748,7 @@ index a8b159f1..e0029ea5 100644
  
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
-@@ -2903,6 +3745,10 @@ class AsyncMemory(MemoryBase):
+@@ -2903,6 +3761,10 @@ class AsyncMemory(MemoryBase):
              if key in memory.payload:
                  result_item[key] = memory.payload[key]
  
@@ -7532,7 +7759,7 @@ index a8b159f1..e0029ea5 100644
          additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
          if additional_metadata:
              result_item["metadata"] = additional_metadata
-@@ -2916,6 +3762,9 @@ class AsyncMemory(MemoryBase):
+@@ -2916,6 +3778,9 @@ class AsyncMemory(MemoryBase):
          filters: Optional[Dict[str, Any]] = None,
          top_k: int = 20,
          show_expired: bool = False,
@@ -7542,7 +7769,7 @@ index a8b159f1..e0029ea5 100644
          **kwargs,
      ):
          """
-@@ -2927,6 +3776,10 @@ class AsyncMemory(MemoryBase):
+@@ -2927,6 +3792,10 @@ class AsyncMemory(MemoryBase):
                  Example: filters={"user_id": "u1", "agent_id": "a1"}
              top_k (int, optional): The maximum number of memories to return. Defaults to 20.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -7553,7 +7780,7 @@ index a8b159f1..e0029ea5 100644
  
          Returns:
              dict: A dictionary containing a list of memories under the "results" key.
-@@ -2973,7 +3826,9 @@ class AsyncMemory(MemoryBase):
+@@ -2973,7 +3842,9 @@ class AsyncMemory(MemoryBase):
              "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"}
          )
  
@@ -7564,7 +7791,7 @@ index a8b159f1..e0029ea5 100644
  
          if scale_threshold_notice:
              await display_scale_threshold_notice_async(self, "async", "get_all", *scale_threshold_notice)
-@@ -2981,8 +3836,21 @@ class AsyncMemory(MemoryBase):
+@@ -2981,8 +3852,21 @@ class AsyncMemory(MemoryBase):
              await display_first_run_notice_async(self, "async", "get_all")
          return {"results": all_memories_result}
  
@@ -7588,7 +7815,7 @@ index a8b159f1..e0029ea5 100644
  
          # Handle different vector store return formats by inspecting first element
          if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
-@@ -2997,15 +3865,7 @@ class AsyncMemory(MemoryBase):
+@@ -2997,15 +3881,7 @@ class AsyncMemory(MemoryBase):
          else:
              actual_memories = memories_result
  
@@ -7605,7 +7832,7 @@ index a8b159f1..e0029ea5 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          formatted_memories = []
-@@ -3024,6 +3884,9 @@ class AsyncMemory(MemoryBase):
+@@ -3024,6 +3900,9 @@ class AsyncMemory(MemoryBase):
                  if key in mem.payload:
                      memory_item_dict[key] = mem.payload[key]
  
@@ -7615,7 +7842,7 @@ index a8b159f1..e0029ea5 100644
              additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  memory_item_dict["metadata"] = additional_metadata
-@@ -3045,6 +3908,9 @@ class AsyncMemory(MemoryBase):
+@@ -3045,6 +3924,9 @@ class AsyncMemory(MemoryBase):
          explain: bool = False,
          reference_date: Optional[Any] = None,
          show_expired: bool = False,
@@ -7625,7 +7852,7 @@ index a8b159f1..e0029ea5 100644
          **kwargs,
      ):
          """
-@@ -3078,6 +3944,14 @@ class AsyncMemory(MemoryBase):
+@@ -3078,6 +3960,14 @@ class AsyncMemory(MemoryBase):
              explain (bool, optional): Whether to include score_details for each result. Defaults to False.
              reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -7640,7 +7867,7 @@ index a8b159f1..e0029ea5 100644
  
          Returns:
              dict: A dictionary containing the search results under a "results" key.
-@@ -3154,7 +4028,12 @@ class AsyncMemory(MemoryBase):
+@@ -3154,7 +4044,12 @@ class AsyncMemory(MemoryBase):
  
          search_start = time.perf_counter()
          original_memories = await self._search_vector_store(
@@ -7654,7 +7881,7 @@ index a8b159f1..e0029ea5 100644
          )
          search_elapsed_seconds = time.perf_counter() - search_start
  
-@@ -3169,6 +4048,10 @@ class AsyncMemory(MemoryBase):
+@@ -3169,6 +4064,10 @@ class AsyncMemory(MemoryBase):
              except Exception as e:
                  logger.warning(f"Reranking failed, using original results: {e}")
  
@@ -7665,19 +7892,19 @@ index a8b159f1..e0029ea5 100644
          if temporal_usage_notice:
              await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
          elif scale_threshold_notice:
-@@ -3341,6 +4224,11 @@ class AsyncMemory(MemoryBase):
+@@ -3341,6 +4240,11 @@ class AsyncMemory(MemoryBase):
              })
  
          # Step 8: Score and rank
 +        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
 +        # 图分支走 to_thread（同步 HTTP + 硬超时），不阻塞事件循环（设计 §6.1）。
-+        graph_boosts, graph_facts = await asyncio.to_thread(
++        graph_boosts, graph_facts, graph_status = await asyncio.to_thread(
 +            _compute_graph_hits, self, query, candidates, filters
 +        )
          scored_results = score_and_rank(
              semantic_results=candidates,
              bm25_scores=bm25_scores,
-@@ -3348,18 +4236,13 @@ class AsyncMemory(MemoryBase):
+@@ -3348,18 +4252,13 @@ class AsyncMemory(MemoryBase):
              threshold=threshold,
              top_k=limit,
              explain=explain,
@@ -7700,7 +7927,7 @@ index a8b159f1..e0029ea5 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          original_memories = []
-@@ -3381,6 +4264,9 @@ class AsyncMemory(MemoryBase):
+@@ -3381,6 +4280,9 @@ class AsyncMemory(MemoryBase):
                  if key in payload:
                      memory_item_dict[key] = payload[key]
  
@@ -7710,7 +7937,19 @@ index a8b159f1..e0029ea5 100644
              additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  if not memory_item_dict.get("metadata"):
-@@ -3406,7 +4292,7 @@ class AsyncMemory(MemoryBase):
+@@ -3389,6 +4291,11 @@ class AsyncMemory(MemoryBase):
+             if explain and "score_details" in scored:
+                 memory_item_dict["score_details"] = scored["score_details"]
+ 
++            # 图分支的本次状态随结果条目发布（设计 §6.4、§8）：调用方据此区分「图确实没
++            # 贡献」（`ok` 但加分为 0）与「图没答上来」（`timeout` / `error`），并在关闭态
++            # 直接读到 `disabled`，不必靠键缺失去猜。
++            memory_item_dict["graph_status"] = graph_status
++
+             original_memories.append(memory_item_dict)
+ 
+         return original_memories
+@@ -3406,7 +4313,7 @@ class AsyncMemory(MemoryBase):
          if not deduped:
              return {}
  
@@ -8040,10 +8279,10 @@ index b48e03c9..a59b319c 100644
          return result
  
 diff --git a/server/.env.example b/server/.env.example
-index 3e44034a..721c3633 100644
+index 3e44034a..d69dfc91 100644
 --- a/server/.env.example
 +++ b/server/.env.example
-@@ -29,6 +29,56 @@ MEM0_DEFAULT_EMBEDDER_MODEL=text-embedding-3-small
+@@ -29,6 +29,59 @@ MEM0_DEFAULT_EMBEDDER_MODEL=text-embedding-3-small
  # Set to false to opt out.
  MEM0_TELEMETRY=true
  
@@ -8081,7 +8320,10 @@ index 3e44034a..721c3633 100644
 +MEM0_GRAPH_WEIGHT=
 +# Facts taken from one graph search (default 10).
 +MEM0_GRAPH_MAX_FACTS=
-+# Hard timeout budget for the graph branch of /search, in seconds (default 0.4).
++# Hard timeout budget for the graph branch of /search, in seconds (default 1.0). Measured
++# bridge /search latency (n=100): p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max
++# 0.842s, so 0.4s cut off ~14% of normal requests; a timeout is now reported as
++# `graph_status: "timeout"` on every search result instead of silently dropping the signal.
 +MEM0_GRAPH_TIMEOUT_SECONDS=
 +# Adopt graph facts already invalidated on the graph side (default false).
 +MEM0_GRAPH_INCLUDE_INVALIDATED=
@@ -10673,7 +10915,7 @@ index 00000000..9c4bff10
 +fastapi>=0.115.0
 +uvicorn[standard]>=0.30.0
 diff --git a/server/main.py b/server/main.py
-index 20059fb8..7c3b520e 100644
+index 20059fb8..d6ca26f5 100644
 --- a/server/main.py
 +++ b/server/main.py
 @@ -1,13 +1,18 @@
@@ -10695,7 +10937,7 @@ index 20059fb8..7c3b520e 100644
  from errors import (
      UpstreamError,
      install_request_id_logging,
-@@ -18,12 +23,13 @@ from errors import (
+@@ -18,13 +23,15 @@ from errors import (
  )
  from fastapi import Depends, FastAPI, HTTPException, Query, Request
  from fastapi.middleware.cors import CORSMiddleware
@@ -10708,9 +10950,11 @@ index 20059fb8..7c3b520e 100644
  from routers import auth as auth_router
 +from routers import dream as dream_router
  from routers import entities as entities_router
++from routers import graph as graph_router
  from routers import requests as requests_router
  from schemas import MessageResponse
-@@ -113,29 +119,114 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
+ from server_state import (
+@@ -113,29 +120,114 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
  POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
  
  OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -10792,7 +11036,7 @@ index 20059fb8..7c3b520e 100644
 +    "endpoint": os.environ.get("MEM0_GRAPH_ENDPOINT", "http://graph-bridge:8000"),
 +    "weight": _env_number("MEM0_GRAPH_WEIGHT", 0.5, float),
 +    "max_facts": _env_number("MEM0_GRAPH_MAX_FACTS", 10, int),
-+    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 0.4, float),
++    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 1.0, float),
 +    "include_invalidated": _env_flag("MEM0_GRAPH_INCLUDE_INVALIDATED", False),
 +    "queue_size": _env_number("MEM0_GRAPH_QUEUE_SIZE", 1000, int),
 +    "max_retries": _env_number("MEM0_GRAPH_MAX_RETRIES", 3, int),
@@ -10834,7 +11078,7 @@ index 20059fb8..7c3b520e 100644
  }
  
  
-@@ -143,6 +234,27 @@ set_session_factory(SessionLocal)
+@@ -143,6 +235,27 @@ set_session_factory(SessionLocal)
  initialize_state(DEFAULT_CONFIG)
  
  
@@ -10862,7 +11106,7 @@ index 20059fb8..7c3b520e 100644
  app = FastAPI(
      title="Mem0 REST APIs",
      description=(
-@@ -153,6 +265,7 @@ app = FastAPI(
+@@ -153,6 +266,7 @@ app = FastAPI(
      ),
      version="1.0.0",
      redirect_slashes=False,
@@ -10870,15 +11114,16 @@ index 20059fb8..7c3b520e 100644
  )
  app.state.limiter = limiter
  app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-@@ -170,6 +283,7 @@ app.include_router(auth_router.router)
+@@ -170,6 +284,8 @@ app.include_router(auth_router.router)
  app.include_router(api_keys_router.router)
  app.include_router(entities_router.router)
  app.include_router(requests_router.router)
 +app.include_router(dream_router.router)
++app.include_router(graph_router.router)
  
  
  class Message(BaseModel):
-@@ -205,6 +319,21 @@ class SearchRequest(BaseModel):
+@@ -205,6 +321,21 @@ class SearchRequest(BaseModel):
      threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
      explain: Optional[bool] = Field(None, description="Include score details for each search result.")
      show_expired: Optional[bool] = Field(None, description="Include expired memories.")
@@ -10900,7 +11145,7 @@ index 20059fb8..7c3b520e 100644
  
  
  class GenerateInstructionsRequest(BaseModel):
-@@ -383,7 +512,33 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
+@@ -383,7 +514,33 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
  
  
  ALL_MEMORIES_LIMIT = 1000
@@ -10935,7 +11180,7 @@ index 20059fb8..7c3b520e 100644
  
  
  def _serialize_memory(row: Any) -> Dict[str, Any]:
-@@ -396,16 +551,57 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
+@@ -396,16 +553,57 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
          "run_id": payload.get("run_id"),
          "hash": payload.get("hash"),
          "expiration_date": payload.get("expiration_date"),
@@ -10997,7 +11242,7 @@ index 20059fb8..7c3b520e 100644
  
  
  @app.get("/memories", summary="Get memories")
-@@ -415,17 +611,22 @@ def get_all_memories(
+@@ -415,17 +613,22 @@ def get_all_memories(
      run_id: Optional[str] = None,
      agent_id: Optional[str] = None,
      top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
@@ -11022,7 +11267,7 @@ index 20059fb8..7c3b520e 100644
          filters = {
              k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
          }
-@@ -433,6 +634,10 @@ def get_all_memories(
+@@ -433,6 +636,10 @@ def get_all_memories(
          if top_k is not None:
              params["top_k"] = top_k
          params["show_expired"] = show_expired
@@ -11033,7 +11278,7 @@ index 20059fb8..7c3b520e 100644
          return get_memory_instance().get_all(**params)
      except HTTPException:
          raise
-@@ -440,6 +645,82 @@ def get_all_memories(
+@@ -440,6 +647,82 @@ def get_all_memories(
          raise upstream_error()
  
  
@@ -11116,7 +11361,7 @@ index 20059fb8..7c3b520e 100644
  @app.get("/memories/{memory_id}", summary="Get a memory")
  def get_memory(memory_id: str, _auth=Depends(verify_auth)):
      """Retrieve a specific memory by ID."""
-@@ -475,6 +756,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+@@ -475,6 +758,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
              params["explain"] = search_req.explain
          if search_req.show_expired is not None:
              params["show_expired"] = search_req.show_expired
@@ -11506,6 +11751,88 @@ index 621b67d4..65c3537d 100644
      return [getattr(row, "payload", None) or {} for row in rows]
  
  
+diff --git a/server/routers/graph.py b/server/routers/graph.py
+new file mode 100644
+index 00000000..a7248219
+--- /dev/null
++++ b/server/routers/graph.py
+@@ -0,0 +1,76 @@
++"""图能力的只读观测端点（设计 `docs/design/graph-memory.md` §8）。
++
++一个端点：`GET /graph/stats` 返回图派发计数器与熔断状态的当前值，使「队列有界且可观测」
++这类判据可以由实际读数判定，而不必拿图桥的访问日志当代理（日志里看不到冷却窗口内的
++「跳过」）。
++
++只读：不触发派发、不发起图调用、不改配置。计数来自进程内的 `GraphSync`（首次派发时
++惰性创建），因此关闭态——以及开启但本进程尚未派发过任何事实时——全部读数为 0。
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Dict
++
++from auth import verify_auth
++from fastapi import APIRouter, Depends, HTTPException
++from server_state import get_memory_instance
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(tags=["graph"])
++
++# 计数器键（设计 §8）：派发 / 同步成功 / 幂等跳过 / 失败 / 丢弃。
++COUNTER_KEYS = (
++    "graph_dispatched",
++    "graph_synced",
++    "graph_already_synced",
++    "graph_failed",
++    "graph_dropped",
++)
++
++# 能力开启但本进程尚未派发时，`GraphSync.stats()` 不存在，此时给出的零读数。
++_EMPTY_STATS: Dict[str, Any] = {}
++
++
++def _stats_of(memory: Any) -> Dict[str, Any]:
++    """取实例上图派发器的计数快照。
++
++    这里**不**调用 `_graph_sync_of`：观测端点不得因为被读取就创建派发器（那会连带
++    建出图桥 HTTP 客户端）。未创建即视为零读数。
++    """
++    sync = getattr(memory, "_graph_sync", None)
++    if sync is None:
++        return _EMPTY_STATS
++    try:
++        return sync.stats()
++    except Exception as exc:  # noqa: BLE001 - 观测面不得因读数失败而 5xx
++        logger.warning("Reading graph dispatch counters failed: %s", exc)
++        return _EMPTY_STATS
++
++
++@router.get("/graph/stats", summary="Graph dispatch counters")
++def graph_stats(_auth=Depends(verify_auth)) -> Dict[str, Any]:
++    """图派发计数与熔断状态（只读快照）。
++
++    返回 `enabled`（总开关）、`timeout_seconds`（生效的图检索预算，超时因此可解释）、
++    五项 `graph_*` 计数，以及熔断状态、连续失败数与队列当前长度。
++    """
++    try:
++        memory = get_memory_instance()
++    except RuntimeError as exc:
++        raise HTTPException(status_code=503, detail="Mem0 runtime has not been initialized.") from exc
++
++    config = getattr(getattr(memory, "config", None), "graph", None)
++    stats = _stats_of(memory)
++
++    payload: Dict[str, Any] = {
++        "enabled": bool(getattr(config, "enabled", False)),
++        "timeout_seconds": getattr(config, "timeout_seconds", None),
++        "circuit_open": bool(stats.get("circuit_open", False)),
++        "consecutive_failures": int(stats.get("consecutive_failures", 0)),
++        "queue_size": int(stats.get("queue_size", 0)),
++    }
++    payload.update({key: int(stats.get(key, 0)) for key in COUNTER_KEYS})
++    return payload
 diff --git a/server/routers/requests.py b/server/routers/requests.py
 index 3e226e30..1b520063 100644
 --- a/server/routers/requests.py
@@ -12826,10 +13153,10 @@ index 00000000..d9b345c6
 +        assert store.payload_writes == []
 diff --git a/tests/memory/test_graph_search.py b/tests/memory/test_graph_search.py
 new file mode 100644
-index 00000000..5ffb9a2e
+index 00000000..911383ea
 --- /dev/null
 +++ b/tests/memory/test_graph_search.py
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,192 @@
 +"""Tests for the graph signal in the retrieval layer (design: docs/design/graph-memory.md).
 +
 +Two concerns are covered here:
@@ -12843,6 +13170,7 @@ index 00000000..5ffb9a2e
 +from types import SimpleNamespace
 +from unittest.mock import MagicMock
 +
++import httpx
 +import pytest
 +
 +from mem0.configs.base import GraphConfig, MemoryConfig
@@ -12955,14 +13283,18 @@ index 00000000..5ffb9a2e
 +        return memory
 +
 +    def test_disabled_returns_none(self):
-+        boosts, facts = memory_main._compute_graph_hits(self._memory(enabled=False), "q", [{"id": "a"}], {"user_id": "u"})
++        boosts, facts, status = memory_main._compute_graph_hits(
++            self._memory(enabled=False), "q", [{"id": "a"}], {"user_id": "u"}
++        )
 +        assert boosts is None and facts is None
++        assert status == "disabled"
 +
 +    def test_enabled_without_scope_returns_empty(self):
 +        memory = self._memory(enabled=True)
 +        memory._graph_bridge_client = MagicMock()
-+        boosts, facts = memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {})
++        boosts, facts, status = memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {})
 +        assert boosts == {} and facts == {}
++        assert status == "skipped"
 +        memory._graph_bridge_client.search.assert_not_called()
 +
 +    def test_enabled_maps_facts_to_boosts(self, monkeypatch):
@@ -12970,11 +13302,12 @@ index 00000000..5ffb9a2e
 +        client = MagicMock()
 +        client.search.return_value = {"facts": [{"episodes": ["a"], "invalid_at": None}]}
 +        memory._graph_bridge_client = client
-+        boosts, facts = memory_main._compute_graph_hits(
++        boosts, facts, status = memory_main._compute_graph_hits(
 +            memory, "q", [{"id": "a"}, {"id": "b"}], {"user_id": "test_graph_a"}
 +        )
 +        assert boosts == {"a": pytest.approx(0.5)}
 +        assert facts == {"a": 1}
++        assert status == "ok"
 +        payload, timeout = client.search.call_args[0]
 +        assert payload["group_ids"] == ["mem0_test_graph_a"]
 +        assert payload["query"] == "q"
@@ -12984,7 +13317,19 @@ index 00000000..5ffb9a2e
 +        client = MagicMock()
 +        client.search.side_effect = RuntimeError("bridge down")
 +        memory._graph_bridge_client = client
-+        assert memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {"user_id": "u"}) == ({}, {})
++        assert memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {"user_id": "u"}) == ({}, {}, "error")
++
++    def test_budget_timeout_is_reported_not_swallowed(self):
++        """[AC-3] 预算内超时必须作为显式状态出现，不得与「图答了但没命中」同形。"""
++        memory = self._memory(enabled=True, timeout_seconds=0.001)
++        client = MagicMock()
++        client.search.side_effect = httpx.ReadTimeout("budget exceeded")
++        memory._graph_bridge_client = client
++        boosts, facts, status = memory_main._compute_graph_hits(
++            memory, "q", [{"id": "a"}], {"user_id": "test_graph_a"}
++        )
++        assert (boosts, facts) == ({}, {})
++        assert status == "timeout"
 +
 +    def test_dispatch_skipped_when_disabled(self):
 +        memory = self._memory(enabled=False)
@@ -13006,10 +13351,10 @@ index 00000000..5ffb9a2e
 +            sync.close()
 diff --git a/tests/memory/test_graph_sync.py b/tests/memory/test_graph_sync.py
 new file mode 100644
-index 00000000..bd614648
+index 00000000..a9921185
 --- /dev/null
 +++ b/tests/memory/test_graph_sync.py
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,308 @@
 +"""Tests for graph memory (design: docs/design/graph-memory.md).
 +
 +Two concerns are covered here:
@@ -13024,6 +13369,7 @@ index 00000000..bd614648
 +import time
 +from types import SimpleNamespace
 +
++import httpx
 +import pytest
 +
 +from mem0.configs.base import GraphConfig, MemoryConfig
@@ -13033,6 +13379,7 @@ index 00000000..bd614648
 +    derive_group_id,
 +    sanitize_group_id,
 +    search_graph_facts,
++    search_graph_facts_with_status,
 +)
 +
 +
@@ -13062,6 +13409,13 @@ index 00000000..bd614648
 +
 +    def close(self):
 +        self.closed = True
++
++
++class _TimeoutClient:
++    """Stand-in that always exceeds the per-call budget."""
++
++    def search(self, _payload, _timeout_seconds):
++        raise httpx.ReadTimeout("budget exceeded")
 +
 +
 +def _memory(**graph_overrides):
@@ -13165,6 +13519,30 @@ index 00000000..bd614648
 +        assert search_graph_facts(client, "mem0_test_graph_a", "", 5, 0.4) == []
 +        assert client.calls == []
 +
++    def test_status_is_ok_when_the_bridge_answers(self):
++        """答了但没命中仍是 `ok`：与「没答上来」必须区分（设计 §8）。"""
++        facts, status = search_graph_facts_with_status(_CountingClient(), "mem0_test_graph_a", "q", 5, 0.4)
++        assert facts == [] and status == "ok"
++
++    def test_status_marks_a_budget_timeout(self):
++        """[AC-3] 预算内超时是显式状态，不再与「无命中」同形。"""
++        facts, status = search_graph_facts_with_status(_TimeoutClient(), "mem0_test_graph_a", "q", 5, 0.4)
++        assert facts == [] and status == "timeout"
++
++    def test_status_marks_a_bridge_failure_and_a_malformed_payload(self):
++        facts, status = search_graph_facts_with_status(_CountingClient(failures=1), "mem0_test_graph_a", "q", 5, 0.4)
++        assert facts == [] and status == "error"
++
++        client = SimpleNamespace(search=lambda payload, timeout: {"facts": "nope"})
++        facts, status = search_graph_facts_with_status(client, "mem0_test_graph_a", "q", 5, 0.4)
++        assert facts == [] and status == "error"
++
++    def test_status_marks_a_skipped_lookup(self):
++        client = _CountingClient()
++        facts, status = search_graph_facts_with_status(client, None, "q", 5, 0.4)
++        assert facts == [] and status == "skipped"
++        assert client.calls == []
++
 +
 +class TestDispatchQueue:
 +    """[AC-6][AC-9][AC-25] 派发不阻塞写入路径，队列有界且失败可观测。"""
@@ -13187,10 +13565,13 @@ index 00000000..bd614648
 +        finally:
 +            sync.close()
 +
-+    def test_queue_overflow_drops_oldest_and_counts(self):
++    def test_queue_overflow_drops_oldest_and_counts(self, monkeypatch):
 +        client = _CountingClient()
-+        # worker 不启动：只验证入队路径的有界性。
 +        sync = GraphSync(GraphConfig(enabled=True, queue_size=2), client=client)
++        # worker 不启动：只验证入队路径的有界性。`dispatch()` 末行会惰性启动 worker 并
++        # 排空队列，「投递与排空的交错」取决于线程调度（同一命令连跑 10 次曾 5 次得到
++        # dropped=2），因此必须把 `start()` 显式置为空操作，断言才只覆盖入队路径。
++        monkeypatch.setattr(sync, "start", lambda: None)
 +        for index in range(5):
 +            sync.dispatch(f"m{index}", "text", None, "mem0_test_graph_a")
 +        stats = sync.stats()
@@ -14272,6 +14653,153 @@ index 00000000..64d42cd8
 +        assert parsed["candidates"][0]["decision"] == "would_write"
 +        for field in ("observation_key", "members", "text", "source_memory_ids", "evidence_count", "decision", "skip_reason"):
 +            assert field in parsed["candidates"][0]
+diff --git a/tests/test_graph_router.py b/tests/test_graph_router.py
+new file mode 100644
+index 00000000..2bc8a7ad
+--- /dev/null
++++ b/tests/test_graph_router.py
+@@ -0,0 +1,141 @@
++"""Tests for the graph observability router (design: docs/design/graph-memory.md §8).
++
++`GET /graph/stats` is the read path that makes the graph dispatch counters judgeable
++without the bridge access log as a proxy (the log shows nothing for the dispatches the
++circuit breaker drops), so these tests pin three things without a live server:
++
++  * the five counters plus the circuit / queue readings are passed through untouched;
++  * a capability that was switched on but never dispatched reads as zeros;
++  * reading the endpoint never materialises a dispatcher (that would build a bridge
++    HTTP client as a side effect of looking at the numbers).
++"""
++
++import os
++import sys
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++pytest.importorskip("fastapi", reason="fastapi not installed")
++
++from fastapi import FastAPI  # noqa: E402
++from fastapi.testclient import TestClient  # noqa: E402
++
++# `server/` is a flat module directory (`auth`, `routers.*` are imported by bare name)
++# because the container runs uvicorn with PYTHONPATH=/app. Tests run from the repo root,
++# so put the flat directory on the path the same way before importing them.
++_SERVER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server")
++if _SERVER_DIR not in sys.path:
++    sys.path.insert(0, _SERVER_DIR)
++
++from auth import verify_auth  # noqa: E402
++from mem0.configs.base import GraphConfig  # noqa: E402
++from routers import graph as graph_router  # noqa: E402
++
++REQUIRED_COUNTERS = ("graph_dispatched", "graph_synced", "graph_dropped", "graph_failed")
++
++
++class _SyncStub:
++    """Counts reads so a test can prove the endpoint hit the dispatcher exactly once."""
++
++    def __init__(self, **stats):
++        self._stats = stats
++        self.stats_calls = 0
++
++    def stats(self):
++        self.stats_calls += 1
++        return dict(self._stats)
++
++
++def _memory(enabled, sync=None, timeout_seconds=0.4):
++    config = SimpleNamespace(graph=GraphConfig(enabled=enabled, timeout_seconds=timeout_seconds))
++    memory = SimpleNamespace(config=config)
++    if sync is not None:
++        memory._graph_sync = sync
++    return memory
++
++
++def _client(memory):
++    app = FastAPI()
++    app.include_router(graph_router.router)
++    app.dependency_overrides[verify_auth] = lambda: None
++    patcher = patch.object(graph_router, "get_memory_instance", lambda: memory)
++    patcher.start()
++    client = TestClient(app)
++    client._patcher = patcher
++    return client
++
++
++class TestGraphStats:
++    def test_counters_are_passed_through(self):
++        sync = _SyncStub(
++            graph_dispatched=5,
++            graph_synced=3,
++            graph_already_synced=1,
++            graph_failed=1,
++            graph_dropped=2,
++            consecutive_failures=1,
++            queue_size=4,
++            circuit_open=True,
++        )
++        client = _client(_memory(True, sync, timeout_seconds=0.8))
++        try:
++            response = client.get("/graph/stats")
++            assert response.status_code == 200
++            body = response.json()
++            assert body["graph_dispatched"] == 5
++            assert body["graph_synced"] == 3
++            assert body["graph_already_synced"] == 1
++            assert body["graph_failed"] == 1
++            assert body["graph_dropped"] == 2
++            assert body["circuit_open"] is True
++            assert body["consecutive_failures"] == 1
++            assert body["queue_size"] == 4
++            assert body["enabled"] is True
++            assert body["timeout_seconds"] == 0.8
++            assert sync.stats_calls == 1
++        finally:
++            client._patcher.stop()
++
++    def test_the_judged_counters_are_always_published(self):
++        """[AC-9]/[AC-25] 的判定面：四个计数器在任何状态下都可读。"""
++        client = _client(_memory(True, _SyncStub()))
++        try:
++            body = client.get("/graph/stats").json()
++            assert all(key in body for key in REQUIRED_COUNTERS)
++        finally:
++            client._patcher.stop()
++
++    def test_disabled_capability_reads_as_zeros(self):
++        client = _client(_memory(False))
++        try:
++            body = client.get("/graph/stats").json()
++            assert body["enabled"] is False
++            assert all(body[key] == 0 for key in graph_router.COUNTER_KEYS)
++            assert body["circuit_open"] is False
++        finally:
++            client._patcher.stop()
++
++    def test_never_dispatched_reads_as_zeros_without_creating_a_dispatcher(self):
++        memory = _memory(True)
++        client = _client(memory)
++        try:
++            body = client.get("/graph/stats").json()
++            assert body["enabled"] is True
++            assert all(body[key] == 0 for key in graph_router.COUNTER_KEYS)
++            assert getattr(memory, "_graph_sync", None) is None
++        finally:
++            client._patcher.stop()
++
++    def test_uninitialized_runtime_is_503(self):
++        app = FastAPI()
++        app.include_router(graph_router.router)
++        app.dependency_overrides[verify_auth] = lambda: None
++
++        def _raise():
++            raise RuntimeError("Mem0 runtime has not been initialized.")
++
++        with patch.object(graph_router, "get_memory_instance", _raise):
++            response = TestClient(app).get("/graph/stats")
++        assert response.status_code == 503
 diff --git a/tests/test_main.py b/tests/test_main.py
 index 0e6aed4f..9c8c1c4e 100644
 --- a/tests/test_main.py
