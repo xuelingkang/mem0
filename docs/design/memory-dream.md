@@ -439,7 +439,7 @@ user prompt：`## Facts\n<JSON 数组>\n\n# Output:`，与既有 `generate_contr
 | 单轮超时 | `dream_run_timeout_seconds`（默认 1800）。超时后中断 Consolidate，已落地的观察保留，未处理的簇留待下一轮 |
 | 失败重试 | 单簇失败不重试；整轮失败（Orient/Gather/Prune 抛异常）由下一周期自然重试 |
 | 关停 | 进程停止信号触发事件，线程在单簇边界处退出 |
-| 降级 | `dream_enabled=false`（默认）时不启动调度线程；`POST /dream/run` 返回 409 |
+| 降级 | `dream_enabled`（默认 `false`）是总开关：关闭时周期线程不启动，且 `POST /dream/run` 与 `POST /dream/preview` 均返回 409。首次上线需显式开启——整合会写入新数据，不在默认开启的路径上自动发生 |
 
 调度参数一律经既有配置链路（`.env` → `DEFAULT_CONFIG` → 可运行时覆盖），与 `server_state` 的配置合并机制一致。
 
@@ -451,6 +451,7 @@ user prompt：`## Facts\n<JSON 数组>\n\n# Output:`，与既有 `generate_contr
 | 数据写入 | 零：不写 Qdrant、不写 history、不写 `dream_runs`、不写 `dream_cluster_states`、不写任何缓存文件；报告落盘到 `history/dream-reports/` 是 dry-run 唯一的持久化产出。dry-run 的判定结果**不进入**状态表，因此 dry-run 之后紧接的实跑仍会完整执行该轮 |
 | LLM 调用 | 与实跑**完全一致**（成本口径可比）；报告中的 token 与调用数照实记录 |
 | 锁 | 与实跑共用同一把锁（dry-run 也持有），避免与实跑交错 |
+| 总开关 | 受 `dream_enabled` 约束：关闭时返回 409（与 `POST /dream/run` 一致） |
 | 报告内容 | 见 5.8 |
 | 与实跑的差异 | 仅有两点：不执行 5.4.2 的全部写入动作；`dream_runs` 不落行。判定规则、剪枝规则、LLM 调用、统计口径完全相同 |
 | 报告与实跑的一致性 | 报告中的 `would_write` 列表与实跑实际写入的 point id 集合必须逐条相等（同一输入下） |
