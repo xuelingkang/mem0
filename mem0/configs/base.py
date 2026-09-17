@@ -76,8 +76,9 @@ class GraphConfig(BaseModel):
     设计见 `docs/design/graph-memory.md`。事实主存仍是 Qdrant；本配置段只控制
     「新事实是否同步入图」与「检索时是否把图关联折算为补充加分」。
 
-    默认 `enabled=False`：关闭时不派发、不查询、不加分，检索与写入行为与引入本机制
-    之前逐位一致（`explain` 输出也不出现图分量键）。
+    默认 `enabled=False`：关闭时不派发、不查询、不加分，分数与 `explain` 的 `score_details`
+    与引入本机制之前逐位一致；结果条目只多一个只读的 `graph_status = "disabled"`，用于把
+    「能力关闭」与「图没答上来」在响应上分开。
     """
 
     enabled: bool = Field(
@@ -99,8 +100,12 @@ class GraphConfig(BaseModel):
         ge=1,
     )
     timeout_seconds: float = Field(
-        description="图检索硬超时预算（秒）。超时即本次无图信号，不延长响应。",
-        default=0.4,
+        description=(
+            "图检索硬超时预算（秒）。超时即本次无图信号，不延长响应，本次状态在检索结果里标为 `timeout`。"
+            "默认 1.0：图桥 `/search` 实测 n=100 得 p50/p90/p95/p99/max = 0.163/0.445/0.514/0.812/0.842s"
+            "（另一轮 n=60 max 0.678s），0.4s 只覆盖到约 p85、正常请求会落进超时区（实测 14/100 超预算）。"
+        ),
+        default=1.0,
         gt=0,
     )
     include_invalidated: bool = Field(

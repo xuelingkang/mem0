@@ -198,7 +198,7 @@ GRAPH_CONFIG = {
     "endpoint": os.environ.get("MEM0_GRAPH_ENDPOINT", "http://graph-bridge:8000"),
     "weight": _env_number("MEM0_GRAPH_WEIGHT", 0.5, float),
     "max_facts": _env_number("MEM0_GRAPH_MAX_FACTS", 10, int),
-    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 0.4, float),
+    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 1.0, float),
     "include_invalidated": _env_flag("MEM0_GRAPH_INCLUDE_INVALIDATED", False),
     "queue_size": _env_number("MEM0_GRAPH_QUEUE_SIZE", 1000, int),
     "max_retries": _env_number("MEM0_GRAPH_MAX_RETRIES", 3, int),
