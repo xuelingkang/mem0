@@ -70,6 +70,75 @@ class DecayConfig(BaseModel):
     )
 
 
+class GraphConfig(BaseModel):
+    """旁路图检索（graph memory）配置：Graphiti 图桥 + 图加分。
+
+    设计见 `docs/design/graph-memory.md`。事实主存仍是 Qdrant；本配置段只控制
+    「新事实是否同步入图」与「检索时是否把图关联折算为补充加分」。
+
+    默认 `enabled=False`：关闭时不派发、不查询、不加分，检索与写入行为与引入本机制
+    之前逐位一致（`explain` 输出也不出现图分量键）。
+    """
+
+    enabled: bool = Field(
+        description="图能力总开关。关闭时不派发、不查询、不加分。",
+        default=False,
+    )
+    endpoint: str = Field(
+        description="图桥服务地址（`/episodes`、`/search` 所在的服务根）。",
+        default="http://graph-bridge:8000",
+    )
+    weight: float = Field(
+        description="图加分上限 W_g，与实体加入上限同量级（默认 0.5）。",
+        default=0.5,
+        ge=0.0,
+    )
+    max_facts: int = Field(
+        description="每次图检索取用的事实条数（按图检索返回顺序定权）。",
+        default=10,
+        ge=1,
+    )
+    timeout_seconds: float = Field(
+        description="图检索硬超时预算（秒）。超时即本次无图信号，不延长响应。",
+        default=0.4,
+        gt=0,
+    )
+    include_invalidated: bool = Field(
+        description="是否采用 `invalid_at` 非空（图侧已失效）的事实，默认不采用。",
+        default=False,
+    )
+    queue_size: int = Field(
+        description="入图派发队列容量；满时丢弃最旧任务并计入 `graph_dropped`。",
+        default=1000,
+        ge=1,
+    )
+    max_retries: int = Field(
+        description="单条 episode 的最大重试次数。",
+        default=3,
+        ge=0,
+    )
+    retry_backoff_seconds: float = Field(
+        description="线性退避基数：第 n 次重试等待 n × 基数。",
+        default=5.0,
+        ge=0,
+    )
+    circuit_breaker_failures: int = Field(
+        description="连续失败达到该值进入冷却窗口。",
+        default=5,
+        ge=1,
+    )
+    circuit_cooldown_seconds: float = Field(
+        description="熔断冷却窗口（秒）；窗口内派发直接丢弃并计数，结束后放行一条探测。",
+        default=60.0,
+        gt=0,
+    )
+    request_timeout_seconds: float = Field(
+        description="图桥写入请求（`/episodes`）的单次超时（秒）。",
+        default=120.0,
+        gt=0,
+    )
+
+
 class MemoryConfig(BaseModel):
     vector_store: VectorStoreConfig = Field(
         description="Configuration for the vector store",
@@ -102,6 +171,10 @@ class MemoryConfig(BaseModel):
     decay: DecayConfig = Field(
         description="Retrieval decay: Ebbinghaus forgetting curve plus access reinforcement.",
         default_factory=DecayConfig,
+    )
+    graph: GraphConfig = Field(
+        description="Graph memory: Graphiti side-car graph with additive retrieval boost.",
+        default_factory=GraphConfig,
     )
 
 

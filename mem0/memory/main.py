@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
-from mem0.configs.base import DecayConfig, MemoryConfig, MemoryItem
+from mem0.configs.base import DecayConfig, GraphConfig, MemoryConfig, MemoryItem
 from mem0.configs.enums import MemoryType
 from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
@@ -33,6 +33,13 @@ from mem0.configs.prompts import (
 from mem0.exceptions import LLMError
 from mem0.exceptions import ValidationError as Mem0ValidationError
 from mem0.memory.base import MemoryBase
+from mem0.memory.graph_sync import (
+    GraphBridgeClient,
+    GraphSync,
+    compute_graph_boosts,
+    derive_group_id,
+    search_graph_facts,
+)
 from mem0.memory.notices import (
     PERFORMANCE_SLOW_QUERY_THRESHOLD_SECONDS,
     detect_decay_usage_from_delete,
@@ -974,6 +981,119 @@ def _reinforce_search_hits(memory, results: List[Dict[str, Any]]) -> None:
         _dispatch_decay_reinforcement(memory.vector_store, updates)
 
 
+# ---------------------------------------------------------------------------
+# Graph memory (Graphiti side-car graph)
+#
+# Design: `docs/design/graph-memory.md`. New facts are dispatched to the graph bridge
+# asynchronously (the write path only enqueues), and `/search` folds the graph hits back
+# into the additive score as a bounded supplementary signal. Qdrant stays the single
+# source of truth: nothing here writes to the vector store, and every graph-side failure
+# degrades to "no graph signal this time" instead of touching the response.
+# ---------------------------------------------------------------------------
+
+
+def _graph_config_of(memory) -> Optional[GraphConfig]:
+    """取实例的图配置段；不是真正的 `GraphConfig` 时返回 None。
+
+    与 `_decay_config_of` 同理：返回 None 一律等价于「关闭」，实例若未携带配置段
+    （子类、测试替身、替身式 MagicMock 配置）就不得产生任何副作用，也不得让替身的
+    属性值流进算式。
+    """
+    config = getattr(getattr(memory, "config", None), "graph", None)
+    return config if isinstance(config, GraphConfig) else None
+
+
+def _graph_sync_of(memory) -> Optional[GraphSync]:
+    """取（并按需惰性创建）实例的图派发器；关闭态返回 None。"""
+    config = _graph_config_of(memory)
+    if config is None or not config.enabled:
+        return None
+    sync = getattr(memory, "_graph_sync", None)
+    if sync is None:
+        sync = GraphSync(config)
+        memory._graph_sync = sync
+    return sync
+
+
+def _graph_client(memory) -> GraphBridgeClient:
+    """取（并按需惰性创建）图桥 HTTP 客户端；检索路径与派发路径共用一个连接池。"""
+    client = getattr(memory, "_graph_bridge_client", None)
+    if client is None:
+        client = GraphBridgeClient(memory.config.graph.endpoint, memory.config.graph.request_timeout_seconds)
+        memory._graph_bridge_client = client
+    return client
+
+
+def _dispatch_graph_sync(memory, records: List[tuple], filters: Optional[Dict[str, Any]]) -> None:
+    """把本次写入的事实派发入图（设计 §5.1）。
+
+    派发只做内存入队，O(1) 且不抛异常，因此不进入写入响应的时延路径；图不可用时失败
+    由队列重试与熔断吸收，Qdrant 事实照常保留。关闭态下直接返回。
+
+    Args:
+        memory: `Memory` / `AsyncMemory` 实例（提供 `config.graph`）。
+        records: 写入管道的 `(memory_id, text, embedding, payload)` 记录列表。
+        filters: 写入时的作用域过滤条件，用于派生图键。
+    """
+    sync = _graph_sync_of(memory)
+    if sync is None or not records:
+        return
+    group_id = derive_group_id(filters)
+    if not group_id:
+        return
+    for record in records:
+        if not isinstance(record, (list, tuple)) or len(record) < 4:
+            continue
+        memory_id, text, _embedding, payload = record[0], record[1], record[2], record[3]
+        if not memory_id or not text:
+            continue
+        created_at = (payload or {}).get("created_at") if isinstance(payload, dict) else None
+        sync.dispatch(str(memory_id), str(text), created_at, group_id)
+
+
+def _graph_hits(
+    memory,
+    query: str,
+    candidates: List[Dict[str, Any]],
+    filters: Optional[Dict[str, Any]],
+) -> tuple:
+    """取回一次图检索并按候选池折算加分（设计 §6.1–6.2）。
+
+    Returns:
+        `(graph_boosts, graph_facts)`，或 `(None, None)` 表示图能力关闭——调用方把 None
+        原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致。
+    """
+    config = _graph_config_of(memory)
+    if config is None or not config.enabled:
+        return None, None
+    group_id = derive_group_id(filters)
+    if not group_id or not candidates:
+        return {}, {}
+    facts = search_graph_facts(
+        _graph_client(memory),
+        group_id,
+        query,
+        config.max_facts,
+        config.timeout_seconds,
+    )
+    candidate_ids = [str(candidate["id"]) for candidate in candidates if candidate.get("id") is not None]
+    return compute_graph_boosts(
+        facts,
+        candidate_ids,
+        config.weight,
+        config.include_invalidated,
+    )
+
+
+def _compute_graph_hits(memory, query: str, candidates: List[Dict[str, Any]], filters) -> tuple:
+    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。"""
+    try:
+        return _graph_hits(memory, query, candidates, filters)
+    except Exception as exc:  # noqa: BLE001 - 图侧异常不得外溢到主检索
+        logger.warning(f"Graph boost computation failed: {exc}")
+        return {}, {}
+
+
 setup_config()
 logger = logging.getLogger(__name__)
 
@@ -1765,6 +1885,9 @@ class Memory(MemoryBase):
         # Phase 8: Save messages + return
         self.db.save_messages(messages, session_scope)
 
+        # 图同步派发：内存入队，O(1) 且不抛异常，不进入写入响应时延路径（设计 §5.1）。
+        _dispatch_graph_sync(self, records, filters)
+
         returned_memories = [
             {"id": r[0], "memory": r[1], "event": "ADD"}
             for r in records
@@ -2321,6 +2444,8 @@ class Memory(MemoryBase):
 
         # Step 8: Score and rank
         # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
+        # 图分支与 BM25 / 实体加分的取数并列：超时或异常一律按「本次无图信号」处理。
+        graph_boosts, graph_facts = _compute_graph_hits(self, query, candidates, filters)
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -2329,6 +2454,8 @@ class Memory(MemoryBase):
             top_k=limit,
             explain=explain,
             decay_factors=self._decay_factors(candidates),
+            graph_boosts=graph_boosts,
+            graph_facts=graph_facts,
         )
 
         # Step 9: Format results
@@ -3538,6 +3665,9 @@ class AsyncMemory(MemoryBase):
         # Phase 8: Save messages + return
         await asyncio.to_thread(self.db.save_messages, messages, session_scope)
 
+        # 图同步派发：内存入队，O(1) 且不抛异常，不进入写入响应时延路径（设计 §5.1）。
+        _dispatch_graph_sync(self, records, effective_filters)
+
         returned_memories = [
             {"id": r[0], "memory": r[1], "event": "ADD"}
             for r in records
@@ -4095,6 +4225,10 @@ class AsyncMemory(MemoryBase):
 
         # Step 8: Score and rank
         # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
+        # 图分支走 to_thread（同步 HTTP + 硬超时），不阻塞事件循环（设计 §6.1）。
+        graph_boosts, graph_facts = await asyncio.to_thread(
+            _compute_graph_hits, self, query, candidates, filters
+        )
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
@@ -4103,6 +4237,8 @@ class AsyncMemory(MemoryBase):
             top_k=limit,
             explain=explain,
             decay_factors=self._decay_factors(candidates),
+            graph_boosts=graph_boosts,
+            graph_facts=graph_facts,
         )
 
         # Step 9: Format results

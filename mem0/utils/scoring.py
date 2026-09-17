@@ -56,6 +56,10 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
 
 ENTITY_BOOST_WEIGHT = 0.5
 
+# 图加分上限 W_g。与实体加入上限同量级：四信号全开时图信号对最终分的贡献上限为
+# `0.5 / 3.0 = 16.7%`（设计 §6.2）。
+GRAPH_BOOST_WEIGHT = 0.5
+
 # Time-factor components published in `score_details` when decay is active. The scorer
 # only copies them through, so the field names stay owned by the decay implementation.
 DECAY_DETAIL_KEYS = (
@@ -66,6 +70,12 @@ DECAY_DETAIL_KEYS = (
     "access_count",
 )
 
+# Graph-signal components published in `score_details` when the graph capability is on.
+# `graph_boost` is the candidate's additive boost (0.0 when the graph missed it);
+# `graph_facts` is how many graph facts referenced it. Both keys stay absent when the
+# capability is off, so `explain` output is byte-identical to pre-graph releases.
+GRAPH_DETAIL_KEYS = ("graph_boost", "graph_facts")
+
 
 def score_and_rank(
     semantic_results: List[Dict[str, Any]],
@@ -75,12 +85,14 @@ def score_and_rank(
     top_k: int,
     explain: bool = False,
     decay_factors: Optional[Dict[str, Dict[str, Any]]] = None,
+    graph_boosts: Optional[Dict[str, float]] = None,
+    graph_facts: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Score candidates additively and return top-k results.
 
     For each candidate:
         semantic_score is taken from the result's score field.
-        combined = (semantic + bm25 + entity_boost) / max_possible
+        combined = (semantic + bm25 + entity_boost + graph_boost) / max_possible
         final_score = combined * decay_weight
 
     Threshold gates the semantic score BEFORE combining -- candidates
@@ -91,6 +103,8 @@ def score_and_rank(
         - Semantic + BM25: max_possible = 2.0
         - Semantic + BM25 + entity: max_possible = 2.5
         - Semantic + entity (no BM25): max_possible = 1.5
+        - ... plus `GRAPH_BOOST_WEIGHT` whenever at least one candidate in the pool
+          actually carries a graph boost.
 
     The time factor is applied after combining and before ranking, so it can only
     reorder candidates that are already in the pool: it is a multiplier bounded by
@@ -108,6 +122,15 @@ def score_and_rank(
             `DECAY_DETAIL_KEYS`. Candidates absent from the mapping (and every candidate
             when the mapping is omitted or empty) score exactly as they did before the
             time factor existed.
+        graph_boosts: Optional per-candidate graph boost keyed by memory ID. The caller
+            passes the mapping only when the graph capability is ON: an empty mapping
+            then means "graph is on, nothing was hit", which keeps the divisor at its
+            base value while still publishing zero-valued graph components. `None` means
+            the capability is off and the scoring is byte-identical to its pre-graph
+            form. Only candidates present here grow the divisor, so ids outside the
+            candidate pool can never influence it.
+        graph_facts: Optional per-candidate count of graph facts that referenced it,
+            published as `graph_facts` in `score_details`.
 
     Returns:
         List of scored result dicts sorted by combined score descending.
@@ -115,12 +138,17 @@ def score_and_rank(
 
     has_bm25 = bool(bm25_scores)
     has_entity = bool(entity_boosts)
+    has_graph = bool(graph_boosts)
 
     max_possible = 1.0
     if has_bm25:
         max_possible += 1.0
     if has_entity:
         max_possible += ENTITY_BOOST_WEIGHT
+    if has_graph:
+        max_possible += GRAPH_BOOST_WEIGHT
+
+    graph_enabled = graph_boosts is not None
 
     scored: List[Dict[str, Any]] = []
 
@@ -136,8 +164,9 @@ def score_and_rank(
         mem_id_str = str(mem_id)
         bm25_score = bm25_scores.get(mem_id_str, 0.0)
         entity_boost = entity_boosts.get(mem_id_str, 0.0)
+        graph_boost = (graph_boosts or {}).get(mem_id_str, 0.0)
 
-        raw_combined = semantic_score + bm25_score + entity_boost
+        raw_combined = semantic_score + bm25_score + entity_boost + graph_boost
         combined = min(raw_combined / max_possible, 1.0)
 
         # Time factor: a bounded multiplier on the hybrid score, never a filter.
@@ -164,6 +193,11 @@ def score_and_rank(
                 # 使 explain 输出与引入本机制之前逐位一致。
                 for key in DECAY_DETAIL_KEYS:
                     score_details[key] = decay.get(key)
+            if graph_enabled:
+                # 图能力开启即发布两个分量键：未命中为 0.0 / 0，命中为实际加分与事实条数
+                # （设计 §8）。关闭态不发布，`explain` 与引入本机制之前逐位一致。
+                score_details[GRAPH_DETAIL_KEYS[0]] = graph_boost
+                score_details[GRAPH_DETAIL_KEYS[1]] = (graph_facts or {}).get(mem_id_str, 0)
             scored_result["score_details"] = score_details
         scored.append(scored_result)
 
