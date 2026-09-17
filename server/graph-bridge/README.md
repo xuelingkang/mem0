@@ -27,6 +27,24 @@ join key 是构造性的：`episode uuid == memory id`，图侧不另存映射�
 | `SEMAPHORE_LIMIT` | `1` | 并发上限，默认串行入图 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
+## 依赖钉版（不要放宽）
+
+`requirements.txt` 里 `httpx` 与 `openai<3` 是**必须显式写死**的，不是冗余声明：
+
+- `graphiti-core 0.30.2` 的 `llm_client/client.py` 直接 `import httpx`，并用 `httpx.HTTPStatusError`
+  判定 5xx 重试与限流，但它**没有把 httpx 声明为依赖**——这份依赖此前只是从 `openai` 传递而来。
+- `openai 3.x` 改用 `httpx2`，传递依赖随之消失。实测：不钉版时镜像构建「成功」，容器也「在跑」，
+  但 `import httpx` 在运行期抛 `ModuleNotFoundError`，表现为 `/health` 与 `/episodes` 一律 500。
+- 钉住 `openai<3` 的第二个理由是语义一致：graphiti 用 `isinstance(exc, httpx.HTTPStatusError)`
+  做判定，而 `openai 3.x` 抛的是 `httpx2` 的异常类，两者不同源，5xx 重试与限流翻译会静默失效。
+
+验证方式（构建后必跑）：
+
+```bash
+docker exec mem0-dev-graph-bridge-1 python -c "import httpx, graphiti_core; print('imports ok')"
+curl -s localhost:8000/health   # 期望 {"status":"healthy","backend":"falkordb","falkordb":"ok"}
+```
+
 ## 本地验证
 
 ```bash

@@ -5,5 +5,14 @@
 # 启动即 ImportError，实测见方案 §4.2 G1）。
 graphiti-core[falkordb]==0.30.2
 
+# graphiti-core 0.30.2 在 `llm_client/client.py` 里 `import httpx`，并用
+# `httpx.HTTPStatusError` 做重试/限流判定，却没有把 httpx 声明为自己的依赖——它此前只是
+# 从 openai 传递而来。openai 3.x 改用 httpx2，传递依赖随之消失：镜像构建期
+# `import httpx` 直接 ModuleNotFoundError，`/health` 与所有抽取路径 500（实测）。
+# 因此这里把两个包都显式钉住：httpx 补上未声明的运行时依赖，openai<3 让 graphiti 的
+# isinstance 判定与其实际抛出的异常类型保持同一套（否则 5xx 重试与限流翻译都静默失效）。
+openai>=1.91.0,<3
+httpx>=0.27,<1
+
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
