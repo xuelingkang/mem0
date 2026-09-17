@@ -7,10 +7,10 @@
 #   bash patches/apply-patch.sh          # 应用 patch（默认）
 #   bash patches/apply-patch.sh --reverse # 反打（还原到上游）
 #
-# 注意：
+# 注意:
 #   - patch 文件须由 patches/generate-patch.sh 生成（mem0-local.patch）
-#   - 应用后需把改动的 py 文件复制进容器 site-packages 并重启 mem0
-#     （见本文件底部注释，或 generate-patch.sh 的说明）
+#   - patch 由「upstream/main..HEAD」提交区间导出，覆盖运行时代码 + dashboard 前端
+#   - 应用后生效路径见本文件底部（三种改动语义不同，别混）
 # =============================================================================
 set -euo pipefail
 
@@ -50,19 +50,26 @@ elif git apply --check --reverse "$PATCH_FILE" 2>/dev/null; then
   fi
 else
   echo "❌ 无法干净应用/反打：工作区可能与 patch 基线不一致。"
-  echo "   请手动处理（git checkout 后重打，或人工合并）。"
-  echo "   涉及文件："
-  git diff --name-only -- mem0/configs/prompts.py server/main.py server/routers/entities.py server/docker-compose.yaml
+  echo "   两条出路："
+  echo "     a) 先对齐基线：git fetch upstream && git rebase upstream/main，再重跑本脚本"
+  echo "     b) 重新导出：bash patches/generate-patch.sh（会以当前 HEAD 为准覆盖 patch）"
+  echo "   涉及文件:"
+  grep '^diff --git' "$PATCH_FILE" | sed 's|diff --git a/||;s| b/.*||' | sed 's/^/     /'
   exit 1
 fi
 
 echo ""
 echo "======================================================================"
-echo " 下一步（容器生效）："
-echo "  1. 复制改动的 py 文件到容器 site-packages："
-echo "     docker cp mem0/configs/prompts.py mem0-dev-mem0-1:/usr/local/lib/python3.12/site-packages/mem0/configs/prompts.py"
-echo "     docker cp mem0/memory/main.py  mem0-dev-mem0-1:/usr/local/lib/python3.12/site-packages/mem0/memory/main.py"
-echo "     （若升级重建了镜像，需要先重新确认 site-packages 路径）"
-echo "  2. 重启："
-echo "     cd server && docker compose restart mem0"
+echo " 下一步（容器生效）——三种改动语义不同，按需执行："
+echo "   1) 改 server/*.py 或 mem0/**.py:"
+echo "        cd server && docker compose restart mem0"
+echo "      （源码经 volume 挂载，容器启动时 cp 进 site-packages；"
+echo "        无需 docker cp、无需 rebuild）"
+echo "   2) 改 server/dashboard/**:"
+echo "        cd server && docker compose build mem0-dashboard \\"
+echo "          && docker compose up -d --no-deps --force-recreate mem0-dashboard"
+echo "      （dashboard 是 build 型镜像，改源码必须重建）"
+echo "   3) 改 server/.env:"
+echo "        cd server && docker compose up -d --force-recreate mem0"
+echo "      （env 在容器创建时固化，restart 不够）"
 echo "======================================================================"
