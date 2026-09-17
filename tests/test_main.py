@@ -131,9 +131,13 @@ def test_search(memory_instance):
     assert result["results"][0]["score"] == pytest.approx(0.9)
 
     # Hybrid pipeline over-fetches: max(20*4, 60) = 80 (top_k default is now 20)
-    memory_instance.vector_store.search.assert_called_once_with(
-        query="test query", vectors=[0.1, 0.2, 0.3], top_k=80, filters={"user_id": "test_user"}
-    )
+    # The bi-temporal validity predicate is AND-merged with the scope filters.
+    _, search_kwargs = memory_instance.vector_store.search.call_args
+    assert search_kwargs["query"] == "test query"
+    assert search_kwargs["vectors"] == [0.1, 0.2, 0.3]
+    assert search_kwargs["top_k"] == 80
+    assert search_kwargs["filters"]["AND"][0] == {"user_id": "test_user"}
+    assert "invalid_at" in search_kwargs["filters"]["AND"][1]["NOT"][0]
 
 
 def test_search_hides_expired_memories_by_default(memory_instance):
@@ -474,7 +478,8 @@ class TestEntityIdValidation:
         memory_instance.get_all(filters={"user_id": 42})
 
         _, kwargs = memory_instance.vector_store.list.call_args
-        assert kwargs["filters"]["user_id"] == "42"
+        # 有效事实谓词以 AND 合并进 filters，作用域仍在第一段
+        assert kwargs["filters"]["AND"][0]["user_id"] == "42"
 
 
 class TestSearchParamValidation:

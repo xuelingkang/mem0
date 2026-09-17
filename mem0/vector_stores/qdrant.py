@@ -170,18 +170,29 @@ class Qdrant(VectorStoreBase):
             logger.debug("Skipping payload index creation for local Qdrant (not supported)")
             return
 
-        common_fields = ["user_id", "agent_id", "run_id", "actor_id"]
+        # Field schemas are declared per field: keyword fields are matched by value,
+        # while created_at / valid_at / invalid_at are range-filtered (cursor paging and
+        # the bi-temporal validity predicates). A keyword index on a date field would
+        # make those Range conditions fall back to a full scan.
+        keyword_fields = ["user_id", "agent_id", "run_id", "actor_id"]
+        datetime_fields = ["created_at", "valid_at", "invalid_at"]
 
-        for field in common_fields:
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name=field,
-                    field_schema="keyword"
-                )
-                logger.info(f"Created index for {field} in collection {self.collection_name}")
-            except Exception as e:
-                logger.debug(f"Index for {field} might already exist: {e}")
+        for field, field_schema in ((f, "keyword") for f in keyword_fields):
+            self._create_payload_index(field, field_schema)
+        for field, field_schema in ((f, "datetime") for f in datetime_fields):
+            self._create_payload_index(field, field_schema)
+
+    def _create_payload_index(self, field: str, field_schema: str):
+        """Create one payload index, tolerating fields that are already indexed."""
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name=field,
+                field_schema=field_schema,
+            )
+            logger.info(f"Created index for {field} in collection {self.collection_name}")
+        except Exception as e:
+            logger.debug(f"Index for {field} might already exist: {e}")
 
     def insert(self, vectors: list, payloads: list = None, ids: list = None):
         """

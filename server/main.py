@@ -223,6 +223,13 @@ class SearchRequest(BaseModel):
     threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
     explain: Optional[bool] = Field(None, description="Include score details for each search result.")
     show_expired: Optional[bool] = Field(None, description="Include expired memories.")
+    as_of: Optional[str] = Field(
+        None,
+        description="Point-in-time instant (YYYY-MM-DD or ISO8601). Returns the facts valid at that moment.",
+    )
+    include_invalidated: Optional[bool] = Field(
+        None, description="Return invalidated facts too, ignoring the bi-temporal validity filter."
+    )
 
 
 class GenerateInstructionsRequest(BaseModel):
@@ -401,7 +408,23 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
 
 
 ALL_MEMORIES_LIMIT = 1000
-_RESERVED_PAYLOAD_KEYS = {"data", "user_id", "agent_id", "run_id", "hash", "created_at", "updated_at", "expiration_date"}
+# Payload keys surfaced as first-class fields: they are pulled out of `metadata` so a
+# client never sees a bi-temporal field nested under it (the four fields sit one level
+# up, next to `hash` and `created_at`).
+_RESERVED_PAYLOAD_KEYS = {
+    "data",
+    "user_id",
+    "agent_id",
+    "run_id",
+    "hash",
+    "created_at",
+    "updated_at",
+    "expiration_date",
+    "valid_at",
+    "invalid_at",
+    "superseded_by",
+    "invalid_reason",
+}
 
 
 def _serialize_memory(row: Any) -> Dict[str, Any]:
@@ -414,6 +437,12 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
         "run_id": payload.get("run_id"),
         "hash": payload.get("hash"),
         "expiration_date": payload.get("expiration_date"),
+        # Always present (null when the fact has never been invalidated) so clients can
+        # rely on a stable response shape.
+        "valid_at": payload.get("valid_at"),
+        "invalid_at": payload.get("invalid_at"),
+        "superseded_by": payload.get("superseded_by"),
+        "invalid_reason": payload.get("invalid_reason"),
         "metadata": {k: v for k, v in payload.items() if k not in _RESERVED_PAYLOAD_KEYS},
         "created_at": payload.get("created_at"),
         "updated_at": payload.get("updated_at"),
@@ -495,6 +524,10 @@ EXPORT_CSV_COLUMNS = [
     "agent_id",
     "run_id",
     "hash",
+    "valid_at",
+    "invalid_at",
+    "superseded_by",
+    "invalid_reason",
     "created_at",
     "updated_at",
 ]
@@ -587,6 +620,10 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
             params["explain"] = search_req.explain
         if search_req.show_expired is not None:
             params["show_expired"] = search_req.show_expired
+        if search_req.as_of is not None:
+            params["as_of"] = search_req.as_of
+        if search_req.include_invalidated is not None:
+            params["include_invalidated"] = search_req.include_invalidated
         return get_memory_instance().search(query=search_req.query, filters=filters, **params)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

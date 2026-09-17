@@ -10,7 +10,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
@@ -19,8 +19,13 @@ from mem0.configs.enums import MemoryType
 from mem0.configs.prompts import (
     ADDITIVE_EXTRACTION_PROMPT,
     AGENT_CONTEXT_SUFFIX,
+    BITEMP_CANDIDATE_K,
+    BITEMP_EPOCH,
+    CONTRADICTION_DETECTION_PROMPT,
+    INVALID_REASON_SUPERSEDED,
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     generate_additive_extraction_prompt,
+    generate_contradiction_detection_prompt,
 )
 from mem0.exceptions import LLMError
 from mem0.exceptions import ValidationError as Mem0ValidationError
@@ -449,6 +454,255 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
         return date.fromisoformat(str(expiration_date)) < datetime.now(timezone.utc).date()
     except ValueError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Bi-temporal fact model (design 2026-09-17)
+#
+# 1a extraction produces `valid_at`; 1b (an independent LLM call) only reports
+# contradicting pairs; 1c -- the pure helpers below -- derives every invalidation
+# from the records' own time fields, so the same input always yields the same output.
+# ---------------------------------------------------------------------------
+
+# Payload keys promoted to the top level of every read result. The four bi-temporal
+# fields are ordinary payload fields (no second store), so they belong in the same
+# list; one declaration keeps a read path from leaking them into `metadata`.
+BI_TEMPORAL_PAYLOAD_KEYS = [
+    "user_id",
+    "agent_id",
+    "run_id",
+    "actor_id",
+    "role",
+    "attributed_to",
+    "expiration_date",
+    "valid_at",
+    "invalid_at",
+    "superseded_by",
+    "invalid_reason",
+]
+
+# Bi-temporal fields, surfaced top-level on every read result (null when not set).
+BI_TEMPORAL_FIELDS = ("valid_at", "invalid_at", "superseded_by", "invalid_reason")
+
+
+def _coerce_bitemporal_date(value: Any) -> Optional[str]:
+    """Normalize a date-like value to `YYYY-MM-DD`, or None when it is not a date.
+
+    Both sources (LLM `valid_at` output and stored payloads) are untrusted, and only
+    date-parsable values are kept: a non-date string in a datetime-indexed field would
+    make the validity `Range` filters silently misbehave.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _effective_from(record: Dict[str, Any]) -> str:
+    """生效时间：`valid_at` 存在则取之，否则以入库时间 `created_at` 兜底。
+
+    存量记录没有 `valid_at`，它们唯一的生效证据就是入库时间；这里不推测、不回填。
+    """
+    valid_at = _coerce_bitemporal_date(record.get("valid_at"))
+    if valid_at:
+        return valid_at
+    return _coerce_bitemporal_date(record.get("created_at")) or ""
+
+
+def _temporal_key(record: Dict[str, Any]) -> tuple:
+    """时序比较键 `(生效时间, 入库时间)`，全序，供 1c 的先后判定使用。"""
+    return (_effective_from(record), str(record.get("created_at") or ""))
+
+
+def _apply_contradictions(
+    contradictions: List[Dict[str, Any]],
+    new_records: Dict[str, Dict[str, Any]],
+    old_records: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """1c：按生效时间把矛盾对转成旧记录的失效写入（确定性、无 LLM、无 `now` 依赖）。
+
+    对应方案 §5.3.2 的 R1-R11：
+      R1 幻觉 id 防线：`old_id` 不在候选集合内直接丢弃并告警；`new_id` 同理（1b 输出不可信）。
+      R2 自反配对丢弃。
+      R3 时序守卫：仅当 `k(new) > k(old)` 才处置，相等或更早一律不处置。
+      R5 重复失效取最早：已失效记录的 `invalid_at` 更早时三字段保持不变。
+      R6 同一批次里一条旧记录只处置一次：先按 R3 过滤，再取 `k(new)` 最大者。
+      R9/R10 只产出 payload 三字段，不改文本、不写 history（由调用方执行 payload-only 更新）。
+
+    Args:
+        contradictions: 1b 产出的配对 `[{"new_id": str, "old_id": str}]`。
+        new_records: 本批次新记录 `{id: {"valid_at": ..., "created_at": ...}}`。
+        old_records: 候选旧记录 `{id: 该记录的 payload}`。
+
+    Returns:
+        `[{"memory_id", "invalid_at", "superseded_by", "invalid_reason"}]`，顺序确定。
+    """
+    if not contradictions:
+        return []
+
+    # 配对去重 + 排序：处置结果与 1b 的输出顺序无关，同输入必同输出。
+    pairs = set()
+    for pair in contradictions:
+        if not isinstance(pair, dict):
+            continue
+        new_id, old_id = pair.get("new_id"), pair.get("old_id")
+        if not new_id or not old_id:
+            continue
+        if new_id == old_id:  # R2
+            continue
+        pairs.add((str(old_id), str(new_id)))
+
+    winners: Dict[str, str] = {}
+    for old_id, new_id in sorted(pairs):
+        if old_id not in old_records:  # R1
+            logger.warning(f"Contradiction dropped: unknown old_id {old_id}")
+            continue
+        if new_id not in new_records:
+            logger.warning(f"Contradiction dropped: unknown new_id {new_id}")
+            continue
+        new_record = new_records[new_id]
+        old_record = old_records[old_id]
+        if _temporal_key(new_record) <= _temporal_key(old_record):  # R3
+            continue
+        current = winners.get(old_id)
+        if current is None:
+            winners[old_id] = new_id
+            continue
+        # R6：取生效键最大的新事实；生效键完全相等时取 new_id 字典序最小者。
+        if _temporal_key(new_record) > _temporal_key(new_records[current]):
+            winners[old_id] = new_id
+        elif _temporal_key(new_record) == _temporal_key(new_records[current]) and new_id < current:
+            winners[old_id] = new_id
+
+    updates = []
+    for old_id in sorted(winners):
+        new_id = winners[old_id]
+        proposed_invalid_at = _effective_from(new_records[new_id])
+        existing_invalid_at = _coerce_bitemporal_date(old_records[old_id].get("invalid_at"))
+        # R5：已有失效时间更早时保留原结论，保证三字段始终指向同一次取代。
+        if existing_invalid_at and existing_invalid_at <= proposed_invalid_at:
+            continue
+        updates.append(
+            {
+                "memory_id": old_id,
+                "invalid_at": proposed_invalid_at,
+                "superseded_by": new_id,
+                "invalid_reason": INVALID_REASON_SUPERSEDED,
+            }
+        )
+    return updates
+
+
+def _normalize_as_of(as_of: Any) -> str:
+    """把 `as_of`（`YYYY-MM-DD` 或 ISO8601）规范化为 UTC ISO8601；None 表示当前时刻。"""
+    if as_of is None:
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(as_of, datetime):
+        moment = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat()
+    if isinstance(as_of, date):
+        return datetime(as_of.year, as_of.month, as_of.day, tzinfo=timezone.utc).isoformat()
+    try:
+        moment = datetime.fromisoformat(str(as_of).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("as_of must be 'YYYY-MM-DD' or an ISO8601 datetime.") from exc
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def _bitemporal_filter(
+    as_of: Any = None,
+    include_invalidated: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """有效事实过滤谓词（方案 §5.4.1）。
+
+    - 默认读（`as_of=None`）：只排除已失效记录。
+    - point-in-time（给定 T）：生效时间 `<= T`（`valid_at` 缺失时以 `created_at` 兜底），
+      且（未失效 或 失效时间 `> T`）。缺失字段由 `NOT[valid_at >= BITEMP_EPOCH]` 判定，
+      因为 `Range` 不匹配缺失字段，取反后放行。
+    """
+    if include_invalidated:
+        return None
+    moment = _normalize_as_of(as_of)
+    if as_of is None:
+        return {"NOT": [{"invalid_at": {"lte": moment}}]}
+    return {
+        "OR": [
+            {"valid_at": {"lte": moment}},
+            {"AND": [{"created_at": {"lte": moment}}, {"NOT": [{"valid_at": {"gte": BITEMP_EPOCH}}]}]},
+        ],
+        "NOT": [{"invalid_at": {"lte": moment}}],
+    }
+
+
+def _with_bitemporal_filter(
+    filters: Optional[Dict[str, Any]],
+    as_of: Any = None,
+    include_invalidated: bool = False,
+) -> Dict[str, Any]:
+    """把有效事实谓词与业务 filters 以 AND 合并，供所有读路径共用。
+
+    合并（而非就地改写）保证调用方传入的 filters 不被污染，也保证 `include_invalidated`
+    时原样返回、不加任何时间条件。
+    """
+    predicate = _bitemporal_filter(as_of, include_invalidated)
+    if predicate is None:
+        return dict(filters) if filters else {}
+    if not filters:
+        return predicate
+    return {"AND": [dict(filters), predicate]}
+
+
+def _scope_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """取出作用域过滤键（user_id / agent_id / run_id），兼容被 AND 包裹的谓词。
+
+    `Memory.search` 把有效事实谓词以 `{"AND": [作用域, 谓词]}` 的形式合并后传给检索；
+    实体加成只需要其中的作用域部分。若直接按顶层键过滤，合并后的 filters 会取到空作用域，
+    使实体加成退化成全局（跨用户）搜索——所以这里显式展开 AND 包裹。
+    """
+    if not filters:
+        return {}
+    if isinstance(filters.get("AND"), list):
+        merged: Dict[str, Any] = {}
+        for sub in filters["AND"]:
+            merged.update(_scope_filters(sub))
+        return merged
+    return {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+
+
+def _parse_contradiction_pairs(response: Any) -> List[Dict[str, str]]:
+    """解析 1b 的输出；不可解析时返回空列表（本次不处置任何记录）。"""
+    if not response or not str(response).strip():
+        return []
+    try:
+        parsed = json.loads(remove_code_blocks(str(response)), strict=False)
+    except json.JSONDecodeError:
+        try:
+            parsed = json.loads(extract_json(remove_code_blocks(str(response))), strict=False)
+        except Exception as e:
+            logger.error(f"Error parsing contradiction response: {e}")
+            return []
+    except Exception as e:
+        logger.error(f"Error parsing contradiction response: {e}")
+        return []
+    if not isinstance(parsed, dict):
+        logger.error("Error parsing contradiction response: not a JSON object")
+        return []
+    pairs = parsed.get("contradictions", [])
+    if not isinstance(pairs, list):
+        logger.error("Error parsing contradiction response: 'contradictions' is not a list")
+        return []
+    return [pair for pair in pairs if isinstance(pair, dict)]
 
 
 setup_config()
@@ -921,13 +1175,15 @@ class Memory(MemoryBase):
         parsed_messages = parse_messages(messages)
 
         # Phase 1: Existing memory retrieval
+        # 只取有效事实，且 top_k 提升为候选池大小：该结果既作 1a 的去重参考，也作 1b 的候选池。
+        # 检索必须排除已失效记录，否则 hash 去重会把「同一事实失效后重新出现」挡在门外（方案 3.3）。
         search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         query_embedding = self.embedding_model.embed(parsed_messages, "search")
         existing_results = self.vector_store.search(
             query=parsed_messages,
             vectors=query_embedding,
-            top_k=10,
-            filters=search_filters,
+            top_k=BITEMP_CANDIDATE_K,
+            filters=_with_bitemporal_filter(search_filters),
         )
 
         existing_memories = []
@@ -1036,12 +1292,22 @@ class Memory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            # valid_at 是事实在真实世界的生效日期，不是入库时间；判定不出时保持 null，
+            # 读路径由 created_at 兜底（方案 §4.1）。
+            mem_metadata["valid_at"] = _coerce_bitemporal_date(mem.get("valid_at"))
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
             self.db.save_messages(messages, session_scope)
             return []
+
+        # Phase 5: Independent contradiction detection (1b, design §3.2). A second LLM call
+        # with its own system prompt; it only reports pairs, never a retention verdict.
+        # Skipped when either side of the comparison is empty.
+        contradictions = []
+        if existing_results:
+            contradictions = self._detect_contradictions(records, existing_results)
 
         # Phase 6: Batch persist
         all_vectors = [r[2] for r in records]
@@ -1083,6 +1349,24 @@ class Memory(MemoryBase):
                     self.db.add_history(hr["memory_id"], None, hr["new_memory"], "ADD", created_at=hr.get("created_at"))
                 except Exception as e:
                     logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
+
+        # Phase 6b: Deterministic disposition (1c, 方案 §3.2 的 Phase 7). Pure code: the
+        # pairs from 1b are turned into payload-only invalidations. Text, hash, created_at
+        # and the vectors are untouched and no history row is written (R9/R10).
+        for update in _apply_contradictions(
+            contradictions,
+            {r[0]: r[3] for r in records},
+            {mem.id: dict(mem.payload or {}) for mem in existing_results},
+        ):
+            invalidation = {
+                "invalid_at": update["invalid_at"],
+                "superseded_by": update["superseded_by"],
+                "invalid_reason": update["invalid_reason"],
+            }
+            try:
+                self.vector_store.update(vector_id=update["memory_id"], vector=None, payload=invalidation)
+            except Exception as e:
+                logger.error(f"Failed to invalidate memory {update['memory_id']}: {e}")
 
         # Phase 7: Batch entity linking
         try:
@@ -1206,6 +1490,41 @@ class Memory(MemoryBase):
         )
         return returned_memories
 
+    def _detect_contradictions(self, records, existing_results) -> List[Dict[str, str]]:
+        """1b：一次独立的 LLM 调用，只取回矛盾对 `[{new_id, old_id}]`。
+
+        与 1a 的 system prompt 互不共享。失败（异常或不可解析输出）不中断写入，只是本次
+        不处置任何记录——1b 是辅助判定，不能让用户的新事实因它而丢失。
+        """
+        new_facts = [
+            {"id": record[0], "text": record[1], "valid_at": record[3].get("valid_at")}
+            for record in records
+        ]
+        existing_facts = [
+            {
+                "id": mem.id,
+                "text": (mem.payload or {}).get("data", ""),
+                "valid_at": (mem.payload or {}).get("valid_at"),
+                "created_at": (mem.payload or {}).get("created_at"),
+            }
+            for mem in existing_results
+        ]
+        user_prompt = generate_contradiction_detection_prompt(
+            new_facts=new_facts, existing_facts=existing_facts
+        )
+        try:
+            response = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": CONTRADICTION_DETECTION_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as e:
+            logger.error(f"LLM contradiction detection failed: {e}")
+            return []
+        return _parse_contradiction_pairs(response)
+
     def get(self, memory_id):
         """
         Retrieve a memory by ID.
@@ -1222,15 +1541,7 @@ class Memory(MemoryBase):
             display_first_run_notice(self, "sync", "get")
             return None
 
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
@@ -1246,6 +1557,10 @@ class Memory(MemoryBase):
             if key in memory.payload:
                 result_item[key] = memory.payload[key]
 
+        # Bi-temporal fields are first-class: always top-level, null when unset.
+        for key in BI_TEMPORAL_FIELDS:
+            result_item.setdefault(key, None)
+
         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
         if additional_metadata:
             result_item["metadata"] = additional_metadata
@@ -1259,6 +1574,8 @@ class Memory(MemoryBase):
         filters: Optional[Dict[str, Any]] = None,
         top_k: int = 20,
         show_expired: bool = False,
+        as_of: Optional[str] = None,
+        include_invalidated: bool = False,
         **kwargs,
     ):
         """
@@ -1270,6 +1587,10 @@ class Memory(MemoryBase):
                 Example: filters={"user_id": "u1", "agent_id": "a1"}
             top_k (int, optional): The maximum number of memories to return. Defaults to 20.
             show_expired (bool, optional): Include expired memories. Defaults to False.
+            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
+                were valid at T (point-in-time). None means the current moment.
+            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
+                validity filter. Defaults to False.
 
         Returns:
             dict: A dictionary containing a list of memories under the "results" key.
@@ -1316,7 +1637,7 @@ class Memory(MemoryBase):
             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"}
         )
 
-        all_memories_result = self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit)
+        all_memories_result = self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
 
         if scale_threshold_notice:
             display_scale_threshold_notice(self, "sync", "get_all", *scale_threshold_notice)
@@ -1324,8 +1645,12 @@ class Memory(MemoryBase):
             display_first_run_notice(self, "sync", "get_all")
         return {"results": all_memories_result}
 
-    def _get_all_from_vector_store(self, filters, limit, show_expired=False, output_limit=None):
-        memories_result = self.vector_store.list(filters=filters, top_k=limit)
+    def _get_all_from_vector_store(
+        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
+    ):
+        memories_result = self.vector_store.list(
+            filters=_with_bitemporal_filter(filters, as_of, include_invalidated), top_k=limit
+        )
 
         # Handle different vector store return formats by inspecting first element
         if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
@@ -1340,15 +1665,7 @@ class Memory(MemoryBase):
         else:
             actual_memories = memories_result
 
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
         formatted_memories = []
@@ -1366,6 +1683,9 @@ class Memory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
+
+            for key in BI_TEMPORAL_FIELDS:
+                memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
@@ -1388,6 +1708,8 @@ class Memory(MemoryBase):
         explain: bool = False,
         reference_date: Optional[Any] = None,
         show_expired: bool = False,
+        as_of: Optional[str] = None,
+        include_invalidated: bool = False,
         **kwargs,
     ):
         """
@@ -1421,6 +1743,10 @@ class Memory(MemoryBase):
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
             show_expired (bool, optional): Include expired memories. Defaults to False.
+            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
+                were valid at T (point-in-time). None means the current moment.
+            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
+                validity filter. Defaults to False.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
@@ -1493,7 +1819,12 @@ class Memory(MemoryBase):
 
         search_start = time.perf_counter()
         original_memories = self._search_vector_store(
-            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
+            query,
+            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
+            limit,
+            threshold,
+            explain=explain,
+            show_expired=show_expired,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -1688,15 +2019,7 @@ class Memory(MemoryBase):
         )
 
         # Step 9: Format results
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
         original_memories = []
@@ -1718,6 +2041,9 @@ class Memory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in payload:
                     memory_item_dict[key] = payload[key]
+
+            for key in BI_TEMPORAL_FIELDS:
+                memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
@@ -1754,7 +2080,7 @@ class Memory(MemoryBase):
         if not deduped:
             return {}
 
-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        search_filters = _scope_filters(filters)
         memory_boosts = {}
 
         try:
@@ -2583,14 +2909,15 @@ class AsyncMemory(MemoryBase):
         parsed_messages = parse_messages(messages)
 
         # Phase 1: Existing memory retrieval
+        # 只取有效事实，且 top_k 提升为候选池大小（详见 sync 同名阶段的说明）。
         search_filters = {k: v for k, v in effective_filters.items() if k in ("user_id", "agent_id", "run_id") and v}
         query_embedding = await asyncio.to_thread(self.embedding_model.embed, parsed_messages, "search")
         existing_results = await asyncio.to_thread(
             self.vector_store.search,
             query=parsed_messages,
             vectors=query_embedding,
-            top_k=10,
-            filters=search_filters,
+            top_k=BITEMP_CANDIDATE_K,
+            filters=_with_bitemporal_filter(search_filters),
         )
 
         # Map UUIDs to integers (anti-hallucination)
@@ -2694,12 +3021,20 @@ class AsyncMemory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            # valid_at 是事实在真实世界的生效日期，不是入库时间（方案 §4.1）。
+            mem_metadata["valid_at"] = _coerce_bitemporal_date(mem.get("valid_at"))
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
             await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
+
+        # Phase 5: Independent contradiction detection (1b). Second LLM call with its own
+        # system prompt; skipped when either side of the comparison is empty.
+        contradictions = []
+        if existing_results:
+            contradictions = await self._detect_contradictions_async(records, existing_results)
 
         # Phase 6: Batch persist
         all_vectors = [r[2] for r in records]
@@ -2743,6 +3078,28 @@ class AsyncMemory(MemoryBase):
                     )
                 except Exception as e:
                     logger.error(f"Failed to add history for {hr['memory_id']} (async): {e}")
+
+        # Phase 6b: Deterministic disposition (1c, 方案 §3.2 的 Phase 7) — pure code, the
+        # pairs from 1b become payload-only invalidations (R9/R10).
+        for update in _apply_contradictions(
+            contradictions,
+            {r[0]: r[3] for r in records},
+            {mem.id: dict(mem.payload or {}) for mem in existing_results},
+        ):
+            invalidation = {
+                "invalid_at": update["invalid_at"],
+                "superseded_by": update["superseded_by"],
+                "invalid_reason": update["invalid_reason"],
+            }
+            try:
+                await asyncio.to_thread(
+                    self.vector_store.update,
+                    vector_id=update["memory_id"],
+                    vector=None,
+                    payload=invalidation,
+                )
+            except Exception as e:
+                logger.error(f"Failed to invalidate memory {update['memory_id']} (async): {e}")
 
         # Phase 7: Batch entity linking
         try:
@@ -2864,6 +3221,38 @@ class AsyncMemory(MemoryBase):
         )
         return returned_memories
 
+    async def _detect_contradictions_async(self, records, existing_results) -> List[Dict[str, str]]:
+        """1b 的异步版本：独立 LLM 调用，只取回矛盾对（详见 sync 同名方法）。"""
+        new_facts = [
+            {"id": record[0], "text": record[1], "valid_at": record[3].get("valid_at")}
+            for record in records
+        ]
+        existing_facts = [
+            {
+                "id": mem.id,
+                "text": (mem.payload or {}).get("data", ""),
+                "valid_at": (mem.payload or {}).get("valid_at"),
+                "created_at": (mem.payload or {}).get("created_at"),
+            }
+            for mem in existing_results
+        ]
+        user_prompt = generate_contradiction_detection_prompt(
+            new_facts=new_facts, existing_facts=existing_facts
+        )
+        try:
+            response = await asyncio.to_thread(
+                self.llm.generate_response,
+                messages=[
+                    {"role": "system", "content": CONTRADICTION_DETECTION_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as e:
+            logger.error(f"LLM contradiction detection failed (async): {e}")
+            return []
+        return _parse_contradiction_pairs(response)
+
     async def get(self, memory_id):
         """
         Retrieve a memory by ID asynchronously.
@@ -2880,15 +3269,7 @@ class AsyncMemory(MemoryBase):
             await display_first_run_notice_async(self, "async", "get")
             return None
 
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
@@ -2904,6 +3285,10 @@ class AsyncMemory(MemoryBase):
             if key in memory.payload:
                 result_item[key] = memory.payload[key]
 
+        # Bi-temporal fields are first-class: always top-level, null when unset.
+        for key in BI_TEMPORAL_FIELDS:
+            result_item.setdefault(key, None)
+
         additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
         if additional_metadata:
             result_item["metadata"] = additional_metadata
@@ -2917,6 +3302,8 @@ class AsyncMemory(MemoryBase):
         filters: Optional[Dict[str, Any]] = None,
         top_k: int = 20,
         show_expired: bool = False,
+        as_of: Optional[str] = None,
+        include_invalidated: bool = False,
         **kwargs,
     ):
         """
@@ -2928,6 +3315,10 @@ class AsyncMemory(MemoryBase):
                 Example: filters={"user_id": "u1", "agent_id": "a1"}
             top_k (int, optional): The maximum number of memories to return. Defaults to 20.
             show_expired (bool, optional): Include expired memories. Defaults to False.
+            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
+                were valid at T (point-in-time). None means the current moment.
+            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
+                validity filter. Defaults to False.
 
         Returns:
             dict: A dictionary containing a list of memories under the "results" key.
@@ -2974,7 +3365,7 @@ class AsyncMemory(MemoryBase):
             "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"}
         )
 
-        all_memories_result = await self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit)
+        all_memories_result = await self._get_all_from_vector_store(effective_filters, fetch_limit, show_expired, limit, as_of, include_invalidated)
 
         if scale_threshold_notice:
             await display_scale_threshold_notice_async(self, "async", "get_all", *scale_threshold_notice)
@@ -2982,8 +3373,14 @@ class AsyncMemory(MemoryBase):
             await display_first_run_notice_async(self, "async", "get_all")
         return {"results": all_memories_result}
 
-    async def _get_all_from_vector_store(self, filters, limit, show_expired=False, output_limit=None):
-        memories_result = await asyncio.to_thread(self.vector_store.list, filters=filters, top_k=limit)
+    async def _get_all_from_vector_store(
+        self, filters, limit, show_expired=False, output_limit=None, as_of=None, include_invalidated=False
+    ):
+        memories_result = await asyncio.to_thread(
+            self.vector_store.list,
+            filters=_with_bitemporal_filter(filters, as_of, include_invalidated),
+            top_k=limit,
+        )
 
         # Handle different vector store return formats by inspecting first element
         if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
@@ -2998,15 +3395,7 @@ class AsyncMemory(MemoryBase):
         else:
             actual_memories = memories_result
 
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
         formatted_memories = []
@@ -3024,6 +3413,9 @@ class AsyncMemory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
+
+            for key in BI_TEMPORAL_FIELDS:
+                memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
@@ -3046,6 +3438,8 @@ class AsyncMemory(MemoryBase):
         explain: bool = False,
         reference_date: Optional[Any] = None,
         show_expired: bool = False,
+        as_of: Optional[str] = None,
+        include_invalidated: bool = False,
         **kwargs,
     ):
         """
@@ -3079,6 +3473,10 @@ class AsyncMemory(MemoryBase):
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
             show_expired (bool, optional): Include expired memories. Defaults to False.
+            as_of (str, optional): `YYYY-MM-DD` or ISO8601 instant T. Returns the facts that
+                were valid at T (point-in-time). None means the current moment.
+            include_invalidated (bool, optional): Return invalidated facts too, ignoring the
+                validity filter. Defaults to False.
 
         Returns:
             dict: A dictionary containing the search results under a "results" key.
@@ -3155,7 +3553,12 @@ class AsyncMemory(MemoryBase):
 
         search_start = time.perf_counter()
         original_memories = await self._search_vector_store(
-            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
+            query,
+            _with_bitemporal_filter(effective_filters, as_of, include_invalidated),
+            limit,
+            threshold,
+            explain=explain,
+            show_expired=show_expired,
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
@@ -3352,15 +3755,7 @@ class AsyncMemory(MemoryBase):
         )
 
         # Step 9: Format results
-        promoted_payload_keys = [
-            "user_id",
-            "agent_id",
-            "run_id",
-            "actor_id",
-            "role",
-            "attributed_to",
-            "expiration_date",
-        ]
+        promoted_payload_keys = BI_TEMPORAL_PAYLOAD_KEYS
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
 
         original_memories = []
@@ -3381,6 +3776,9 @@ class AsyncMemory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in payload:
                     memory_item_dict[key] = payload[key]
+
+            for key in BI_TEMPORAL_FIELDS:
+                memory_item_dict.setdefault(key, None)
 
             additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
@@ -3407,7 +3805,7 @@ class AsyncMemory(MemoryBase):
         if not deduped:
             return {}
 
-        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        search_filters = _scope_filters(filters)
         memory_boosts = {}
 
         try:

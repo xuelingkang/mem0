@@ -912,6 +912,45 @@ class TestEntityBoostParallelism:
 
         mock_memory.embedding_model.embed_batch.assert_called_once_with(["alice", "bob", "carol"], "search")
 
+    def test_sync_scope_survives_and_wrapped_filters(self, mock_memory):
+        """Entity boosts must stay scoped when search() passes an AND-wrapped filter.
+
+        `Memory.search` merges the bi-temporal validity predicate as
+        `{"AND": [scope, predicate]}`; reading the scope keys off the top level would
+        yield `{}` and silently upgrade the entity lookup to a global (cross-user) one.
+        """
+        mock_memory.embedding_model = Mock()
+        mock_memory.embedding_model.embed_batch = Mock(return_value=[[0.1]])
+        mock_memory._entity_store = Mock()
+        mock_memory._entity_store.search = Mock(return_value=[_make_match(0.7, ["mem-1"])])
+
+        merged = {
+            "AND": [
+                {"user_id": "u1", "agent_id": "a1"},
+                {"NOT": [{"invalid_at": {"lte": "2026-09-17T00:00:00+00:00"}}]},
+            ]
+        }
+        mock_memory._compute_entity_boosts([("person", "alice")], merged)
+
+        assert mock_memory._entity_store.search.call_args.kwargs["filters"] == {"user_id": "u1", "agent_id": "a1"}
+
+    @pytest.mark.asyncio
+    async def test_async_scope_survives_and_wrapped_filters(self, mock_async_memory):
+        mock_async_memory.embedding_model = Mock()
+        mock_async_memory.embedding_model.embed_batch = Mock(return_value=[[0.1]])
+        mock_async_memory._entity_store = Mock()
+        mock_async_memory._entity_store.search = Mock(return_value=[_make_match(0.7, ["mem-1"])])
+
+        merged = {
+            "AND": [
+                {"user_id": "u1"},
+                {"NOT": [{"invalid_at": {"lte": "2026-09-17T00:00:00+00:00"}}]},
+            ]
+        }
+        await mock_async_memory._compute_entity_boosts_async([("person", "alice")], merged)
+
+        assert mock_async_memory._entity_store.search.call_args.kwargs["filters"] == {"user_id": "u1"}
+
     @pytest.mark.asyncio
     async def test_async_boosts_preserve_scoring(self, mock_async_memory):
         from mem0.utils.scoring import ENTITY_BOOST_WEIGHT

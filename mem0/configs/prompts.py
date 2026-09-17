@@ -625,6 +625,8 @@ ADDITIVE_EXTRACTION_PROMPT = """# 角色
 ### 时间锚定
 保留确切日期、持续时间和时间关系。使用观察日期（而非当前日期）将相对时间转换为绝对时间。绝不要把绝对时间转成模糊表述。"18 天"就写"18 天"，不要写"一段时间"。
 
+每条记忆都必须带 `valid_at`。带时间的事实写绝对日期；描述当前状态的事实写观察日期；无法判定生效起点的持久事实写 null。`valid_at` 表述的是事实本身何时为真，与这条记忆何时进入系统无关。
+
 ### 数字精确
 按原样保留确切数量。"416 页"就写"416 页"，不要写"大约 400 页"。
 
@@ -698,9 +700,9 @@ ADDITIVE_EXTRACTION_PROMPT = """# 角色
 
 输出：
 {"memory": [
-  {"id": "0", "text": "用户名叫 Marcus，在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师，为此奋斗了两年"},
-  {"id": "1", "text": "Marcus 有位妻子叫 Elena，他们常在常去的餐厅 Osteria Francescana 庆祝特殊场合"},
-  {"id": "2", "text": "Marcus 和妻子 Elena 预计在 2026 年 3 月迎来第一个宝宝"}
+  {"id": "0", "text": "用户名叫 Marcus，在 2025 年 8 月 12 日前后晋升为 Shopify 高级工程师，为此奋斗了两年", "valid_at": "2025-08-12"},
+  {"id": "1", "text": "Marcus 有位妻子叫 Elena，他们常在常去的餐厅 Osteria Francescana 庆祝特殊场合", "valid_at": null},
+  {"id": "2", "text": "Marcus 和妻子 Elena 预计在 2026 年 3 月迎来第一个宝宝", "valid_at": "2026-03-01"}
 ]}
 
 三个不同主题——职业、关系/餐饮、家庭里程碑——各自拥有完整上下文的独立记忆。
@@ -847,11 +849,11 @@ ADDITIVE_EXTRACTION_PROMPT = """# 角色
 
 输出：
 {"memory": [
-  {"id": "0", "text": "用户于 2025 年 3 月 1-2 日前后领养了一只名叫 Max 的比格混血小狗"},
-  {"id": "1", "text": "用户开始上每周二的陶艺课"},
-  {"id": "2", "text": "用户在陶艺课上用女儿的脸做了一个陶瓷杯子"},
-  {"id": "3", "text": "用户的妹妹最近搬到波特兰"},
-  {"id": "4", "text": "用户在 2025 年 3 月 3 日前后被提升为团队负责人，对近期所有变化感到开心但又有些不知所措"}
+  {"id": "0", "text": "用户于 2025 年 3 月 1-2 日前后领养了一只名叫 Max 的比格混血小狗", "valid_at": "2025-03-01"},
+  {"id": "1", "text": "用户开始上每周二的陶艺课", "valid_at": "2025-03-10"},
+  {"id": "2", "text": "用户在陶艺课上用女儿的脸做了一个陶瓷杯子", "valid_at": "2025-03-10"},
+  {"id": "3", "text": "用户的妹妹最近搬到波特兰", "valid_at": "2025-03-03"},
+  {"id": "4", "text": "用户在 2025 年 3 月 3 日前后被提升为团队负责人，对近期所有变化感到开心但又有些不知所措", "valid_at": "2025-03-03"}
 ]}
 
 5 条消息中的 5 个主题——每个分别提取。不要在第一个主题（小狗）后停止。陶艺杯子的细节、妹妹的搬家以及对晋升的情绪反应都是独立、可提取的事实。
@@ -894,8 +896,8 @@ ADDITIVE_EXTRACTION_PROMPT = """# 角色
 
 {
   "memory": [
-    {"id": "0", "text": "第一条提取的记忆", "attributed_to": "user", "linked_memory_ids": ["相关已有记忆的uuid"]},
-    {"id": "1", "text": "第二条提取的记忆", "attributed_to": "assistant"},
+    {"id": "0", "text": "第一条提取的记忆", "attributed_to": "user", "linked_memory_ids": ["相关已有记忆的uuid"], "valid_at": "2024-03-05"},
+    {"id": "1", "text": "第二条提取的记忆", "attributed_to": "assistant", "valid_at": null},
   ]
 }
 
@@ -905,6 +907,13 @@ ADDITIVE_EXTRACTION_PROMPT = """# 角色
 - **text**（字符串，必填）：上下文丰富、自包含的事实陈述（15-80 词）。
 - **attributed_to**（字符串，必填）：这条记忆关于谁。用户陈述的或关于用户的事实（偏好、计划、个人事实）用 "user"；助手提供的信息（建议、确认、创建的计划、调研获得的信息）用 "assistant"。
 - **linked_memory_ids**（字符串数组，可选）：与这条新记忆相关的已有记忆的 ID。使用已有记忆列表中的确切 ID。没有相关已有记忆则省略或传 []。
+- **valid_at**（字符串或 null）：这条事实在真实世界中**开始为真**的日期，格式 `YYYY-MM-DD`。它不是入库时间。
+  - 事实带有明确时间（"2024 年 3 月 5 日签约"）→ 写该日期。
+  - 事实带有相对时间（"昨天"、"上周"、"下个月"）→ 按「观察日期」解析为绝对日期后写入。
+  - 事实描述的是当前状态（"我现在住在柏林"、"已经从杏仁奶换成燕麦奶"）→ 写观察日期。
+  - 事实指向未来（"下个月搬到柏林"、"预计 2026 年 3 月迎来第一个宝宝"）→ 写该未来日期。
+  - 事实是持久属性、偏好或无法判定何时开始（"我喜欢喝黑咖啡"、"用户有条叫 Poppy 的狗"）→ 写 null。
+  - 不要用"当前日期"填空，不要推测，不要为了填满字段而编造日期。
 
 ## 规则
 
@@ -930,6 +939,83 @@ The primary entity is an AI agent. Frame memories from the agent's perspective:
 
 The attributed_to field should still reflect the original source: "user" for facts the user stated, "assistant" for things the agent said or did.
 """
+
+
+# ---------------------------------------------------------------------------
+# V4 Bi-temporal contradiction detection (module 1b)
+# Paired with ADDITIVE_EXTRACTION_PROMPT (module 1a): this prompt only reports
+# contradicting (new, old) pairs. Retention/invalidation decisions belong to the
+# deterministic disposition in 1c, so the two prompts never share instructions.
+# ---------------------------------------------------------------------------
+
+CONTRADICTION_DETECTION_PROMPT = """# 角色
+
+你是一名矛盾检测器。你的唯一职责是找出「哪些新事实与哪些已有事实互相矛盾」，并输出这些配对。
+
+你不提取事实，不改写事实，不判断保留哪一条、失效哪一条——处置由下游的确定性代码按时间规则完成，不属于你的职责。
+
+# 什么构成矛盾
+
+一条新事实与一条已有事实构成矛盾，必须同时满足三个条件：
+
+1. **同主体**：两条事实关于同一个主体（同一个人、同一个 AI 助手、同一个具体实体）。
+2. **同属性**：两条事实描述该主体的同一个属性或同一个待判定问题（例如"居住城市"这一个属性）。
+3. **互斥值**：两条事实给出的取值不能同时为真。取值随时间先后变化，正是矛盾的典型形态，而不是排除矛盾的理由。
+
+三者缺一即不是矛盾。以下情况不是矛盾：
+
+- 不同主体（"用户住在巴黎"与"用户的妹妹住在里昂"）
+- 同一主体的不同属性（"用户住在巴黎"与"用户养了一条狗"）
+- 同一属性但取值可以并存（"用户喜欢喝咖啡"与"用户喜欢喝茶"）
+- 同一属性的不同事件、不同侧面或不同时间点的不同取值之外的信息（"用户周二跑了 5 公里"与"用户周三跑了 3 公里"）
+- 一条事实是另一条的细化、补充或蕴含，取值不冲突（"用户有只狗"与"用户的狗叫 Poppy"）
+- 语义等价或近等价的同一事实的两种说法——等价属于去重范畴，不是矛盾
+
+# 输入
+
+## 新事实
+
+本次从对话中新提取的事实。格式：
+
+[{"id": "新事实的 uuid", "text": "事实文本", "valid_at": "生效日期或 null"}]
+
+## 已有事实
+
+与本次对话相关的现有事实。格式：
+
+[{"id": "已有事实的 uuid", "text": "事实文本", "valid_at": "生效日期或 null", "created_at": "入库时间"}]
+
+# 输出
+
+只返回可由 json.loads() 解析的有效 JSON。不要任何文本、推理、解释或包装。
+
+{
+  "contradictions": [
+    {"new_id": "新事实的 uuid", "old_id": "已有事实的 uuid"}
+  ]
+}
+
+# 规则
+
+- `new_id` 只能取自「新事实」列表中真实存在的 id；`old_id` 只能取自「已有事实」列表中真实存在的 id。绝不虚构或猜测 id。
+- 同一个 (new_id, old_id) 配对只输出一次。
+- 一条新事实可以与多条已有事实矛盾；一条已有事实也可以被多条新事实矛盾——照实全部输出。
+- 没有矛盾时返回：{"contradictions": []}
+- 只输出配对，不给出保留或失效的建议。
+
+# 判定纪律
+
+- **拿不准就不输出**。多输出一个错误配对会让一条本来有效的事实被错误失效；漏输出只意味着这条矛盾留待下一次对话处理。
+- 时间先后不是排除矛盾的理由，也不是判定矛盾的理由——你只判断取值是否互斥。
+"""
+
+# 时点比较基准：任何真实日期都晚于该值，故 `NOT[valid_at >= BITEMP_EPOCH]` 等价于
+# "valid_at 缺失"，用于 point-in-time 判定中的 created_at 兜底分支。
+BITEMP_EPOCH = "1970-01-01T00:00:00Z"
+# 失效原因枚举的唯一取值（见 1c 的 R4）。
+INVALID_REASON_SUPERSEDED = "superseded_by_newer_fact"
+# 每次写入时取回的有效事实候选数，同时供 1a 去重参考与 1b 候选池使用。
+BITEMP_CANDIDATE_K = 20
 
 
 # ---------------------------------------------------------------------------
@@ -1033,5 +1119,22 @@ def generate_additive_extraction_prompt(
             "8. For CJK languages: maintain appropriate formality level from the source text."
         )
 
+    sections.append("# Output:")
+    return "\n\n".join(sections)
+
+
+def generate_contradiction_detection_prompt(
+    new_facts=None,
+    existing_facts=None,
+):
+    """Build the user prompt for independent contradiction detection (module 1b).
+
+    Pairs with CONTRADICTION_DETECTION_PROMPT. The LLM only reports
+    ``{"contradictions": [{"new_id": ..., "old_id": ...}]}``; deciding which
+    record is superseded is the deterministic job of ``_apply_contradictions``.
+    """
+    sections = []
+    sections.append(f"## New Facts\n{_serialize_memories(new_facts)}")
+    sections.append(f"## Existing Facts\n{_serialize_memories(existing_facts)}")
     sections.append("# Output:")
     return "\n\n".join(sections)
