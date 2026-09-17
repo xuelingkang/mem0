@@ -3618,10 +3618,10 @@ index 00000000..1f5be2bc
 +| mem0 上游 Dream / Synthesis（`docs/platform/features/dream.mdx`、`docs/api-reference/dream/*`） | 端点形态参照（preview / runs / sources 三分组）；**偏离点**：上游按纯 `user_id` 作用域且只处理启用后的新记忆，本机记忆全部带 `agent_id`，故作用域改为 `(user_id, agent_id)` 二元组；上游不区分观察与事实（pattern memory 与普通记忆同权返回），本方案以 `memory_kind` 区分并默认不返回观察 |
 +| bi-temporal 事实模型设计（`docs/design/bitemporal-fact-model.md`） | 条款同构：payload-only 更新、失效不删除、悬空指针不清洗、`invalid_reason` 枚举扩展、读侧一等字段提升 |
 diff --git a/mem0/configs/base.py b/mem0/configs/base.py
-index 5955ade6..15d8e623 100644
+index 5955ade6..e9a3828b 100644
 --- a/mem0/configs/base.py
 +++ b/mem0/configs/base.py
-@@ -26,6 +26,50 @@ class MemoryItem(BaseModel):
+@@ -26,6 +26,119 @@ class MemoryItem(BaseModel):
      updated_at: Optional[str] = Field(None, description="The timestamp when the memory was updated")
  
  
@@ -3669,16 +3669,89 @@ index 5955ade6..15d8e623 100644
 +    )
 +
 +
++class GraphConfig(BaseModel):
++    """旁路图检索（graph memory）配置：Graphiti 图桥 + 图加分。
++
++    设计见 `docs/design/graph-memory.md`。事实主存仍是 Qdrant；本配置段只控制
++    「新事实是否同步入图」与「检索时是否把图关联折算为补充加分」。
++
++    默认 `enabled=False`：关闭时不派发、不查询、不加分，检索与写入行为与引入本机制
++    之前逐位一致（`explain` 输出也不出现图分量键）。
++    """
++
++    enabled: bool = Field(
++        description="图能力总开关。关闭时不派发、不查询、不加分。",
++        default=False,
++    )
++    endpoint: str = Field(
++        description="图桥服务地址（`/episodes`、`/search` 所在的服务根）。",
++        default="http://graph-bridge:8000",
++    )
++    weight: float = Field(
++        description="图加分上限 W_g，与实体加入上限同量级（默认 0.5）。",
++        default=0.5,
++        ge=0.0,
++    )
++    max_facts: int = Field(
++        description="每次图检索取用的事实条数（按图检索返回顺序定权）。",
++        default=10,
++        ge=1,
++    )
++    timeout_seconds: float = Field(
++        description="图检索硬超时预算（秒）。超时即本次无图信号，不延长响应。",
++        default=0.4,
++        gt=0,
++    )
++    include_invalidated: bool = Field(
++        description="是否采用 `invalid_at` 非空（图侧已失效）的事实，默认不采用。",
++        default=False,
++    )
++    queue_size: int = Field(
++        description="入图派发队列容量；满时丢弃最旧任务并计入 `graph_dropped`。",
++        default=1000,
++        ge=1,
++    )
++    max_retries: int = Field(
++        description="单条 episode 的最大重试次数。",
++        default=3,
++        ge=0,
++    )
++    retry_backoff_seconds: float = Field(
++        description="线性退避基数：第 n 次重试等待 n × 基数。",
++        default=5.0,
++        ge=0,
++    )
++    circuit_breaker_failures: int = Field(
++        description="连续失败达到该值进入冷却窗口。",
++        default=5,
++        ge=1,
++    )
++    circuit_cooldown_seconds: float = Field(
++        description="熔断冷却窗口（秒）；窗口内派发直接丢弃并计数，结束后放行一条探测。",
++        default=60.0,
++        gt=0,
++    )
++    request_timeout_seconds: float = Field(
++        description="图桥写入请求（`/episodes`）的单次超时（秒）。",
++        default=120.0,
++        gt=0,
++    )
++
++
  class MemoryConfig(BaseModel):
      vector_store: VectorStoreConfig = Field(
          description="Configuration for the vector store",
-@@ -55,6 +99,10 @@ class MemoryConfig(BaseModel):
+@@ -55,6 +168,14 @@ class MemoryConfig(BaseModel):
          description="Custom instructions for fact extraction",
          default=None,
      )
 +    decay: DecayConfig = Field(
 +        description="Retrieval decay: Ebbinghaus forgetting curve plus access reinforcement.",
 +        default_factory=DecayConfig,
++    )
++    graph: GraphConfig = Field(
++        description="Graph memory: Graphiti side-car graph with additive retrieval boost.",
++        default_factory=GraphConfig,
 +    )
  
  
@@ -5836,11 +5909,392 @@ index 00000000..f6191f16
 +    with open(path, "w", encoding="utf-8") as handle:
 +        json.dump(report, handle, ensure_ascii=False, indent=2, default=str)
 +    return path
+diff --git a/mem0/memory/graph_sync.py b/mem0/memory/graph_sync.py
+new file mode 100644
+index 00000000..b3e17eca
+--- /dev/null
++++ b/mem0/memory/graph_sync.py
+@@ -0,0 +1,375 @@
++"""图记忆同步：把新事实派发入图（Graphiti 图桥），并把图关联折算为补充加分。
++
++设计见 `docs/design/graph-memory.md`。本模块只负责与图桥相关的三件事，事实主存
++（Qdrant）在任何路径上都不被改写：
++
++| 职责 | 入口 | 关键约束 |
++| --- | --- | --- |
++| 作用域 → 图键 | `derive_group_id` | 纯函数，写入派发与检索查询共用同一来源 |
++| 事实入图 | `GraphSync.dispatch` / `GraphSync` 的串行 worker | 内存队列投递 O(1) 且不抛异常；失败重试、连续失败熔断 |
++| 图检索与折算 | `search_graph_facts` / `compute_graph_boosts` | 硬超时预算；纯函数折算，不依赖 LLM |
++
++两条不变量：
++
++* **降级**：图桥不可用时写入与检索照常，图分支静默跳过——派发失败只记计数器，
++  图检索异常/超时一律按「本次无图信号」返回。
++* **写路径零阻塞**：`dispatch` 只做一次内存入队；HTTP 调用发生在独立线程的事件循环里，
++  与 FastAPI 的请求线程池互不占用。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import queue
++import re
++import threading
++import time
++from datetime import datetime, timezone
++from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
++
++import httpx
++
++from mem0.configs.base import GraphConfig
++
++logger = logging.getLogger(__name__)
++
++# 作用域键的优先级：user_id 优先，其次 agent_id，再次 run_id（与 mem0 的作用域语义一致）。
++SCOPE_KEYS = ("user_id", "agent_id", "run_id")
++
++# 图键前缀。graphiti 侧 `validate_group_id` 只接受 [A-Za-z0-9_-]，因此分隔符取下划线
++# 而非冒号，作用域值里的其它字符一并归一为下划线（同一作用域恒得同一图键）。
++GROUP_ID_PREFIX = "mem0"
++_GROUP_ID_MAX_LENGTH = 96
++_GROUP_ID_INVALID = re.compile(r"[^0-9A-Za-z_-]")
++
++# 图检索事实的排序权重：w(k) = 1 / (1 + 0.5 × (k − 1))，k 从 1 起。
++_RANK_DECAY_STEP = 0.5
++
++# 入队的最大尝试次数：队列被并发排空时的兜底上界，保证派发是 O(1) 且必然返回。
++_QUEUE_PUSH_ATTEMPTS = 8
++
++
++def sanitize_group_id(value: Any) -> str:
++    """把作用域值归一为 graphiti 接受的图键片段。
++
++    只保留 ASCII 字母/数字/下划线/连字符，其余字符替换为下划线；超长时截断（图键是
++    Redis key 名，长度受键名限制约束）。
++    """
++    text = _GROUP_ID_INVALID.sub("_", str(value).strip())
++    if len(text) > _GROUP_ID_MAX_LENGTH:
++        text = text[:_GROUP_ID_MAX_LENGTH]
++    return text
++
++
++def _scope_from_filters(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++    """取出作用域键，兼容被 `AND` 包裹的谓词（与 `_scope_filters` 同形）。"""
++    if not filters:
++        return {}
++    if isinstance(filters.get("AND"), list):
++        merged: Dict[str, Any] = {}
++        for sub in filters["AND"]:
++            merged.update(_scope_from_filters(sub))
++        return merged
++    return {k: v for k, v in filters.items() if k in SCOPE_KEYS and v}
++
++
++def derive_group_id(filters: Optional[Dict[str, Any]]) -> Optional[str]:
++    """由作用域派生图键；派生不出作用域时返回 None（调用方一律跳过图分支）。
++
++    写入派发与检索查询共用本函数，保证「写进哪个图」与「从哪里检索」永不漂移。
++    """
++    scope = _scope_from_filters(filters)
++    for key in SCOPE_KEYS:
++        value = scope.get(key)
++        if value:
++            return f"{GROUP_ID_PREFIX}_{sanitize_group_id(value)}"
++    return None
++
++
++def compute_graph_boosts(
++    facts: Sequence[Dict[str, Any]],
++    candidate_ids: Iterable[str],
++    weight: float,
++    include_invalidated: bool = False,
++) -> Tuple[Dict[str, float], Dict[str, int]]:
++    """把图检索结果折算为候选池内的加分（纯函数，设计 §6.2）。
++
++    Args:
++        facts: 图桥返回的事实列表，**顺序即相关度序**（第 k 条权重 `1/(1+0.5(k-1))`）。
++        candidate_ids: 本次检索的候选池 id 集合；池外 id 一律忽略。
++        weight: 图加分上限 `W_g`。
++        include_invalidated: 是否采用 `invalid_at` 非空的事实。
++
++    Returns:
++        `(boosts, fact_counts)`：前者仅含加分 > 0 的候选（用于判断分母是否增长），
++        后者记录每个候选被多少条事实命中（可解释输出用）。
++    """
++    candidates = {str(mid) for mid in candidate_ids}
++    boosts: Dict[str, float] = {}
++    fact_counts: Dict[str, int] = {}
++    if weight <= 0:
++        return boosts, fact_counts
++
++    for index, fact in enumerate(facts):
++        if not isinstance(fact, dict):
++            continue
++        # 图侧已失效的事实默认不参与加分，与主通道的失效语义保持一致（设计 §2.1 F8）。
++        if not include_invalidated and fact.get("invalid_at"):
++            continue
++        episodes = fact.get("episodes")
++        if not isinstance(episodes, list):
++            continue
++        rank_weight = 1.0 / (1.0 + _RANK_DECAY_STEP * index)
++        for episode in episodes:
++            if episode is None:
++                continue
++            memory_id = str(episode)
++            if memory_id not in candidates:
++                continue
++            boost = weight * rank_weight
++            if boost > boosts.get(memory_id, 0.0):
++                boosts[memory_id] = boost
++            fact_counts[memory_id] = fact_counts.get(memory_id, 0) + 1
++
++    return boosts, fact_counts
++
++
++def _parse_reference_time(value: Any) -> datetime:
++    """把 ISO 字符串/日期时间解析为 UTC datetime；不可解析时取当前时刻。"""
++    if isinstance(value, datetime):
++        parsed = value
++    elif isinstance(value, str) and value.strip():
++        try:
++            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++        except ValueError:
++            return datetime.now(timezone.utc)
++    else:
++        return datetime.now(timezone.utc)
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=timezone.utc)
++    return parsed.astimezone(timezone.utc)
++
++
++class GraphBridgeClient:
++    """图桥的同步 HTTP 客户端（写入侧在 worker 线程使用，检索侧在请求线程使用）。"""
++
++    def __init__(self, endpoint: str, timeout_seconds: float = 120.0):
++        self.endpoint = endpoint.rstrip("/")
++        self.timeout_seconds = timeout_seconds
++        self._client = httpx.Client(base_url=self.endpoint, timeout=timeout_seconds)
++
++    def post_episode(self, payload: Dict[str, Any]) -> Dict[str, Any]:
++        """投递一条 episode；非 2xx 抛异常（由调用方按失败处理）。"""
++        response = self._client.post("/episodes", json=payload)
++        response.raise_for_status()
++        return response.json()
++
++    def search(self, payload: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
++        """图检索；超时预算由调用方按次给出。"""
++        response = self._client.post("/search", json=payload, timeout=timeout_seconds)
++        response.raise_for_status()
++        return response.json()
++
++    def close(self) -> None:
++        self._client.close()
++
++
++def search_graph_facts(
++    client: Any,
++    group_id: Optional[str],
++    query: str,
++    max_facts: int,
++    timeout_seconds: float,
++) -> List[Dict[str, Any]]:
++    """取回一次图检索的事实列表；任何失败（含超时、畸形响应）都返回空列表。
++
++    检索缺图信号按「无信号」打分，因此本函数**不抛异常**：图侧故障的可见面是日志与
++    计数器，而不是响应内容或响应时延（设计 §6.4）。
++    """
++    if not group_id or not query:
++        return []
++    try:
++        payload = client.search(
++            {"group_ids": [group_id], "query": query, "max_facts": max_facts},
++            timeout_seconds,
++        )
++    except Exception as exc:  # noqa: BLE001 - 图侧任何异常都不得外溢到主检索
++        logger.debug("Graph search skipped (bridge unavailable): %s", exc)
++        return []
++
++    facts = payload.get("facts") if isinstance(payload, dict) else None
++    if not isinstance(facts, list):
++        return []
++    return [fact for fact in facts if isinstance(fact, dict)]
++
++
++class GraphSync:
++    """把新写入的事实异步派发入图（设计 §5.1–5.3）。
++
++    队列为进程内有界队列；worker 为单线程 + 独立事件循环，串行调用图桥（Graphiti 要求
++    同一分区的 episode 顺序摄入）。派发路径只做内存入队，不做任何 I/O。
++    """
++
++    def __init__(self, config: GraphConfig, client: Optional[Any] = None):
++        self.config = config
++        self._client = client if client is not None else GraphBridgeClient(config.endpoint, config.request_timeout_seconds)
++        self._queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=config.queue_size)
++        self._lock = threading.Lock()
++        self._counters: Dict[str, int] = {
++            "graph_dispatched": 0,
++            "graph_synced": 0,
++            "graph_already_synced": 0,
++            "graph_failed": 0,
++            "graph_dropped": 0,
++        }
++        self._consecutive_failures = 0
++        self._circuit_open_until = 0.0
++        self._worker: Optional[threading.Thread] = None
++        self._stopping = threading.Event()
++
++    # ------------------------------------------------------------------ counters
++
++    def stats(self) -> Dict[str, Any]:
++        """返回派发计数与熔断状态（`/stats` 与测试的观测面）。"""
++        with self._lock:
++            snapshot = dict(self._counters)
++            snapshot["circuit_open"] = self._circuit_open_until > time.monotonic()
++            snapshot["queue_size"] = self._queue.qsize()
++            snapshot["consecutive_failures"] = self._consecutive_failures
++        return snapshot
++
++    def _bump(self, key: str, amount: int = 1) -> None:
++        with self._lock:
++            self._counters[key] = self._counters.get(key, 0) + amount
++
++    # ------------------------------------------------------------------ dispatch
++
++    def dispatch(self, memory_id: str, text: str, created_at: Any, group_id: Optional[str]) -> bool:
++        """把一个新事实投递进队列；返回是否入队。
++
++        入队是 O(1) 的内存操作且不抛异常：队列满时丢弃最旧任务并累加 `graph_dropped`，
++        任何异常都被吞掉（写入结果不因图侧而改变）。
++        """
++        if not self.config.enabled or not group_id or not memory_id:
++            return False
++        task = {
++            "uuid": str(memory_id),
++            "group_id": group_id,
++            "text": text,
++            "reference_time": _parse_reference_time(created_at).isoformat(),
++            "source_description": "mem0 事实同步",
++        }
++        try:
++            # 队列满时丢弃最旧任务再入队；重试次数有界，避免队列被并发排空时死循环。
++            for _ in range(_QUEUE_PUSH_ATTEMPTS):
++                try:
++                    self._queue.put_nowait(task)
++                    break
++                except queue.Full:
++                    try:
++                        self._queue.get_nowait()
++                        self._bump("graph_dropped")
++                    except queue.Empty:
++                        continue
++            else:
++                self._bump("graph_dropped")
++                return False
++            self._bump("graph_dispatched")
++            self.start()
++            return True
++        except Exception as exc:  # noqa: BLE001 - 派发失败不得影响写入结果
++            logger.warning("Graph dispatch failed for %s: %s", memory_id, exc)
++            self._bump("graph_dropped")
++            return False
++
++    # ------------------------------------------------------------------ worker
++
++    def start(self) -> None:
++        """惰性启动 worker 线程（首次派发时）。"""
++        if self._worker is not None and self._worker.is_alive():
++            return
++        with self._lock:
++            if self._worker is not None and self._worker.is_alive():
++                return
++            self._stopping.clear()
++            self._worker = threading.Thread(target=self._run, name="mem0-graph-sync", daemon=True)
++            self._worker.start()
++
++    def stop(self, timeout: float = 5.0) -> None:
++        """停止 worker（测试与关停用）；队列中未处理的任务不保证完成。"""
++        self._stopping.set()
++        worker = self._worker
++        if worker is not None:
++            worker.join(timeout=timeout)
++        self._worker = None
++
++    def _run(self) -> None:
++        """worker 主体：在独立事件循环里串行处理队列。"""
++        loop = asyncio.new_event_loop()
++        asyncio.set_event_loop(loop)
++        try:
++            while not self._stopping.is_set():
++                try:
++                    task = self._queue.get(timeout=0.2)
++                except queue.Empty:
++                    continue
++                if task is None:
++                    continue
++                try:
++                    loop.run_until_complete(self._sync_one(task))
++                except Exception as exc:  # noqa: BLE001 - worker 不得因单条任务退出
++                    logger.warning("Graph sync worker error: %s", exc)
++        finally:
++            try:
++                loop.close()
++            except Exception:  # noqa: BLE001
++                pass
++
++    def _circuit_is_open(self) -> bool:
++        return self._circuit_open_until > time.monotonic()
++
++    def _register_failure(self) -> None:
++        with self._lock:
++            self._consecutive_failures += 1
++            if self._consecutive_failures >= self.config.circuit_breaker_failures:
++                self._circuit_open_until = time.monotonic() + self.config.circuit_cooldown_seconds
++                logger.warning(
++                    "Graph sync circuit opened for %.1fs after %d consecutive failures",
++                    self.config.circuit_cooldown_seconds,
++                    self._consecutive_failures,
++                )
++
++    def _register_success(self) -> None:
++        with self._lock:
++            self._consecutive_failures = 0
++            self._circuit_open_until = 0.0
++
++    async def _sync_one(self, task: Dict[str, Any]) -> None:
++        """投递单条 episode，带重试；冷却窗口内的任务直接丢弃并计数（设计 §5.2）。"""
++        if self._circuit_is_open():
++            self._bump("graph_dropped")
++            return
++        attempts = self.config.max_retries + 1
++        for attempt in range(attempts):
++            if attempt > 0:
++                await asyncio.sleep(attempt * self.config.retry_backoff_seconds)
++            try:
++                result = await asyncio.to_thread(self._client.post_episode, task)
++            except Exception as exc:  # noqa: BLE001 - 非 2xx / 连接失败 / 超时一律视为失败
++                logger.debug("Graph episode sync attempt %d failed: %s", attempt + 1, exc)
++                continue
++            self._register_success()
++            status = (result or {}).get("status")
++            self._bump("graph_already_synced" if status == "already_synced" else "graph_synced")
++            return
++        self._bump("graph_failed")
++        self._register_failure()
++
++    def close(self) -> None:
++        """停止 worker 并关闭 HTTP 客户端。"""
++        self.stop()
++        try:
++            self._client.close()
++        except Exception:  # noqa: BLE001
++            pass
 diff --git a/mem0/memory/main.py b/mem0/memory/main.py
-index a8b159f1..1c5ab328 100644
+index a8b159f1..e0029ea5 100644
 --- a/mem0/memory/main.py
 +++ b/mem0/memory/main.py
-@@ -4,23 +4,31 @@ import gc
+@@ -4,27 +4,42 @@ import gc
  import hashlib
  import json
  import logging
@@ -5858,7 +6312,7 @@ index a8b159f1..1c5ab328 100644
  from pydantic import ValidationError
  
 -from mem0.configs.base import MemoryConfig, MemoryItem
-+from mem0.configs.base import DecayConfig, MemoryConfig, MemoryItem
++from mem0.configs.base import DecayConfig, GraphConfig, MemoryConfig, MemoryItem
  from mem0.configs.enums import MemoryType
  from mem0.configs.prompts import (
      ADDITIVE_EXTRACTION_PROMPT,
@@ -5874,7 +6328,18 @@ index a8b159f1..1c5ab328 100644
  )
  from mem0.exceptions import LLMError
  from mem0.exceptions import ValidationError as Mem0ValidationError
-@@ -451,6 +459,521 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
+ from mem0.memory.base import MemoryBase
++from mem0.memory.graph_sync import (
++    GraphBridgeClient,
++    GraphSync,
++    compute_graph_boosts,
++    derive_group_id,
++    search_graph_facts,
++)
+ from mem0.memory.notices import (
+     PERFORMANCE_SLOW_QUERY_THRESHOLD_SECONDS,
+     detect_decay_usage_from_delete,
+@@ -451,6 +466,634 @@ def _payload_is_expired(payload: Optional[Dict[str, Any]]) -> bool:
          return False
  
  
@@ -6393,10 +6858,123 @@ index a8b159f1..1c5ab328 100644
 +        _dispatch_decay_reinforcement(memory.vector_store, updates)
 +
 +
++# ---------------------------------------------------------------------------
++# Graph memory (Graphiti side-car graph)
++#
++# Design: `docs/design/graph-memory.md`. New facts are dispatched to the graph bridge
++# asynchronously (the write path only enqueues), and `/search` folds the graph hits back
++# into the additive score as a bounded supplementary signal. Qdrant stays the single
++# source of truth: nothing here writes to the vector store, and every graph-side failure
++# degrades to "no graph signal this time" instead of touching the response.
++# ---------------------------------------------------------------------------
++
++
++def _graph_config_of(memory) -> Optional[GraphConfig]:
++    """取实例的图配置段；不是真正的 `GraphConfig` 时返回 None。
++
++    与 `_decay_config_of` 同理：返回 None 一律等价于「关闭」，实例若未携带配置段
++    （子类、测试替身、替身式 MagicMock 配置）就不得产生任何副作用，也不得让替身的
++    属性值流进算式。
++    """
++    config = getattr(getattr(memory, "config", None), "graph", None)
++    return config if isinstance(config, GraphConfig) else None
++
++
++def _graph_sync_of(memory) -> Optional[GraphSync]:
++    """取（并按需惰性创建）实例的图派发器；关闭态返回 None。"""
++    config = _graph_config_of(memory)
++    if config is None or not config.enabled:
++        return None
++    sync = getattr(memory, "_graph_sync", None)
++    if sync is None:
++        sync = GraphSync(config)
++        memory._graph_sync = sync
++    return sync
++
++
++def _graph_client(memory) -> GraphBridgeClient:
++    """取（并按需惰性创建）图桥 HTTP 客户端；检索路径与派发路径共用一个连接池。"""
++    client = getattr(memory, "_graph_bridge_client", None)
++    if client is None:
++        client = GraphBridgeClient(memory.config.graph.endpoint, memory.config.graph.request_timeout_seconds)
++        memory._graph_bridge_client = client
++    return client
++
++
++def _dispatch_graph_sync(memory, records: List[tuple], filters: Optional[Dict[str, Any]]) -> None:
++    """把本次写入的事实派发入图（设计 §5.1）。
++
++    派发只做内存入队，O(1) 且不抛异常，因此不进入写入响应的时延路径；图不可用时失败
++    由队列重试与熔断吸收，Qdrant 事实照常保留。关闭态下直接返回。
++
++    Args:
++        memory: `Memory` / `AsyncMemory` 实例（提供 `config.graph`）。
++        records: 写入管道的 `(memory_id, text, embedding, payload)` 记录列表。
++        filters: 写入时的作用域过滤条件，用于派生图键。
++    """
++    sync = _graph_sync_of(memory)
++    if sync is None or not records:
++        return
++    group_id = derive_group_id(filters)
++    if not group_id:
++        return
++    for record in records:
++        if not isinstance(record, (list, tuple)) or len(record) < 4:
++            continue
++        memory_id, text, _embedding, payload = record[0], record[1], record[2], record[3]
++        if not memory_id or not text:
++            continue
++        created_at = (payload or {}).get("created_at") if isinstance(payload, dict) else None
++        sync.dispatch(str(memory_id), str(text), created_at, group_id)
++
++
++def _graph_hits(
++    memory,
++    query: str,
++    candidates: List[Dict[str, Any]],
++    filters: Optional[Dict[str, Any]],
++) -> tuple:
++    """取回一次图检索并按候选池折算加分（设计 §6.1–6.2）。
++
++    Returns:
++        `(graph_boosts, graph_facts)`，或 `(None, None)` 表示图能力关闭——调用方把 None
++        原样传给打分器，使 `explain` 输出与引入本机制之前逐位一致。
++    """
++    config = _graph_config_of(memory)
++    if config is None or not config.enabled:
++        return None, None
++    group_id = derive_group_id(filters)
++    if not group_id or not candidates:
++        return {}, {}
++    facts = search_graph_facts(
++        _graph_client(memory),
++        group_id,
++        query,
++        config.max_facts,
++        config.timeout_seconds,
++    )
++    candidate_ids = [str(candidate["id"]) for candidate in candidates if candidate.get("id") is not None]
++    return compute_graph_boosts(
++        facts,
++        candidate_ids,
++        config.weight,
++        config.include_invalidated,
++    )
++
++
++def _compute_graph_hits(memory, query: str, candidates: List[Dict[str, Any]], filters) -> tuple:
++    """同步检索路径的图信号取数（异步版本经 `asyncio.to_thread` 复用同一逻辑）。"""
++    try:
++        return _graph_hits(memory, query, candidates, filters)
++    except Exception as exc:  # noqa: BLE001 - 图侧异常不得外溢到主检索
++        logger.warning(f"Graph boost computation failed: {exc}")
++        return {}, {}
++
++
  setup_config()
  logger = logging.getLogger(__name__)
  
-@@ -513,6 +1036,11 @@ class Memory(MemoryBase):
+@@ -513,6 +1156,11 @@ class Memory(MemoryBase):
          # Entity store is initialized lazily on first use
          self._entity_store = None
  
@@ -6408,7 +6986,7 @@ index a8b159f1..1c5ab328 100644
          if MEM0_TELEMETRY:
              # Create telemetry config manually to avoid deepcopy issues with thread locks
              telemetry_config_dict = {}
-@@ -555,6 +1083,18 @@ class Memory(MemoryBase):
+@@ -555,6 +1203,18 @@ class Memory(MemoryBase):
      def project(self):
          return _OSSProject()
  
@@ -6427,7 +7005,7 @@ index a8b159f1..1c5ab328 100644
      @property
      def entity_store(self):
          """Lazily initialize entity store on first use."""
-@@ -921,21 +1461,26 @@ class Memory(MemoryBase):
+@@ -921,21 +1581,26 @@ class Memory(MemoryBase):
          parsed_messages = parse_messages(messages)
  
          # Phase 1: Existing memory retrieval
@@ -6461,7 +7039,7 @@ index a8b159f1..1c5ab328 100644
  
          # Phase 2: LLM extraction (single call)
          is_agent_scoped = bool(filters.get("agent_id")) and not filters.get("user_id")
-@@ -1035,6 +1580,9 @@ class Memory(MemoryBase):
+@@ -1035,6 +1700,9 @@ class Memory(MemoryBase):
              mem_metadata["updated_at"] = mem_metadata["created_at"]
              if mem.get("attributed_to"):
                  mem_metadata["attributed_to"] = mem["attributed_to"]
@@ -6471,7 +7049,7 @@ index a8b159f1..1c5ab328 100644
  
              records.append((memory_id, text, embed_map[text], mem_metadata))
  
-@@ -1042,6 +1590,13 @@ class Memory(MemoryBase):
+@@ -1042,6 +1710,13 @@ class Memory(MemoryBase):
              self.db.save_messages(messages, session_scope)
              return []
  
@@ -6485,7 +7063,7 @@ index a8b159f1..1c5ab328 100644
          # Phase 6: Batch persist
          all_vectors = [r[2] for r in records]
          all_ids = [r[0] for r in records]
-@@ -1083,6 +1638,24 @@ class Memory(MemoryBase):
+@@ -1083,6 +1758,24 @@ class Memory(MemoryBase):
                  except Exception as e:
                      logger.error(f"Failed to add history for {hr['memory_id']}: {e}")
  
@@ -6510,7 +7088,17 @@ index a8b159f1..1c5ab328 100644
          # Phase 7: Batch entity linking
          try:
              all_texts = [r[1] for r in records]
-@@ -1205,6 +1778,41 @@ class Memory(MemoryBase):
+@@ -1192,6 +1885,9 @@ class Memory(MemoryBase):
+         # Phase 8: Save messages + return
+         self.db.save_messages(messages, session_scope)
+ 
++        # 图同步派发：内存入队，O(1) 且不抛异常，不进入写入响应时延路径（设计 §5.1）。
++        _dispatch_graph_sync(self, records, filters)
++
+         returned_memories = [
+             {"id": r[0], "memory": r[1], "event": "ADD"}
+             for r in records
+@@ -1205,6 +1901,41 @@ class Memory(MemoryBase):
          )
          return returned_memories
  
@@ -6552,7 +7140,7 @@ index a8b159f1..1c5ab328 100644
      def get(self, memory_id):
          """
          Retrieve a memory by ID.
-@@ -1221,15 +1829,7 @@ class Memory(MemoryBase):
+@@ -1221,15 +1952,7 @@ class Memory(MemoryBase):
              display_first_run_notice(self, "sync", "get")
              return None
  
@@ -6569,7 +7157,7 @@ index a8b159f1..1c5ab328 100644
  
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
-@@ -1245,6 +1845,10 @@ class Memory(MemoryBase):
+@@ -1245,6 +1968,10 @@ class Memory(MemoryBase):
              if key in memory.payload:
                  result_item[key] = memory.payload[key]
  
@@ -6580,7 +7168,7 @@ index a8b159f1..1c5ab328 100644
          additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
          if additional_metadata:
              result_item["metadata"] = additional_metadata
-@@ -1258,6 +1862,9 @@ class Memory(MemoryBase):
+@@ -1258,6 +1985,9 @@ class Memory(MemoryBase):
          filters: Optional[Dict[str, Any]] = None,
          top_k: int = 20,
          show_expired: bool = False,
@@ -6590,7 +7178,7 @@ index a8b159f1..1c5ab328 100644
          **kwargs,
      ):
          """
-@@ -1269,6 +1876,13 @@ class Memory(MemoryBase):
+@@ -1269,6 +1999,13 @@ class Memory(MemoryBase):
                  Example: filters={"user_id": "u1", "agent_id": "a1"}
              top_k (int, optional): The maximum number of memories to return. Defaults to 20.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -6604,7 +7192,7 @@ index a8b159f1..1c5ab328 100644
  
          Returns:
              dict: A dictionary containing a list of memories under the "results" key.
-@@ -1315,7 +1929,9 @@ class Memory(MemoryBase):
+@@ -1315,7 +2052,9 @@ class Memory(MemoryBase):
              "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"}
          )
  
@@ -6615,7 +7203,7 @@ index a8b159f1..1c5ab328 100644
  
          if scale_threshold_notice:
              display_scale_threshold_notice(self, "sync", "get_all", *scale_threshold_notice)
-@@ -1323,8 +1939,20 @@ class Memory(MemoryBase):
+@@ -1323,8 +2062,20 @@ class Memory(MemoryBase):
              display_first_run_notice(self, "sync", "get_all")
          return {"results": all_memories_result}
  
@@ -6638,7 +7226,7 @@ index a8b159f1..1c5ab328 100644
  
          # Handle different vector store return formats by inspecting first element
          if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
-@@ -1339,15 +1967,7 @@ class Memory(MemoryBase):
+@@ -1339,15 +2090,7 @@ class Memory(MemoryBase):
          else:
              actual_memories = memories_result
  
@@ -6655,7 +7243,7 @@ index a8b159f1..1c5ab328 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          formatted_memories = []
-@@ -1366,6 +1986,9 @@ class Memory(MemoryBase):
+@@ -1366,6 +2109,9 @@ class Memory(MemoryBase):
                  if key in mem.payload:
                      memory_item_dict[key] = mem.payload[key]
  
@@ -6665,7 +7253,7 @@ index a8b159f1..1c5ab328 100644
              additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  memory_item_dict["metadata"] = additional_metadata
-@@ -1387,6 +2010,9 @@ class Memory(MemoryBase):
+@@ -1387,6 +2133,9 @@ class Memory(MemoryBase):
          explain: bool = False,
          reference_date: Optional[Any] = None,
          show_expired: bool = False,
@@ -6675,7 +7263,7 @@ index a8b159f1..1c5ab328 100644
          **kwargs,
      ):
          """
-@@ -1420,6 +2046,14 @@ class Memory(MemoryBase):
+@@ -1420,6 +2169,14 @@ class Memory(MemoryBase):
              explain (bool, optional): Whether to include score_details for each result. Defaults to False.
              reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -6690,7 +7278,7 @@ index a8b159f1..1c5ab328 100644
  
          Returns:
              dict: A dictionary containing the search results under a "results" key.
-@@ -1492,7 +2126,12 @@ class Memory(MemoryBase):
+@@ -1492,7 +2249,12 @@ class Memory(MemoryBase):
  
          search_start = time.perf_counter()
          original_memories = self._search_vector_store(
@@ -6704,7 +7292,7 @@ index a8b159f1..1c5ab328 100644
          )
          search_elapsed_seconds = time.perf_counter() - search_start
  
-@@ -1504,6 +2143,10 @@ class Memory(MemoryBase):
+@@ -1504,6 +2266,10 @@ class Memory(MemoryBase):
              except Exception as e:
                  logger.warning(f"Reranking failed, using original results: {e}")
  
@@ -6715,19 +7303,23 @@ index a8b159f1..1c5ab328 100644
          if temporal_usage_notice:
              display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
          elif scale_threshold_notice:
-@@ -1677,6 +2320,7 @@ class Memory(MemoryBase):
+@@ -1677,6 +2443,9 @@ class Memory(MemoryBase):
              })
  
          # Step 8: Score and rank
 +        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
++        # 图分支与 BM25 / 实体加分的取数并列：超时或异常一律按「本次无图信号」处理。
++        graph_boosts, graph_facts = _compute_graph_hits(self, query, candidates, filters)
          scored_results = score_and_rank(
              semantic_results=candidates,
              bm25_scores=bm25_scores,
-@@ -1684,18 +2328,11 @@ class Memory(MemoryBase):
+@@ -1684,18 +2453,13 @@ class Memory(MemoryBase):
              threshold=threshold,
              top_k=limit,
              explain=explain,
 +            decay_factors=self._decay_factors(candidates),
++            graph_boosts=graph_boosts,
++            graph_facts=graph_facts,
          )
  
          # Step 9: Format results
@@ -6744,7 +7336,7 @@ index a8b159f1..1c5ab328 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          original_memories = []
-@@ -1718,6 +2355,9 @@ class Memory(MemoryBase):
+@@ -1718,6 +2482,9 @@ class Memory(MemoryBase):
                  if key in payload:
                      memory_item_dict[key] = payload[key]
  
@@ -6754,7 +7346,7 @@ index a8b159f1..1c5ab328 100644
              additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  if not memory_item_dict.get("metadata"):
-@@ -1753,7 +2393,7 @@ class Memory(MemoryBase):
+@@ -1753,7 +2520,7 @@ class Memory(MemoryBase):
          if not deduped:
              return {}
  
@@ -6763,7 +7355,7 @@ index a8b159f1..1c5ab328 100644
          memory_boosts = {}
  
          try:
-@@ -2188,6 +2828,11 @@ class AsyncMemory(MemoryBase):
+@@ -2188,6 +2955,11 @@ class AsyncMemory(MemoryBase):
          self.custom_instructions = self.config.custom_instructions
          self._entity_store = None
  
@@ -6775,7 +7367,7 @@ index a8b159f1..1c5ab328 100644
          # Initialize reranker if configured
          self.reranker = None
          if config.reranker:
-@@ -2220,6 +2865,18 @@ class AsyncMemory(MemoryBase):
+@@ -2220,6 +2992,18 @@ class AsyncMemory(MemoryBase):
      def project(self):
          return _AsyncOSSProject()
  
@@ -6794,7 +7386,7 @@ index a8b159f1..1c5ab328 100644
      @property
      def entity_store(self):
          """Lazily initialize entity store on first use."""
-@@ -2582,14 +3239,15 @@ class AsyncMemory(MemoryBase):
+@@ -2582,14 +3366,15 @@ class AsyncMemory(MemoryBase):
          parsed_messages = parse_messages(messages)
  
          # Phase 1: Existing memory retrieval
@@ -6812,7 +7404,7 @@ index a8b159f1..1c5ab328 100644
          )
  
          # Map UUIDs to integers (anti-hallucination)
-@@ -2693,6 +3351,8 @@ class AsyncMemory(MemoryBase):
+@@ -2693,6 +3478,8 @@ class AsyncMemory(MemoryBase):
              mem_metadata["updated_at"] = mem_metadata["created_at"]
              if mem.get("attributed_to"):
                  mem_metadata["attributed_to"] = mem["attributed_to"]
@@ -6821,7 +7413,7 @@ index a8b159f1..1c5ab328 100644
  
              records.append((memory_id, text, embed_map[text], mem_metadata))
  
-@@ -2700,6 +3360,12 @@ class AsyncMemory(MemoryBase):
+@@ -2700,6 +3487,12 @@ class AsyncMemory(MemoryBase):
              await asyncio.to_thread(self.db.save_messages, messages, session_scope)
              return []
  
@@ -6834,7 +7426,7 @@ index a8b159f1..1c5ab328 100644
          # Phase 6: Batch persist
          all_vectors = [r[2] for r in records]
          all_ids = [r[0] for r in records]
-@@ -2743,6 +3409,28 @@ class AsyncMemory(MemoryBase):
+@@ -2743,6 +3536,28 @@ class AsyncMemory(MemoryBase):
                  except Exception as e:
                      logger.error(f"Failed to add history for {hr['memory_id']} (async): {e}")
  
@@ -6863,7 +7455,17 @@ index a8b159f1..1c5ab328 100644
          # Phase 7: Batch entity linking
          try:
              all_texts = [r[1] for r in records]
-@@ -2863,6 +3551,38 @@ class AsyncMemory(MemoryBase):
+@@ -2850,6 +3665,9 @@ class AsyncMemory(MemoryBase):
+         # Phase 8: Save messages + return
+         await asyncio.to_thread(self.db.save_messages, messages, session_scope)
+ 
++        # 图同步派发：内存入队，O(1) 且不抛异常，不进入写入响应时延路径（设计 §5.1）。
++        _dispatch_graph_sync(self, records, effective_filters)
++
+         returned_memories = [
+             {"id": r[0], "memory": r[1], "event": "ADD"}
+             for r in records
+@@ -2863,6 +3681,38 @@ class AsyncMemory(MemoryBase):
          )
          return returned_memories
  
@@ -6902,7 +7504,7 @@ index a8b159f1..1c5ab328 100644
      async def get(self, memory_id):
          """
          Retrieve a memory by ID asynchronously.
-@@ -2879,15 +3599,7 @@ class AsyncMemory(MemoryBase):
+@@ -2879,15 +3729,7 @@ class AsyncMemory(MemoryBase):
              await display_first_run_notice_async(self, "async", "get")
              return None
  
@@ -6919,7 +7521,7 @@ index a8b159f1..1c5ab328 100644
  
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
-@@ -2903,6 +3615,10 @@ class AsyncMemory(MemoryBase):
+@@ -2903,6 +3745,10 @@ class AsyncMemory(MemoryBase):
              if key in memory.payload:
                  result_item[key] = memory.payload[key]
  
@@ -6930,7 +7532,7 @@ index a8b159f1..1c5ab328 100644
          additional_metadata = {k: v for k, v in memory.payload.items() if k not in core_and_promoted_keys}
          if additional_metadata:
              result_item["metadata"] = additional_metadata
-@@ -2916,6 +3632,9 @@ class AsyncMemory(MemoryBase):
+@@ -2916,6 +3762,9 @@ class AsyncMemory(MemoryBase):
          filters: Optional[Dict[str, Any]] = None,
          top_k: int = 20,
          show_expired: bool = False,
@@ -6940,7 +7542,7 @@ index a8b159f1..1c5ab328 100644
          **kwargs,
      ):
          """
-@@ -2927,6 +3646,10 @@ class AsyncMemory(MemoryBase):
+@@ -2927,6 +3776,10 @@ class AsyncMemory(MemoryBase):
                  Example: filters={"user_id": "u1", "agent_id": "a1"}
              top_k (int, optional): The maximum number of memories to return. Defaults to 20.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -6951,7 +7553,7 @@ index a8b159f1..1c5ab328 100644
  
          Returns:
              dict: A dictionary containing a list of memories under the "results" key.
-@@ -2973,7 +3696,9 @@ class AsyncMemory(MemoryBase):
+@@ -2973,7 +3826,9 @@ class AsyncMemory(MemoryBase):
              "mem0.get_all", self, {"limit": limit, "keys": keys, "encoded_ids": encoded_ids, "sync_type": "async"}
          )
  
@@ -6962,7 +7564,7 @@ index a8b159f1..1c5ab328 100644
  
          if scale_threshold_notice:
              await display_scale_threshold_notice_async(self, "async", "get_all", *scale_threshold_notice)
-@@ -2981,8 +3706,21 @@ class AsyncMemory(MemoryBase):
+@@ -2981,8 +3836,21 @@ class AsyncMemory(MemoryBase):
              await display_first_run_notice_async(self, "async", "get_all")
          return {"results": all_memories_result}
  
@@ -6986,7 +7588,7 @@ index a8b159f1..1c5ab328 100644
  
          # Handle different vector store return formats by inspecting first element
          if isinstance(memories_result, (tuple, list)) and len(memories_result) > 0:
-@@ -2997,15 +3735,7 @@ class AsyncMemory(MemoryBase):
+@@ -2997,15 +3865,7 @@ class AsyncMemory(MemoryBase):
          else:
              actual_memories = memories_result
  
@@ -7003,7 +7605,7 @@ index a8b159f1..1c5ab328 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          formatted_memories = []
-@@ -3024,6 +3754,9 @@ class AsyncMemory(MemoryBase):
+@@ -3024,6 +3884,9 @@ class AsyncMemory(MemoryBase):
                  if key in mem.payload:
                      memory_item_dict[key] = mem.payload[key]
  
@@ -7013,7 +7615,7 @@ index a8b159f1..1c5ab328 100644
              additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  memory_item_dict["metadata"] = additional_metadata
-@@ -3045,6 +3778,9 @@ class AsyncMemory(MemoryBase):
+@@ -3045,6 +3908,9 @@ class AsyncMemory(MemoryBase):
          explain: bool = False,
          reference_date: Optional[Any] = None,
          show_expired: bool = False,
@@ -7023,7 +7625,7 @@ index a8b159f1..1c5ab328 100644
          **kwargs,
      ):
          """
-@@ -3078,6 +3814,14 @@ class AsyncMemory(MemoryBase):
+@@ -3078,6 +3944,14 @@ class AsyncMemory(MemoryBase):
              explain (bool, optional): Whether to include score_details for each result. Defaults to False.
              reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
              show_expired (bool, optional): Include expired memories. Defaults to False.
@@ -7038,7 +7640,7 @@ index a8b159f1..1c5ab328 100644
  
          Returns:
              dict: A dictionary containing the search results under a "results" key.
-@@ -3154,7 +3898,12 @@ class AsyncMemory(MemoryBase):
+@@ -3154,7 +4028,12 @@ class AsyncMemory(MemoryBase):
  
          search_start = time.perf_counter()
          original_memories = await self._search_vector_store(
@@ -7052,7 +7654,7 @@ index a8b159f1..1c5ab328 100644
          )
          search_elapsed_seconds = time.perf_counter() - search_start
  
-@@ -3169,6 +3918,10 @@ class AsyncMemory(MemoryBase):
+@@ -3169,6 +4048,10 @@ class AsyncMemory(MemoryBase):
              except Exception as e:
                  logger.warning(f"Reranking failed, using original results: {e}")
  
@@ -7063,19 +7665,25 @@ index a8b159f1..1c5ab328 100644
          if temporal_usage_notice:
              await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
          elif scale_threshold_notice:
-@@ -3341,6 +4094,7 @@ class AsyncMemory(MemoryBase):
+@@ -3341,6 +4224,11 @@ class AsyncMemory(MemoryBase):
              })
  
          # Step 8: Score and rank
 +        # 时间因子只在本检索路径生效；整批候选共用同一个 now 基准（设计 §3.5）。
++        # 图分支走 to_thread（同步 HTTP + 硬超时），不阻塞事件循环（设计 §6.1）。
++        graph_boosts, graph_facts = await asyncio.to_thread(
++            _compute_graph_hits, self, query, candidates, filters
++        )
          scored_results = score_and_rank(
              semantic_results=candidates,
              bm25_scores=bm25_scores,
-@@ -3348,18 +4102,11 @@ class AsyncMemory(MemoryBase):
+@@ -3348,18 +4236,13 @@ class AsyncMemory(MemoryBase):
              threshold=threshold,
              top_k=limit,
              explain=explain,
 +            decay_factors=self._decay_factors(candidates),
++            graph_boosts=graph_boosts,
++            graph_facts=graph_facts,
          )
  
          # Step 9: Format results
@@ -7092,7 +7700,7 @@ index a8b159f1..1c5ab328 100644
          core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", "text_lemmatized", "attributed_to", *promoted_payload_keys}
  
          original_memories = []
-@@ -3381,6 +4128,9 @@ class AsyncMemory(MemoryBase):
+@@ -3381,6 +4264,9 @@ class AsyncMemory(MemoryBase):
                  if key in payload:
                      memory_item_dict[key] = payload[key]
  
@@ -7102,7 +7710,7 @@ index a8b159f1..1c5ab328 100644
              additional_metadata = {k: v for k, v in payload.items() if k not in core_and_promoted_keys}
              if additional_metadata:
                  if not memory_item_dict.get("metadata"):
-@@ -3406,7 +4156,7 @@ class AsyncMemory(MemoryBase):
+@@ -3406,7 +4292,7 @@ class AsyncMemory(MemoryBase):
          if not deduped:
              return {}
  
@@ -7112,13 +7720,17 @@ index a8b159f1..1c5ab328 100644
  
          try:
 diff --git a/mem0/utils/scoring.py b/mem0/utils/scoring.py
-index e85a9cb8..7ac77216 100644
+index e85a9cb8..1ee215ab 100644
 --- a/mem0/utils/scoring.py
 +++ b/mem0/utils/scoring.py
-@@ -56,6 +56,16 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
+@@ -56,6 +56,26 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
  
  ENTITY_BOOST_WEIGHT = 0.5
  
++# 图加分上限 W_g。与实体加入上限同量级：四信号全开时图信号对最终分的贡献上限为
++# `0.5 / 3.0 = 16.7%`（设计 §6.2）。
++GRAPH_BOOST_WEIGHT = 0.5
++
 +# Time-factor components published in `score_details` when decay is active. The scorer
 +# only copies them through, so the field names stay owned by the decay implementation.
 +DECAY_DETAIL_KEYS = (
@@ -7129,36 +7741,47 @@ index e85a9cb8..7ac77216 100644
 +    "access_count",
 +)
 +
++# Graph-signal components published in `score_details` when the graph capability is on.
++# `graph_boost` is the candidate's additive boost (0.0 when the graph missed it);
++# `graph_facts` is how many graph facts referenced it. Both keys stay absent when the
++# capability is off, so `explain` output is byte-identical to pre-graph releases.
++GRAPH_DETAIL_KEYS = ("graph_boost", "graph_facts")
++
  
  def score_and_rank(
      semantic_results: List[Dict[str, Any]],
-@@ -64,12 +74,14 @@ def score_and_rank(
+@@ -64,12 +84,16 @@ def score_and_rank(
      threshold: float,
      top_k: int,
      explain: bool = False,
 +    decay_factors: Optional[Dict[str, Dict[str, Any]]] = None,
++    graph_boosts: Optional[Dict[str, float]] = None,
++    graph_facts: Optional[Dict[str, int]] = None,
  ) -> List[Dict[str, Any]]:
      """Score candidates additively and return top-k results.
  
      For each candidate:
          semantic_score is taken from the result's score field.
-         combined = (semantic + bm25 + entity_boost) / max_possible
+-        combined = (semantic + bm25 + entity_boost) / max_possible
++        combined = (semantic + bm25 + entity_boost + graph_boost) / max_possible
 +        final_score = combined * decay_weight
  
      Threshold gates the semantic score BEFORE combining -- candidates
      below the threshold are excluded even if BM25/entity would boost them.
-@@ -80,6 +92,10 @@ def score_and_rank(
+@@ -79,6 +103,12 @@ def score_and_rank(
+         - Semantic + BM25: max_possible = 2.0
          - Semantic + BM25 + entity: max_possible = 2.5
          - Semantic + entity (no BM25): max_possible = 1.5
- 
++        - ... plus `GRAPH_BOOST_WEIGHT` whenever at least one candidate in the pool
++          actually carries a graph boost.
++
 +    The time factor is applied after combining and before ranking, so it can only
 +    reorder candidates that are already in the pool: it is a multiplier bounded by
 +    [floor, 1].0 in the caller, never a filter.
-+
+ 
      Args:
          semantic_results: Candidate memories from vector search.
-         bm25_scores: Normalized keyword scores keyed by memory ID.
-@@ -87,10 +103,16 @@ def score_and_rank(
+@@ -87,18 +117,38 @@ def score_and_rank(
          threshold: Minimum semantic score required before hybrid scoring.
          top_k: Maximum number of results to return.
          explain: Include score_details in each result when true.
@@ -7167,6 +7790,15 @@ index e85a9cb8..7ac77216 100644
 +            `DECAY_DETAIL_KEYS`. Candidates absent from the mapping (and every candidate
 +            when the mapping is omitted or empty) score exactly as they did before the
 +            time factor existed.
++        graph_boosts: Optional per-candidate graph boost keyed by memory ID. The caller
++            passes the mapping only when the graph capability is ON: an empty mapping
++            then means "graph is on, nothing was hit", which keeps the divisor at its
++            base value while still publishing zero-valued graph components. `None` means
++            the capability is off and the scoring is byte-identical to its pre-graph
++            form. Only candidates present here grow the divisor, so ids outside the
++            candidate pool can never influence it.
++        graph_facts: Optional per-candidate count of graph facts that referenced it,
++            published as `graph_facts` in `score_details`.
  
      Returns:
          List of scored result dicts sorted by combined score descending.
@@ -7174,9 +7806,28 @@ index e85a9cb8..7ac77216 100644
 +
      has_bm25 = bool(bm25_scores)
      has_entity = bool(entity_boosts)
++    has_graph = bool(graph_boosts)
  
-@@ -118,21 +140,31 @@ def score_and_rank(
-         raw_combined = semantic_score + bm25_score + entity_boost
+     max_possible = 1.0
+     if has_bm25:
+         max_possible += 1.0
+     if has_entity:
+         max_possible += ENTITY_BOOST_WEIGHT
++    if has_graph:
++        max_possible += GRAPH_BOOST_WEIGHT
++
++    graph_enabled = graph_boosts is not None
+ 
+     scored: List[Dict[str, Any]] = []
+ 
+@@ -114,25 +164,41 @@ def score_and_rank(
+         mem_id_str = str(mem_id)
+         bm25_score = bm25_scores.get(mem_id_str, 0.0)
+         entity_boost = entity_boosts.get(mem_id_str, 0.0)
++        graph_boost = (graph_boosts or {}).get(mem_id_str, 0.0)
+ 
+-        raw_combined = semantic_score + bm25_score + entity_boost
++        raw_combined = semantic_score + bm25_score + entity_boost + graph_boost
          combined = min(raw_combined / max_possible, 1.0)
  
 +        # Time factor: a bounded multiplier on the hybrid score, never a filter.
@@ -7206,6 +7857,11 @@ index e85a9cb8..7ac77216 100644
 +                # 使 explain 输出与引入本机制之前逐位一致。
 +                for key in DECAY_DETAIL_KEYS:
 +                    score_details[key] = decay.get(key)
++            if graph_enabled:
++                # 图能力开启即发布两个分量键：未命中为 0.0 / 0，命中为实际加分与事实条数
++                # （设计 §8）。关闭态不发布，`explain` 与引入本机制之前逐位一致。
++                score_details[GRAPH_DETAIL_KEYS[0]] = graph_boost
++                score_details[GRAPH_DETAIL_KEYS[1]] = (graph_facts or {}).get(mem_id_str, 0)
 +            scored_result["score_details"] = score_details
          scored.append(scored_result)
  
@@ -7384,10 +8040,10 @@ index b48e03c9..a59b319c 100644
          return result
  
 diff --git a/server/.env.example b/server/.env.example
-index 3e44034a..fd5be6d8 100644
+index 3e44034a..721c3633 100644
 --- a/server/.env.example
 +++ b/server/.env.example
-@@ -29,6 +29,30 @@ MEM0_DEFAULT_EMBEDDER_MODEL=text-embedding-3-small
+@@ -29,6 +29,56 @@ MEM0_DEFAULT_EMBEDDER_MODEL=text-embedding-3-small
  # Set to false to opt out.
  MEM0_TELEMETRY=true
  
@@ -7414,6 +8070,32 @@ index 3e44034a..fd5be6d8 100644
 +DREAM_PER_CLUSTER_TIMEOUT_SECONDS=
 +# Where dry-run/live reports are written (default /app/history/dream-reports).
 +DREAM_REPORT_DIR=
++
++# Graph memory (Graphiti side-car graph, optional). Off by default: no fact is dispatched
++# to the graph, no graph query is made and no graph boost is applied, so retrieval stays
++# byte-identical to pre-graph releases. The capability degrades silently when the bridge
++# or FalkorDB is down (`docker compose up -d falkordb graph-bridge` to bring it up).
++MEM0_GRAPH_ENABLED=false
++MEM0_GRAPH_ENDPOINT=http://graph-bridge:8000
++# Graph boost ceiling W_g (default 0.5, i.e. at most 16.7% of a fully-loaded final score).
++MEM0_GRAPH_WEIGHT=
++# Facts taken from one graph search (default 10).
++MEM0_GRAPH_MAX_FACTS=
++# Hard timeout budget for the graph branch of /search, in seconds (default 0.4).
++MEM0_GRAPH_TIMEOUT_SECONDS=
++# Adopt graph facts already invalidated on the graph side (default false).
++MEM0_GRAPH_INCLUDE_INVALIDATED=
++# Bounded dispatch queue (default 1000); overflow drops the oldest task and counts it.
++MEM0_GRAPH_QUEUE_SIZE=
++# Per-episode retry budget and linear backoff base (defaults 3 / 5.0s).
++MEM0_GRAPH_MAX_RETRIES=
++MEM0_GRAPH_RETRY_BACKOFF_SECONDS=
++# Circuit breaker: consecutive failures to open, cooldown window (defaults 5 / 60s).
++MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES=
++MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS=
++# Single /episodes request timeout on the mem0 side (default 120s; one ingest runs several
++# LLM calls and measured 14–37s per fact).
++MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=
 +
  # Days of request_logs history to keep when `make prune-logs` runs.
  # Wire the prune command into cron/systemd in production.
@@ -8897,7 +9579,7 @@ index 6db543ff..1175631c 100644
  
  export const ENTITY_ENDPOINTS = {
 diff --git a/server/docker-compose.yaml b/server/docker-compose.yaml
-index 7e382f7c..9de17646 100644
+index 7e382f7c..64940363 100644
 --- a/server/docker-compose.yaml
 +++ b/server/docker-compose.yaml
 @@ -5,6 +5,7 @@ services:
@@ -8908,7 +9590,7 @@ index 7e382f7c..9de17646 100644
      ports:
        - "8888:8000"
      env_file:
-@@ -12,26 +13,44 @@ services:
+@@ -12,26 +13,98 @@ services:
      networks:
        - mem0_network
      volumes:
@@ -8919,6 +9601,12 @@ index 7e382f7c..9de17646 100644
      depends_on:
        postgres:
          condition: service_healthy
++      # Soft dependency: the graph capability degrades silently when the bridge is down,
++      # so mem0 must start regardless of the bridge's health (`required: false` only
++      # affects ordering when the bridge was explicitly requested).
++      graph-bridge:
++        condition: service_started
++        required: false
      command: >
 -      sh -c "rm -rf /app/packages && pip install -q --force-reinstall --no-deps mem0ai && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
 +      sh -c "rm -rf /usr/local/lib/python3.12/site-packages/mem0 && cp -r /opt/mem0-src /usr/local/lib/python3.12/site-packages/mem0 && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"
@@ -8949,6 +9637,54 @@ index 7e382f7c..9de17646 100644
 +      - DREAM_RUN_TIMEOUT_SECONDS=${DREAM_RUN_TIMEOUT_SECONDS:-}
 +      - DREAM_PER_CLUSTER_TIMEOUT_SECONDS=${DREAM_PER_CLUSTER_TIMEOUT_SECONDS:-}
 +      - DREAM_REPORT_DIR=${DREAM_REPORT_DIR:-}
++      # Graph memory (Graphiti side-car graph). Off by default: no dispatch, no graph
++      # query, no boost -- retrieval stays byte-identical to pre-graph releases.
++      - MEM0_GRAPH_ENABLED=${MEM0_GRAPH_ENABLED:-false}
++      - MEM0_GRAPH_ENDPOINT=${MEM0_GRAPH_ENDPOINT:-http://graph-bridge:8000}
++      - MEM0_GRAPH_WEIGHT=${MEM0_GRAPH_WEIGHT:-}
++      - MEM0_GRAPH_MAX_FACTS=${MEM0_GRAPH_MAX_FACTS:-}
++      - MEM0_GRAPH_TIMEOUT_SECONDS=${MEM0_GRAPH_TIMEOUT_SECONDS:-}
++      - MEM0_GRAPH_INCLUDE_INVALIDATED=${MEM0_GRAPH_INCLUDE_INVALIDATED:-}
++      - MEM0_GRAPH_QUEUE_SIZE=${MEM0_GRAPH_QUEUE_SIZE:-}
++      - MEM0_GRAPH_MAX_RETRIES=${MEM0_GRAPH_MAX_RETRIES:-}
++      - MEM0_GRAPH_RETRY_BACKOFF_SECONDS=${MEM0_GRAPH_RETRY_BACKOFF_SECONDS:-}
++      - MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES=${MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES:-}
++      - MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS=${MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS:-}
++      - MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=${MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS:-}
++
++  falkordb:
++    image: falkordb/falkordb:latest
++    restart: unless-stopped
++    networks:
++      - mem0_network
++    # Internal-only: no host port published (the graph is reached through the bridge).
++    mem_limit: 384m
++    volumes:
++      - falkordb_data:/data
++
++  graph-bridge:
++    build: ./graph-bridge
++    restart: unless-stopped
++    networks:
++      - mem0_network
++    mem_limit: 512m
++    env_file:
++      - .env
++    environment:
++      - FALKORDB_HOST=falkordb
++      - FALKORDB_PORT=6379
++      # 抽取管道按 /responses 结构化输出通道装配（官方镜像的 json_schema 通道被本机
++      # 网关 422 拒绝，实测见方案 §4.2）；LLM_MODEL 缺省跟随后端默认 LLM 模型。
++      - LLM_API_KEY=${LLM_API_KEY:-}
++      - LLM_BASE_URL=${LLM_BASE_URL:-}
++      - LLM_MODEL=${GRAPH_LLM_MODEL:-${MEM0_DEFAULT_LLM_MODEL:-gpt-5-mini}}
++      - EMBEDDER_API_KEY=${EMBEDDER_API_KEY:-}
++      - EMBEDDER_BASE_URL=${EMBEDDER_BASE_URL:-}
++      - EMBEDDER_MODEL=${MEM0_DEFAULT_EMBEDDER_MODEL:-text-embedding-3-small}
++      - EMBEDDER_DIMS=${EMBEDDER_EMBEDDING_DIMS:-2048}
++      - SEMAPHORE_LIMIT=1
++    depends_on:
++      - falkordb
  
    postgres:
        image: pgvector/pgvector:pg17
@@ -8957,7 +9693,7 @@ index 7e382f7c..9de17646 100644
        shm_size: "128mb"
        networks:
          - mem0_network
-@@ -49,8 +68,20 @@ services:
+@@ -49,8 +122,20 @@ services:
        ports:
          - "8432:5432"
  
@@ -8978,21 +9714,22 @@ index 7e382f7c..9de17646 100644
      ports:
        - "3000:3000"
      networks:
-@@ -70,6 +101,8 @@ services:
+@@ -70,6 +155,9 @@ services:
  
  volumes:
    postgres_db:
 +  mem0_history:
 +  qdrant_data:
++  falkordb_data:
  
  networks:
    mem0_network:
 diff --git a/server/dream_scheduler.py b/server/dream_scheduler.py
 new file mode 100644
-index 00000000..bc267000
+index 00000000..b69cbd10
 --- /dev/null
 +++ b/server/dream_scheduler.py
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,448 @@
 +"""Dream 后台调度的服务侧载体（设计 `docs/design/memory-dream.md` §5.6）。
 +
 +职责边界：把 SDK 的四阶段整合（`mem0.memory.dream`）挂到 server 进程上——
@@ -9414,11 +10151,14 @@ index 00000000..bc267000
 +                observer=observer,
 +                scopes=scopes,
 +            )
-+            report_path = write_report(report, settings.report_dir)
++            # 报告文件名由 run_id 决定，因此在落盘之前就能把路径写进报告本体——这样
++            # 落盘内容与 `POST /dream/preview` 的响应体逐字段相等（设计 §10.6 [AC-29]）。
++            report_path = os.path.join(settings.report_dir, f"{report['run_id']}.json")
 +            report["report_path"] = report_path
++            report["trigger"] = trigger
++            write_report(report, settings.report_dir)
 +            if observer is not None:
 +                observer.attach_report(report["run_id"], report_path)
-+            report["trigger"] = trigger
 +            return report
 +        finally:
 +            self._lock.release()
@@ -9438,8 +10178,502 @@ index 00000000..bc267000
 +def get_scheduler() -> Optional[DreamScheduler]:
 +    with _scheduler_lock:
 +        return _scheduler
+diff --git a/server/graph-bridge/Dockerfile b/server/graph-bridge/Dockerfile
+new file mode 100644
+index 00000000..8a0a5c69
+--- /dev/null
++++ b/server/graph-bridge/Dockerfile
+@@ -0,0 +1,16 @@
++FROM python:3.12-slim
++
++# graphiti-core 的 falkordb extra 与 fastapi/uvicorn 一并从 PyPI 装机（见 requirements.txt）。
++WORKDIR /app
++COPY requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++
++COPY app.py .
++
++# 单 worker 串行入图（与 SDK 侧派发器一致）：图侧 LLM 调用不与主链路的 LLM 调用争抢。
++ENV SEMAPHORE_LIMIT=1 \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PYTHONUNBUFFERED=1
++
++EXPOSE 8000
++CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/server/graph-bridge/README.md b/server/graph-bridge/README.md
+new file mode 100644
+index 00000000..6c0d1386
+--- /dev/null
++++ b/server/graph-bridge/README.md
+@@ -0,0 +1,62 @@
++# graph-bridge：mem0 的旁路图服务
++
++设计见 [`docs/design/graph-memory.md`](../../docs/design/graph-memory.md) §4。本服务是
++`graphiti-core` 的薄壳，向 mem0 暴露事实入图与图检索两个能力；它**不修改 graphiti-core
++源码**，图库选 FalkorDB（Redis 协议内存型图库，目标规模数据集 8.25MiB / 常驻 68MiB）。
++
++## 端点
++
++| 方法 | 路径 | 说明 |
++| --- | --- | --- |
++| POST | `/episodes` | 入图一条事实。请求 `{uuid, group_id, text, reference_time, source_description}`；同 `uuid` 重复调用返回 `already_synced` 且不重复抽取 |
++| POST | `/search` | 图检索。请求 `{group_ids, query, max_facts}`；响应 `{facts:[{uuid,name,fact,valid_at,invalid_at,episodes}]}`，`episodes` 即 memory id |
++| GET | `/stats?group_id=` | 图规模：`episodes` / `entity_nodes` / `entity_edges` |
++| GET | `/health` | 存活 + `backend=falkordb` + 图库连通性 |
++| GET | `/graphs` | 图键清单 |
++| DELETE | `/graph/{group_id}` | 整体删除一个图键（隔离验证数据的清理面） |
++
++join key 是构造性的：`episode uuid == memory id`，图侧不另存映射表。
++
++## 环境变量
++
++| 变量 | 默认 | 说明 |
++| --- | --- | --- |
++| `FALKORDB_HOST` / `FALKORDB_PORT` | `falkordb` / `6379` | 图库地址 |
++| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 空 / 空 / `gpt-5-mini` | 抽取管道使用的 LLM（走 `/responses` 结构化输出通道） |
++| `EMBEDDER_API_KEY` / `EMBEDDER_BASE_URL` / `EMBEDDER_MODEL` / `EMBEDDER_DIMS` | 回落 `LLM_*` / `text-embedding-3-small` / `1024` | 事实向量化用的 embedder |
++| `SEMAPHORE_LIMIT` | `1` | 并发上限，默认串行入图 |
++| `LOG_LEVEL` | `INFO` | 日志级别 |
++
++## 依赖钉版（不要放宽）
++
++`requirements.txt` 里 `httpx` 与 `openai<3` 是**必须显式写死**的，不是冗余声明：
++
++- `graphiti-core 0.30.2` 的 `llm_client/client.py` 直接 `import httpx`，并用 `httpx.HTTPStatusError`
++  判定 5xx 重试与限流，但它**没有把 httpx 声明为依赖**——这份依赖此前只是从 `openai` 传递而来。
++- `openai 3.x` 改用 `httpx2`，传递依赖随之消失。实测：不钉版时镜像构建「成功」，容器也「在跑」，
++  但 `import httpx` 在运行期抛 `ModuleNotFoundError`，表现为 `/health` 与 `/episodes` 一律 500。
++- 钉住 `openai<3` 的第二个理由是语义一致：graphiti 用 `isinstance(exc, httpx.HTTPStatusError)`
++  做判定，而 `openai 3.x` 抛的是 `httpx2` 的异常类，两者不同源，5xx 重试与限流翻译会静默失效。
++
++验证方式（构建后必跑）：
++
++```bash
++docker exec mem0-dev-graph-bridge-1 python -c "import httpx, graphiti_core; print('imports ok')"
++curl -s localhost:8000/health   # 期望 {"status":"healthy","backend":"falkordb","falkordb":"ok"}
++```
++
++## 本地验证
++
++```bash
++cd server && docker compose up -d falkordb && docker compose up -d --build graph-bridge
++curl -s localhost:8000/health            # 容器内：curl http://graph-bridge:8000/health
++curl -s -X POST localhost:8000/episodes -H 'content-type: application/json' \
++  -d '{"uuid":"<uuid4>","group_id":"mem0_test_graph_probe","text":"验证用事实","reference_time":"2026-09-17T00:00:00+00:00"}'
++curl -s -X POST localhost:8000/search -H 'content-type: application/json' \
++  -d '{"group_ids":["mem0_test_graph_probe"],"query":"验证用事实","max_facts":5}'
++curl -s "localhost:8000/stats?group_id=mem0_test_graph_probe"
++curl -s -X DELETE localhost:8000/graph/mem0_test_graph_probe
++```
++
++一次真实入图需要多次 LLM 调用（实测单条中文事实 14.24–36.65s），因此 `/episodes` 的
++超时预算应按分钟级设置（mem0 侧默认 `MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=120`）。
+diff --git a/server/graph-bridge/app.py b/server/graph-bridge/app.py
+new file mode 100644
+index 00000000..6c5185ca
+--- /dev/null
++++ b/server/graph-bridge/app.py
+@@ -0,0 +1,374 @@
++"""graph-bridge：mem0 的旁路图服务（Graphiti 薄壳）。
++
++设计见 `docs/design/graph-memory.md` §4。本服务持有 graphiti-core 与 FalkorDB 连接，
++对 mem0 侧暴露四个端点：
++
++| 端点 | 作用 |
++| --- | --- |
++| `POST /episodes` | 一条事实入图（幂等前置判定 + 先建 episode 再抽取） |
++| `POST /search` | 按查询文本做图检索，返回事实及其关联的 memory id |
++| `GET /stats` | 图规模（episodes / 实体节点 / 关系边） |
++| `GET /health` | 存活与后端自证（含 FalkorDB 连通性） |
++| `GET /graphs`、`DELETE /graph/{group_id}` | 图键清单与按作用域整体清理 |
++
++三条实现约定（均来自本机实测，方案 §5.3–5.4）：
++
++1. **join key = episode uuid**：入图前先落一个 `uuid == memory_id` 的 `EpisodicNode`，
++   再以同一 uuid 调 `add_episode`；检索结果里的边自带 `episodes` 列表，即 memory id。
++2. **`group_id` 即 FalkorDB 图键**：driver 的 database 必须与该次请求的 `group_id`
++   一致，否则 `add_episode` 会克隆 driver 去另一个图键读 episode（`NodeNotFoundError`）。
++   因此按 `group_id` 缓存 Graphiti 实例。
++3. **幂等必须前置判定**：同 uuid 重放 `add_episode` 不报错但会重新抽取（边数增长），
++   所以先查该 uuid 的 `Episodic.entity_edges` 是否非空，非空即直接返回 `already_synced`。
++
++本服务不修改 graphiti-core 一行源码：LLM 客户端走 `/responses` 通道（本机网关实测唯一
++可用形态），embedder 用 OpenAI 兼容客户端并显式指定维度。
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++from contextlib import asynccontextmanager
++from datetime import datetime, timezone
++from typing import Any, Dict, List, Optional
++
++from fastapi import FastAPI
++from pydantic import BaseModel, Field
++
++logger = logging.getLogger("graph-bridge")
++logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
++
++# --------------------------------------------------------------------------- config
++
++FALKORDB_HOST = os.environ.get("FALKORDB_HOST", "falkordb")
++FALKORDB_PORT = int(os.environ.get("FALKORDB_PORT", "6379"))
++
++LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
++LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or None
++LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5-mini")
++
++EMBEDDER_API_KEY = os.environ.get("EMBEDDER_API_KEY", LLM_API_KEY)
++EMBEDDER_BASE_URL = os.environ.get("EMBEDDER_BASE_URL") or None
++EMBEDDER_MODEL = os.environ.get("EMBEDDER_MODEL", "text-embedding-3-small")
++EMBEDDER_DIMS = int(os.environ.get("EMBEDDER_DIMS", "1024"))
++
++SOURCE_DESCRIPTION_DEFAULT = "mem0 事实同步"
++
++
++# --------------------------------------------------------------------------- schemas
++
++
++class EpisodeRequest(BaseModel):
++    """一条待入图的事实。"""
++
++    uuid: str = Field(..., description="episode uuid，等于 mem0 的 memory id。")
++    group_id: str = Field(..., description="图键（作用域派生）。")
++    text: str = Field(..., description="事实文本。")
++    reference_time: Optional[str] = Field(None, description="事实时间（ISO8601，缺省取当前时刻）。")
++    source_description: Optional[str] = Field(None, description="来源描述。")
++
++
++class EpisodeResponse(BaseModel):
++    status: str = Field(..., description="`synced` 或 `already_synced`。")
++    uuid: str
++    group_id: str
++    nodes: int = Field(default=0, description="本次抽取出的实体节点数。")
++    edges: int = Field(default=0, description="本次抽取出的关系边数。")
++
++
++class SearchRequest(BaseModel):
++    group_ids: List[str] = Field(..., description="要检索的图键列表。")
++    query: str = Field(..., description="检索文本。")
++    max_facts: int = Field(default=10, ge=1, description="最多返回的事实条数。")
++
++
++class FactItem(BaseModel):
++    uuid: str = Field(..., description="关系边 uuid。")
++    name: str = Field(default="", description="关系名。")
++    fact: str = Field(default="", description="事实文本。")
++    valid_at: Optional[str] = Field(default=None)
++    invalid_at: Optional[str] = Field(default=None)
++    episodes: List[str] = Field(default_factory=list, description="产生该事实的 memory id 列表。")
++
++
++class SearchResponse(BaseModel):
++    facts: List[FactItem] = Field(default_factory=list)
++
++
++# --------------------------------------------------------------------------- clients
++
++
++def _build_llm_client():
++    """装配 LLM 客户端（`/responses` 结构化输出通道，本机网关实测唯一可用形态）。"""
++    from graphiti_core.llm_client.config import LLMConfig
++    from graphiti_core.llm_client.openai_client import OpenAIClient
++
++    config = LLMConfig(
++        api_key=LLM_API_KEY,
++        base_url=LLM_BASE_URL,
++        model=LLM_MODEL,
++        small_model=LLM_MODEL,
++    )
++    return OpenAIClient(config=config)
++
++
++def _build_embedder():
++    """装配 embedder（OpenAI 兼容端点，显式指定维度以对齐本机 embedder 模型）。"""
++    from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
++
++    return OpenAIEmbedder(
++        config=OpenAIEmbedderConfig(
++            api_key=EMBEDDER_API_KEY,
++            base_url=EMBEDDER_BASE_URL,
++            embedding_model=EMBEDDER_MODEL,
++            embedding_dim=EMBEDDER_DIMS,
++        )
++    )
++
++
++def _build_cross_encoder():
++    """装配 cross encoder：显式传本机 LLM 配置，避免回落到读环境变量的默认客户端。"""
++    from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
++    from graphiti_core.llm_client.config import LLMConfig
++
++    return OpenAIRerankerClient(config=LLMConfig(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, model=LLM_MODEL))
++
++
++class GraphitiRegistry:
++    """按图键缓存 Graphiti 实例（driver 的 database 必须等于图键，见模块 docstring）。"""
++
++    def __init__(self) -> None:
++        self._instances: Dict[str, Any] = {}
++        self._lock = asyncio.Lock()
++
++    async def get(self, group_id: str):
++        async with self._lock:
++            instance = self._instances.get(group_id)
++            if instance is not None:
++                return instance
++            from graphiti_core import Graphiti
++            from graphiti_core.driver.falkordb_driver import FalkorDriver
++
++            driver = FalkorDriver(
++                host=FALKORDB_HOST,
++                port=FALKORDB_PORT,
++                database=group_id,
++            )
++            instance = Graphiti(
++                graph_driver=driver,
++                llm_client=_build_llm_client(),
++                embedder=_build_embedder(),
++                cross_encoder=_build_cross_encoder(),
++                # 单 worker 串行入图：图侧 LLM 调用不与主链路的 LLM 调用争抢（方案 §3.3）。
++                max_coroutines=int(os.environ.get("SEMAPHORE_LIMIT", "1")),
++            )
++            await instance.build_indices_and_constraints()
++            self._instances[group_id] = instance
++            return instance
++
++    async def drop(self, group_id: str) -> None:
++        """丢弃某图键的缓存实例（图键被整体删除后调用）。"""
++        async with self._lock:
++            instance = self._instances.pop(group_id, None)
++        if instance is not None:
++            try:
++                await instance.close()
++            except Exception as exc:  # noqa: BLE001 - 关闭失败不影响清理结果
++                logger.warning("closing graphiti instance for %s failed: %s", group_id, exc)
++
++    async def close(self) -> None:
++        for group_id in list(self._instances):
++            await self.drop(group_id)
++
++
++registry = GraphitiRegistry()
++
++
++@asynccontextmanager
++async def lifespan(_app: FastAPI):
++    yield
++    await registry.close()
++
++
++app = FastAPI(title="mem0 graph-bridge", version="1.0.0", lifespan=lifespan)
++
++
++# --------------------------------------------------------------------------- helpers
++
++
++def _parse_reference_time(value: Optional[str]) -> datetime:
++    if value:
++        try:
++            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
++        except ValueError:
++            logger.warning("unparsable reference_time %r; using now", value)
++    return datetime.now(timezone.utc)
++
++
++async def _episode_already_synced(graphiti, uuid: str) -> bool:
++    """幂等前置判定：该 uuid 的 Episodic 节点存在且已挂上关系边即视为已同步。"""
++    from graphiti_core.errors import NodeNotFoundError
++    from graphiti_core.nodes import EpisodicNode
++
++    try:
++        episode = await EpisodicNode.get_by_uuid(graphiti.driver, uuid)
++    except NodeNotFoundError:
++        return False
++    return bool(getattr(episode, "entity_edges", None))
++
++
++async def _count(graphiti, cypher: str) -> int:
++    records, _header, _summary = await graphiti.driver.execute_query(cypher)
++    if not records:
++        return 0
++    value = list(records[0].values())[0]
++    return int(value or 0)
++
++
++# --------------------------------------------------------------------------- endpoints
++
++
++@app.get("/health", summary="Liveness + backend self-check")
++async def health() -> Dict[str, Any]:
++    """存活 + 后端自证：`backend` 字段固定为 `falkordb`，并顺带探一次图库连通性。"""
++    from graphiti_core.driver.falkordb_driver import FalkorDriver
++
++    backend = "falkordb"
++    try:
++        driver = FalkorDriver(host=FALKORDB_HOST, port=FALKORDB_PORT, database="default_db")
++        await driver.execute_query("RETURN 1")
++        await driver.close()
++        db_status = "ok"
++    except Exception as exc:  # noqa: BLE001 - 健康检查永远返回 200，状态体现在字段里
++        db_status = f"error: {exc}"
++        logger.warning("falkordb health check failed: %s", exc)
++    return {"status": "healthy", "backend": backend, "falkordb": db_status}
++
++
++@app.post("/episodes", response_model=EpisodeResponse, summary="Ingest one fact as an episode")
++async def ingest_episode(request: EpisodeRequest) -> EpisodeResponse:
++    """把一条事实同步入图；同 uuid 重复调用返回 `already_synced` 且不重复抽取。"""
++    from graphiti_core.nodes import EpisodeType, EpisodicNode
++
++    graphiti = await registry.get(request.group_id)
++
++    if await _episode_already_synced(graphiti, request.uuid):
++        return EpisodeResponse(status="already_synced", uuid=request.uuid, group_id=request.group_id)
++
++    reference_time = _parse_reference_time(request.reference_time)
++    source_description = request.source_description or SOURCE_DESCRIPTION_DEFAULT
++
++    # 先落 episode 节点：uuid 由调用方控制，add_episode 才能以同一 uuid 读取并复用
++    # （方案 §5.4 的构造性 join key）。
++    episode = EpisodicNode(
++        name=request.uuid,
++        group_id=request.group_id,
++        labels=[],
++        source=EpisodeType.text,
++        content=request.text,
++        source_description=source_description,
++        created_at=reference_time,
++        valid_at=reference_time,
++    )
++    episode.uuid = request.uuid
++    await episode.save(graphiti.driver)
++
++    result = await graphiti.add_episode(
++        uuid=request.uuid,
++        name=request.uuid,
++        episode_body=request.text,
++        source_description=source_description,
++        reference_time=reference_time,
++        source=EpisodeType.text,
++        group_id=request.group_id,
++    )
++    return EpisodeResponse(
++        status="synced",
++        uuid=request.uuid,
++        group_id=request.group_id,
++        nodes=len(result.nodes),
++        edges=len(result.edges),
++    )
++
++
++@app.post("/search", response_model=SearchResponse, summary="Search the graph for facts")
++async def search_graph(request: SearchRequest) -> SearchResponse:
++    """图检索：返回事实及其 `episodes`（即 memory id），顺序即相关度序。"""
++    facts: List[FactItem] = []
++    for group_id in request.group_ids:
++        graphiti = await registry.get(group_id)
++        edges = await graphiti.search(
++            query=request.query,
++            group_ids=[group_id],
++            num_results=request.max_facts,
++        )
++        for edge in edges:
++            facts.append(
++                FactItem(
++                    uuid=str(edge.uuid),
++                    name=getattr(edge, "name", "") or "",
++                    fact=getattr(edge, "fact", "") or "",
++                    valid_at=str(edge.valid_at) if getattr(edge, "valid_at", None) else None,
++                    invalid_at=str(edge.invalid_at) if getattr(edge, "invalid_at", None) else None,
++                    episodes=[str(episode) for episode in (getattr(edge, "episodes", None) or [])],
++                )
++            )
++        if len(facts) >= request.max_facts:
++            break
++    return SearchResponse(facts=facts[: request.max_facts])
++
++
++@app.get("/stats", summary="Graph size for one group")
++async def stats(group_id: str) -> Dict[str, Any]:
++    """图规模：episodes / 实体节点 / 关系边（单调上升并与新增事实数同阶）。"""
++    graphiti = await registry.get(group_id)
++    return {
++        "group_id": group_id,
++        "episodes": await _count(graphiti, "MATCH (n:Episodic) RETURN count(n)"),
++        "entity_nodes": await _count(graphiti, "MATCH (n:Entity) RETURN count(n)"),
++        "entity_edges": await _count(graphiti, "MATCH ()-[e:RELATES_TO]->() RETURN count(e)"),
++    }
++
++
++@app.get("/graphs", summary="List graph keys")
++async def list_graphs() -> Dict[str, Any]:
++    """列出 FalkorDB 里的图键（运维面：按作用域清理前的清点）。"""
++    from falkordb.asyncio import FalkorDB
++
++    client = FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
++    try:
++        return {"graphs": sorted(await client.list_graphs())}
++    finally:
++        await client.aclose()
++
++
++@app.delete("/graph/{group_id}", summary="Drop one graph key")
++async def drop_graph(group_id: str) -> Dict[str, Any]:
++    """整体删除一个图键（隔离验证数据按作用域清理）。"""
++    from falkordb.asyncio import FalkorDB
++
++    client = FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
++    try:
++        graph = client.select_graph(group_id)
++        try:
++            await graph.delete()
++        except Exception as exc:  # noqa: BLE001 - 图键不存在时也算清理完成
++            logger.warning("drop graph %s: %s", group_id, exc)
++    finally:
++        await client.aclose()
++    await registry.drop(group_id)
++    return {"group_id": group_id, "dropped": True}
++
++
++@app.get("/", include_in_schema=False)
++async def root() -> Dict[str, str]:
++    return {"service": "mem0 graph-bridge"}
++
++
++if __name__ == "__main__":  # pragma: no cover - 本地直跑用
++    import uvicorn
++
++    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+diff --git a/server/graph-bridge/requirements.txt b/server/graph-bridge/requirements.txt
+new file mode 100644
+index 00000000..9c4bff10
+--- /dev/null
++++ b/server/graph-bridge/requirements.txt
+@@ -0,0 +1,18 @@
++# graph-bridge 运行时依赖。图引擎与抽取管道全部来自 graphiti-core 的 PyPI 发行版，
++# 本仓库不携带其源码副本，也不对其打补丁（方案 §4.3、[AC-37]）。
++#
++# `falkordb` extra 提供 FalkorDriver 所需的客户端（官方 `zepai/graphiti` 镜像缺该驱动，
++# 启动即 ImportError，实测见方案 §4.2 G1）。
++graphiti-core[falkordb]==0.30.2
++
++# graphiti-core 0.30.2 在 `llm_client/client.py` 里 `import httpx`，并用
++# `httpx.HTTPStatusError` 做重试/限流判定，却没有把 httpx 声明为自己的依赖——它此前只是
++# 从 openai 传递而来。openai 3.x 改用 httpx2，传递依赖随之消失：镜像构建期
++# `import httpx` 直接 ModuleNotFoundError，`/health` 与所有抽取路径 500（实测）。
++# 因此这里把两个包都显式钉住：httpx 补上未声明的运行时依赖，openai<3 让 graphiti 的
++# isinstance 判定与其实际抛出的异常类型保持同一套（否则 5xx 重试与限流翻译都静默失效）。
++openai>=1.91.0,<3
++httpx>=0.27,<1
++
++fastapi>=0.115.0
++uvicorn[standard]>=0.30.0
 diff --git a/server/main.py b/server/main.py
-index 20059fb8..f1ccaaf7 100644
+index 20059fb8..7c3b520e 100644
 --- a/server/main.py
 +++ b/server/main.py
 @@ -1,13 +1,18 @@
@@ -9457,7 +10691,7 @@ index 20059fb8..f1ccaaf7 100644
  from auth import ADMIN_API_KEY, AUTH_DISABLED, JWT_SECRET, require_admin, verify_auth
  from db import SessionLocal
  from dotenv import load_dotenv
-+from dream_scheduler import DreamScheduler, configure_scheduler
++from dream_scheduler import DreamScheduler, SqlRunObserver, configure_scheduler
  from errors import (
      UpstreamError,
      install_request_id_logging,
@@ -9476,7 +10710,7 @@ index 20059fb8..f1ccaaf7 100644
  from routers import entities as entities_router
  from routers import requests as requests_router
  from schemas import MessageResponse
-@@ -113,29 +119,94 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
+@@ -113,29 +119,114 @@ POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "postgres")
  POSTGRES_COLLECTION_NAME = os.environ.get("POSTGRES_COLLECTION_NAME", "memories")
  
  OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -9549,6 +10783,25 @@ index 20059fb8..f1ccaaf7 100644
 +    "lock_path": os.environ.get("DREAM_LOCK_PATH", "/app/history/dream.lock"),
 +}
 +
++# Graph memory (Graphiti side-car graph): the SDK owns the semantics of these knobs
++# (`mem0.configs.base.GraphConfig`), this block only lets a deployment override the
++# defaults through the environment. `enabled` stays off unless asked for, so retrieval
++# and writes stay byte-identical to pre-graph releases.
++GRAPH_CONFIG = {
++    "enabled": _env_flag("MEM0_GRAPH_ENABLED", False),
++    "endpoint": os.environ.get("MEM0_GRAPH_ENDPOINT", "http://graph-bridge:8000"),
++    "weight": _env_number("MEM0_GRAPH_WEIGHT", 0.5, float),
++    "max_facts": _env_number("MEM0_GRAPH_MAX_FACTS", 10, int),
++    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 0.4, float),
++    "include_invalidated": _env_flag("MEM0_GRAPH_INCLUDE_INVALIDATED", False),
++    "queue_size": _env_number("MEM0_GRAPH_QUEUE_SIZE", 1000, int),
++    "max_retries": _env_number("MEM0_GRAPH_MAX_RETRIES", 3, int),
++    "retry_backoff_seconds": _env_number("MEM0_GRAPH_RETRY_BACKOFF_SECONDS", 5.0, float),
++    "circuit_breaker_failures": _env_number("MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES", 5, int),
++    "circuit_cooldown_seconds": _env_number("MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS", 60.0, float),
++    "request_timeout_seconds": _env_number("MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS", 120.0, float),
++}
++
  DEFAULT_CONFIG = {
      "version": "v1.1",
      "vector_store": {
@@ -9577,10 +10830,11 @@ index 20059fb8..f1ccaaf7 100644
      "history_db_path": HISTORY_DB_PATH,
 +    "decay": DECAY_CONFIG,
 +    "dream": DREAM_CONFIG,
++    "graph": GRAPH_CONFIG,
  }
  
  
-@@ -143,6 +214,23 @@ set_session_factory(SessionLocal)
+@@ -143,6 +234,27 @@ set_session_factory(SessionLocal)
  initialize_state(DEFAULT_CONFIG)
  
  
@@ -9591,7 +10845,11 @@ index 20059fb8..f1ccaaf7 100644
 +    调度器只在 `dream.enabled=true` 时真正启动周期线程；关闭态下 `start()` 立即返回，
 +    `POST /dream/*` 由端点翻译成 409。关停信号置位后线程在单簇边界处退出。
 +    """
-+    scheduler = DreamScheduler(get_config=get_current_config, get_memory=get_memory_instance)
++    scheduler = DreamScheduler(
++        get_config=get_current_config,
++        get_memory=get_memory_instance,
++        observer=SqlRunObserver(),
++    )
 +    configure_scheduler(scheduler)
 +    scheduler.start()
 +    try:
@@ -9604,7 +10862,7 @@ index 20059fb8..f1ccaaf7 100644
  app = FastAPI(
      title="Mem0 REST APIs",
      description=(
-@@ -153,6 +241,7 @@ app = FastAPI(
+@@ -153,6 +265,7 @@ app = FastAPI(
      ),
      version="1.0.0",
      redirect_slashes=False,
@@ -9612,7 +10870,7 @@ index 20059fb8..f1ccaaf7 100644
  )
  app.state.limiter = limiter
  app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-@@ -170,6 +259,7 @@ app.include_router(auth_router.router)
+@@ -170,6 +283,7 @@ app.include_router(auth_router.router)
  app.include_router(api_keys_router.router)
  app.include_router(entities_router.router)
  app.include_router(requests_router.router)
@@ -9620,7 +10878,7 @@ index 20059fb8..f1ccaaf7 100644
  
  
  class Message(BaseModel):
-@@ -205,6 +295,21 @@ class SearchRequest(BaseModel):
+@@ -205,6 +319,21 @@ class SearchRequest(BaseModel):
      threshold: Optional[float] = Field(None, description="Minimum similarity score for results.")
      explain: Optional[bool] = Field(None, description="Include score details for each search result.")
      show_expired: Optional[bool] = Field(None, description="Include expired memories.")
@@ -9642,7 +10900,7 @@ index 20059fb8..f1ccaaf7 100644
  
  
  class GenerateInstructionsRequest(BaseModel):
-@@ -383,7 +488,33 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
+@@ -383,7 +512,33 @@ def add_memory(memory_create: MemoryCreate, _auth=Depends(verify_auth)):
  
  
  ALL_MEMORIES_LIMIT = 1000
@@ -9677,7 +10935,7 @@ index 20059fb8..f1ccaaf7 100644
  
  
  def _serialize_memory(row: Any) -> Dict[str, Any]:
-@@ -396,16 +527,57 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
+@@ -396,16 +551,57 @@ def _serialize_memory(row: Any) -> Dict[str, Any]:
          "run_id": payload.get("run_id"),
          "hash": payload.get("hash"),
          "expiration_date": payload.get("expiration_date"),
@@ -9739,7 +10997,7 @@ index 20059fb8..f1ccaaf7 100644
  
  
  @app.get("/memories", summary="Get memories")
-@@ -415,17 +587,22 @@ def get_all_memories(
+@@ -415,17 +611,22 @@ def get_all_memories(
      run_id: Optional[str] = None,
      agent_id: Optional[str] = None,
      top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
@@ -9764,7 +11022,7 @@ index 20059fb8..f1ccaaf7 100644
          filters = {
              k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v
          }
-@@ -433,6 +610,10 @@ def get_all_memories(
+@@ -433,6 +634,10 @@ def get_all_memories(
          if top_k is not None:
              params["top_k"] = top_k
          params["show_expired"] = show_expired
@@ -9775,7 +11033,7 @@ index 20059fb8..f1ccaaf7 100644
          return get_memory_instance().get_all(**params)
      except HTTPException:
          raise
-@@ -440,6 +621,82 @@ def get_all_memories(
+@@ -440,6 +645,82 @@ def get_all_memories(
          raise upstream_error()
  
  
@@ -9858,7 +11116,7 @@ index 20059fb8..f1ccaaf7 100644
  @app.get("/memories/{memory_id}", summary="Get a memory")
  def get_memory(memory_id: str, _auth=Depends(verify_auth)):
      """Retrieve a specific memory by ID."""
-@@ -475,6 +732,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+@@ -475,6 +756,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
              params["explain"] = search_req.explain
          if search_req.show_expired is not None:
              params["show_expired"] = search_req.show_expired
@@ -11566,6 +12824,464 @@ index 00000000..d9b345c6
 +
 +        assert report["observations_superseded"] == 0
 +        assert store.payload_writes == []
+diff --git a/tests/memory/test_graph_search.py b/tests/memory/test_graph_search.py
+new file mode 100644
+index 00000000..5ffb9a2e
+--- /dev/null
++++ b/tests/memory/test_graph_search.py
+@@ -0,0 +1,174 @@
++"""Tests for the graph signal in the retrieval layer (design: docs/design/graph-memory.md).
++
++Two concerns are covered here:
++  * The additive fusion is a supplementary signal: it never introduces or drops a
++    candidate, its ceiling is `weight` and it only grows the divisor when a candidate in
++    the pool actually carries a boost (design §6.2, [AC-12][AC-13][AC-17]).
++  * The off state is byte-identical to pre-graph releases, `explain` included
++    (design §6.5, [AC-19][AC-31]).
++"""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from mem0.configs.base import GraphConfig, MemoryConfig
++from mem0.memory import main as memory_main
++from mem0.utils.scoring import (
++    ENTITY_BOOST_WEIGHT,
++    GRAPH_BOOST_WEIGHT,
++    GRAPH_DETAIL_KEYS,
++    score_and_rank,
++)
++
++
++def _candidate(memory_id, score=0.8):
++    return {"id": memory_id, "score": score, "payload": {"data": f"mem {memory_id}"}}
++
++
++class TestScoringFusion:
++    """[AC-11][AC-12] 图信号加性进入分子，且受上限约束。"""
++
++    def test_graph_boost_adds_to_numerator(self):
++        results = [_candidate("a"), _candidate("b")]
++        scored = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, graph_boosts={"b": 0.5})
++        by_id = {row["id"]: row["score"] for row in scored}
++        # max_possible = 1.0 + 0.5（图信号存在）
++        assert by_id["b"] == pytest.approx((0.8 + 0.5) / 1.5)
++        assert by_id["a"] == pytest.approx(0.8 / 1.5)
++        assert scored[0]["id"] == "b"
++
++    def test_boost_ceiling_is_the_weight(self):
++        """[AC-12] 四信号全开时图信号占比 ≤ 0.167（W_g=0.5 / max_possible=3.0）。"""
++        results = [_candidate("a")]
++        scored = score_and_rank(
++            results,
++            {"a": 0.4},
++            {"a": 0.2},
++            threshold=0.1,
++            top_k=10,
++            explain=True,
++            graph_boosts={"a": GRAPH_BOOST_WEIGHT},
++        )
++        details = scored[0]["score_details"]
++        assert details["graph_boost"] <= GRAPH_BOOST_WEIGHT
++        assert details["max_possible_score"] == pytest.approx(3.0)
++        assert details["graph_boost"] / details["max_possible_score"] <= 0.167 + 1e-9
++
++    def test_divisor_only_grows_for_pooled_candidates(self):
++        """[AC-17] 池外加分不得增长分母：空映射与「无关 id」都保持 base 分母。"""
++        results = [_candidate("a")]
++        empty = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, explain=True, graph_boosts={})
++        assert empty[0]["score_details"]["max_possible_score"] == 1.0
++        # 空映射也会发布零值分量键（图能力开启、本次未命中）。
++        assert empty[0]["score_details"][GRAPH_DETAIL_KEYS[0]] == 0.0
++        assert empty[0]["score_details"][GRAPH_DETAIL_KEYS[1]] == 0
++
++    def test_signal_composition_with_bm25_and_entity(self):
++        results = [_candidate("a")]
++        scored = score_and_rank(
++            results,
++            {"a": 0.4},
++            {"a": 0.2},
++            threshold=0.1,
++            top_k=10,
++            explain=True,
++            graph_boosts={"a": 0.5},
++        )
++        details = scored[0]["score_details"]
++        assert details["max_possible_score"] == pytest.approx(1.0 + 1.0 + ENTITY_BOOST_WEIGHT + GRAPH_BOOST_WEIGHT)
++        assert details["raw_score"] == pytest.approx(0.8 + 0.4 + 0.2 + 0.5)
++
++    def test_threshold_still_gates_before_fusion(self):
++        """低语义分候选不得凭图加分越过相似度门槛进入候选池。"""
++        results = [_candidate("a", score=0.05)]
++        scored = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, graph_boosts={"a": 0.5})
++        assert scored == []
++
++    def test_off_state_is_byte_identical(self):
++        """[AC-19][AC-31] graph_boosts=None 时评分与 explain 键集合逐位不变。"""
++        results = [_candidate("a"), _candidate("b", 0.6)]
++        without = score_and_rank(results, {}, {}, threshold=0.1, top_k=10, explain=True)
++        explicit_empty = score_and_rank(
++            results, {}, {}, threshold=0.1, top_k=10, explain=True, graph_boosts=None, graph_facts=None
++        )
++        assert without == explicit_empty
++        assert all(key not in without[0]["score_details"] for key in GRAPH_DETAIL_KEYS)
++        # 显式传入 None 与完全不传的调用形状一致（打分器签名保持向后兼容）。
++        positional = score_and_rank(results, {}, {}, 0.1, 10, True)
++        assert positional == without
++
++    def test_graph_facts_published(self):
++        results = [_candidate("a")]
++        scored = score_and_rank(
++            results,
++            {},
++            {},
++            threshold=0.1,
++            top_k=10,
++            explain=True,
++            graph_boosts={"a": 0.3},
++            graph_facts={"a": 2},
++        )
++        assert scored[0]["score_details"][GRAPH_DETAIL_KEYS[1]] == 2
++
++
++class TestGraphHitsWiring:
++    """[AC-15][AC-26][AC-27] 检索路径的取数与开关。"""
++
++    def _memory(self, **graph_overrides):
++        config = MemoryConfig(graph=GraphConfig(**graph_overrides))
++        memory = SimpleNamespace(config=config)
++        return memory
++
++    def test_disabled_returns_none(self):
++        boosts, facts = memory_main._compute_graph_hits(self._memory(enabled=False), "q", [{"id": "a"}], {"user_id": "u"})
++        assert boosts is None and facts is None
++
++    def test_enabled_without_scope_returns_empty(self):
++        memory = self._memory(enabled=True)
++        memory._graph_bridge_client = MagicMock()
++        boosts, facts = memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {})
++        assert boosts == {} and facts == {}
++        memory._graph_bridge_client.search.assert_not_called()
++
++    def test_enabled_maps_facts_to_boosts(self, monkeypatch):
++        memory = self._memory(enabled=True, weight=0.5)
++        client = MagicMock()
++        client.search.return_value = {"facts": [{"episodes": ["a"], "invalid_at": None}]}
++        memory._graph_bridge_client = client
++        boosts, facts = memory_main._compute_graph_hits(
++            memory, "q", [{"id": "a"}, {"id": "b"}], {"user_id": "test_graph_a"}
++        )
++        assert boosts == {"a": pytest.approx(0.5)}
++        assert facts == {"a": 1}
++        payload, timeout = client.search.call_args[0]
++        assert payload["group_ids"] == ["mem0_test_graph_a"]
++        assert payload["query"] == "q"
++
++    def test_bridge_exception_degrades_to_empty(self):
++        memory = self._memory(enabled=True)
++        client = MagicMock()
++        client.search.side_effect = RuntimeError("bridge down")
++        memory._graph_bridge_client = client
++        assert memory_main._compute_graph_hits(memory, "q", [{"id": "a"}], {"user_id": "u"}) == ({}, {})
++
++    def test_dispatch_skipped_when_disabled(self):
++        memory = self._memory(enabled=False)
++        records = [("m1", "text", [0.1], {"created_at": "2026-09-17T00:00:00+00:00"})]
++        memory_main._dispatch_graph_sync(memory, records, {"user_id": "u"})
++        assert getattr(memory, "_graph_sync", None) is None
++
++    def test_dispatch_enqueues_for_each_record(self):
++        memory = self._memory(enabled=True, retry_backoff_seconds=0.0)
++        records = [
++            ("m1", "text one", [0.1], {"created_at": "2026-09-17T00:00:00+00:00"}),
++            ("m2", "text two", [0.1], None),
++        ]
++        memory_main._dispatch_graph_sync(memory, records, {"user_id": "test_graph_a"})
++        sync = memory._graph_sync
++        try:
++            assert sync.stats()["graph_dispatched"] == 2
++        finally:
++            sync.close()
+diff --git a/tests/memory/test_graph_sync.py b/tests/memory/test_graph_sync.py
+new file mode 100644
+index 00000000..bd614648
+--- /dev/null
++++ b/tests/memory/test_graph_sync.py
+@@ -0,0 +1,272 @@
++"""Tests for graph memory (design: docs/design/graph-memory.md).
++
++Two concerns are covered here:
++  * The scope -> graph-key derivation is a pure function shared by the write dispatch
++    and the retrieval query (design §4.4).
++  * The dispatch path is a bounded in-memory queue whose failure modes (queue overflow,
++    unreachable bridge, repeated failures) never raise into the write path and are
++    observable through counters (design §5.1-5.2, §8).
++"""
++
++import queue as queue_module
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from mem0.configs.base import GraphConfig, MemoryConfig
++from mem0.memory.graph_sync import (
++    GraphSync,
++    compute_graph_boosts,
++    derive_group_id,
++    sanitize_group_id,
++    search_graph_facts,
++)
++
++
++class _CountingClient:
++    """Stand-in for `GraphBridgeClient` that records calls and can be told to fail."""
++
++    def __init__(self, statuses=None, failures=0):
++        self.calls = []
++        self._statuses = list(statuses or [])
++        self._failures = failures
++        self.closed = False
++
++    def post_episode(self, payload):
++        self.calls.append(payload)
++        if self._failures > 0:
++            self._failures -= 1
++            raise RuntimeError("bridge down")
++        status = self._statuses.pop(0) if self._statuses else "synced"
++        return {"status": status, "uuid": payload["uuid"]}
++
++    def search(self, payload, timeout_seconds):
++        self.calls.append(payload)
++        if self._failures > 0:
++            self._failures -= 1
++            raise RuntimeError("bridge down")
++        return {"facts": []}
++
++    def close(self):
++        self.closed = True
++
++
++def _memory(**graph_overrides):
++    config = MemoryConfig(graph=GraphConfig(**graph_overrides))
++    return SimpleNamespace(config=config, _graph_bridge_client=_CountingClient())
++
++
++class TestGroupIdDerivation:
++    """[AC-32] 图键由作用域派生，写入与检索共用同一纯函数。"""
++
++    def test_user_id_wins_over_agent_and_run(self):
++        filters = {"user_id": "test_graph_a", "agent_id": "test_graph_b", "run_id": "test_graph_c"}
++        assert derive_group_id(filters) == "mem0_test_graph_a"
++
++    def test_agent_then_run_fallback(self):
++        assert derive_group_id({"agent_id": "test_graph_a"}) == "mem0_test_graph_a"
++        assert derive_group_id({"run_id": "test_graph_a"}) == "mem0_test_graph_a"
++
++    def test_nested_and_wrapper_is_unwrapped(self):
++        """检索侧 filters 常被 `{\"AND\": [...]}` 包裹，作用域必须仍能取到。"""
++        filters = {"AND": [{"user_id": "test_graph_a"}, {"invalid_at": None}]}
++        assert derive_group_id(filters) == "mem0_test_graph_a"
++
++    def test_no_scope_returns_none(self):
++        assert derive_group_id(None) is None
++        assert derive_group_id({}) is None
++        assert derive_group_id({"metadata": {"x": 1}}) is None
++
++    def test_invalid_characters_are_normalized(self):
++        """graphiti 的 `validate_group_id` 只接受 [A-Za-z0-9_-]，冒号等必须归一。"""
++        group_id = derive_group_id({"user_id": "test graph:1/2"})
++        assert group_id == "mem0_test_graph_1_2"
++        assert sanitize_group_id("a" * 200) == "a" * 96
++
++    def test_same_scope_yields_same_key(self):
++        assert derive_group_id({"user_id": "test_graph_a"}) == derive_group_id({"user_id": "test_graph_a"})
++
++
++class TestGraphBoostFolding:
++    """[AC-11][AC-12][AC-16][AC-17][AC-34] 图加分折算为纯函数。"""
++
++    def test_rank_decay_and_ceiling(self):
++        facts = [{"episodes": ["a"]}, {"episodes": ["b"]}]
++        boosts, counts = compute_graph_boosts(facts, ["a", "b"], weight=0.5)
++        assert boosts["a"] == pytest.approx(0.5)
++        assert boosts["b"] == pytest.approx(0.5 / 1.5)
++        assert counts == {"a": 1, "b": 1}
++
++    def test_max_over_ranks_and_fact_count(self):
++        facts = [
++            {"episodes": ["b"]},
++            {"episodes": ["b", "a"]},
++        ]
++        boosts, counts = compute_graph_boosts(facts, ["a", "b", "c"], weight=0.5)
++        # b 在第 1 条命中（权重 1.0）与第 2 条命中（权重 1/1.5），取最大。
++        assert boosts["b"] == pytest.approx(0.5)
++        assert boosts["a"] == pytest.approx(0.5 / 1.5)
++        assert counts == {"b": 2, "a": 1}
++
++    def test_ids_outside_candidate_pool_are_ignored(self):
++        facts = [{"episodes": ["outside"]}]
++        boosts, counts = compute_graph_boosts(facts, ["a"], weight=0.5)
++        assert boosts == {}
++        assert counts == {}
++
++    def test_invalidated_facts_are_skipped_by_default(self):
++        facts = [{"episodes": ["a"], "invalid_at": "2026-01-01T00:00:00+00:00"}]
++        boosts, _ = compute_graph_boosts(facts, ["a"], weight=0.5)
++        assert boosts == {}
++        boosts, _ = compute_graph_boosts(facts, ["a"], weight=0.5, include_invalidated=True)
++        assert boosts["a"] == pytest.approx(0.5)
++
++    def test_malformed_facts_are_ignored(self):
++        facts = ["not-a-dict", {"episodes": None}, {"episodes": "a"}, {}]
++        boosts, counts = compute_graph_boosts(facts, ["a"], weight=0.5)
++        assert boosts == {} and counts == {}
++
++    def test_zero_weight_disables_boosts(self):
++        boosts, _ = compute_graph_boosts([{"episodes": ["a"]}], ["a"], weight=0.0)
++        assert boosts == {}
++
++    def test_pure_function_is_repeatable(self):
++        facts = [{"episodes": ["a"]}, {"episodes": ["b"]}]
++        assert compute_graph_boosts(facts, ["a", "b"], 0.5) == compute_graph_boosts(facts, ["a", "b"], 0.5)
++
++
++class TestSearchDegradation:
++    """[AC-20]-[AC-23] 图检索失败一律按「本次无图信号」处理。"""
++
++    def test_unreachable_bridge_returns_empty(self):
++        client = _CountingClient(failures=1)
++        assert search_graph_facts(client, "mem0_test_graph_a", "q", 5, 0.4) == []
++
++    def test_malformed_response_returns_empty(self):
++        client = SimpleNamespace(search=lambda payload, timeout: {"facts": "nope"})
++        assert search_graph_facts(client, "mem0_test_graph_a", "q", 5, 0.4) == []
++
++    def test_no_group_or_query_skips_the_call(self):
++        client = _CountingClient()
++        assert search_graph_facts(client, None, "q", 5, 0.4) == []
++        assert search_graph_facts(client, "mem0_test_graph_a", "", 5, 0.4) == []
++        assert client.calls == []
++
++
++class TestDispatchQueue:
++    """[AC-6][AC-9][AC-25] 派发不阻塞写入路径，队列有界且失败可观测。"""
++
++    def test_disabled_config_never_dispatches(self):
++        sync = GraphSync(GraphConfig(enabled=False), client=_CountingClient())
++        assert sync.dispatch("m1", "text", None, "mem0_test_graph_a") is False
++        assert sync.stats()["graph_dispatched"] == 0
++
++    def test_dispatch_without_group_id_is_skipped(self):
++        sync = GraphSync(GraphConfig(enabled=True), client=_CountingClient())
++        assert sync.dispatch("m1", "text", None, None) is False
++
++    def test_dispatch_enqueues_and_counts(self):
++        client = _CountingClient()
++        sync = GraphSync(GraphConfig(enabled=True, retry_backoff_seconds=0.0), client=client)
++        try:
++            assert sync.dispatch("m1", "text", "2026-09-17T00:00:00+00:00", "mem0_test_graph_a") is True
++            assert sync.stats()["graph_dispatched"] == 1
++        finally:
++            sync.close()
++
++    def test_queue_overflow_drops_oldest_and_counts(self):
++        client = _CountingClient()
++        # worker 不启动：只验证入队路径的有界性。
++        sync = GraphSync(GraphConfig(enabled=True, queue_size=2), client=client)
++        for index in range(5):
++            sync.dispatch(f"m{index}", "text", None, "mem0_test_graph_a")
++        stats = sync.stats()
++        assert stats["graph_dispatched"] == 5
++        assert stats["graph_dropped"] == 3
++        assert stats["queue_size"] == 2
++        sync.close()
++
++    def test_worker_syncs_and_counts(self):
++        client = _CountingClient()
++        sync = GraphSync(GraphConfig(enabled=True, retry_backoff_seconds=0.0), client=client)
++        try:
++            sync.dispatch("m1", "text", None, "mem0_test_graph_a")
++            for _ in range(50):
++                if sync.stats()["graph_synced"]:
++                    break
++                time.sleep(0.05)
++            assert sync.stats()["graph_synced"] == 1
++            assert client.calls[0]["uuid"] == "m1"
++            assert client.calls[0]["group_id"] == "mem0_test_graph_a"
++        finally:
++            sync.close()
++
++    def test_already_synced_is_counted_separately(self):
++        client = _CountingClient(statuses=["already_synced"])
++        sync = GraphSync(GraphConfig(enabled=True, retry_backoff_seconds=0.0), client=client)
++        try:
++            sync.dispatch("m1", "text", None, "mem0_test_graph_a")
++            for _ in range(50):
++                if sync.stats()["graph_already_synced"]:
++                    break
++                time.sleep(0.05)
++            assert sync.stats()["graph_already_synced"] == 1
++            assert sync.stats()["graph_synced"] == 0
++        finally:
++            sync.close()
++
++    def test_retry_then_failure_counts_and_opens_circuit(self):
++        client = _CountingClient(failures=99)
++        sync = GraphSync(
++            GraphConfig(
++                enabled=True,
++                max_retries=2,
++                retry_backoff_seconds=0.0,
++                circuit_breaker_failures=1,
++                circuit_cooldown_seconds=60.0,
++            ),
++            client=client,
++        )
++        try:
++            import asyncio
++
++            asyncio.run(sync._sync_one({"uuid": "m1", "group_id": "mem0_test_graph_a", "text": "t"}))
++            stats = sync.stats()
++            # 2 次重试 + 首次尝试 = 3 次调用；计数为 1 条失败，且熔断已打开。
++            assert len(client.calls) == 3
++            assert stats["graph_failed"] == 1
++            assert stats["circuit_open"] is True
++        finally:
++            sync.close()
++
++    def test_circuit_open_drops_without_calling(self):
++        import asyncio
++
++        client = _CountingClient()
++        sync = GraphSync(
++            GraphConfig(enabled=True, circuit_breaker_failures=1, circuit_cooldown_seconds=60.0),
++            client=client,
++        )
++        try:
++            sync._consecutive_failures = 5
++            sync._circuit_open_until = time.monotonic() + 30
++            asyncio.run(sync._sync_one({"uuid": "m1", "group_id": "mem0_test_graph_a", "text": "t"}))
++            assert client.calls == []
++            assert sync.stats()["graph_dropped"] == 1
++        finally:
++            sync.close()
++
++    def test_dispatch_swallows_queue_errors(self):
++        """派发路径的任何异常都不得外溢到写入结果。"""
++
++        class _BrokenQueue:
++            def put_nowait(self, _task):
++                raise queue_module.Full()
++
++            def get_nowait(self):
++                raise queue_module.Empty()
++
++        sync = GraphSync(GraphConfig(enabled=True), client=_CountingClient())
++        sync._queue = _BrokenQueue()  # type: ignore[assignment] - 注入一个恒定溢出/为空的队列
++        assert sync.dispatch("m1", "text", None, "mem0_test_graph_a") is False
 diff --git a/tests/memory/test_main.py b/tests/memory/test_main.py
 index cea7e384..d5c35f86 100644
 --- a/tests/memory/test_main.py
