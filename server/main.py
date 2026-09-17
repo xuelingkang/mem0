@@ -31,6 +31,7 @@ from routers import api_keys as api_keys_router
 from routers import auth as auth_router
 from routers import dream as dream_router
 from routers import entities as entities_router
+from routers import graph as graph_router
 from routers import requests as requests_router
 from schemas import MessageResponse
 from server_state import (
@@ -284,6 +285,7 @@ app.include_router(api_keys_router.router)
 app.include_router(entities_router.router)
 app.include_router(requests_router.router)
 app.include_router(dream_router.router)
+app.include_router(graph_router.router)
 
 
 class Message(BaseModel):
