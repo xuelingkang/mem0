@@ -188,6 +188,25 @@ DREAM_CONFIG = {
     "lock_path": os.environ.get("DREAM_LOCK_PATH", "/app/history/dream.lock"),
 }
 
+# Graph memory (Graphiti side-car graph): the SDK owns the semantics of these knobs
+# (`mem0.configs.base.GraphConfig`), this block only lets a deployment override the
+# defaults through the environment. `enabled` stays off unless asked for, so retrieval
+# and writes stay byte-identical to pre-graph releases.
+GRAPH_CONFIG = {
+    "enabled": _env_flag("MEM0_GRAPH_ENABLED", False),
+    "endpoint": os.environ.get("MEM0_GRAPH_ENDPOINT", "http://graph-bridge:8000"),
+    "weight": _env_number("MEM0_GRAPH_WEIGHT", 0.5, float),
+    "max_facts": _env_number("MEM0_GRAPH_MAX_FACTS", 10, int),
+    "timeout_seconds": _env_number("MEM0_GRAPH_TIMEOUT_SECONDS", 0.4, float),
+    "include_invalidated": _env_flag("MEM0_GRAPH_INCLUDE_INVALIDATED", False),
+    "queue_size": _env_number("MEM0_GRAPH_QUEUE_SIZE", 1000, int),
+    "max_retries": _env_number("MEM0_GRAPH_MAX_RETRIES", 3, int),
+    "retry_backoff_seconds": _env_number("MEM0_GRAPH_RETRY_BACKOFF_SECONDS", 5.0, float),
+    "circuit_breaker_failures": _env_number("MEM0_GRAPH_CIRCUIT_BREAKER_FAILURES", 5, int),
+    "circuit_cooldown_seconds": _env_number("MEM0_GRAPH_CIRCUIT_COOLDOWN_SECONDS", 60.0, float),
+    "request_timeout_seconds": _env_number("MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS", 120.0, float),
+}
+
 DEFAULT_CONFIG = {
     "version": "v1.1",
     "vector_store": {
@@ -207,6 +226,7 @@ DEFAULT_CONFIG = {
     "history_db_path": HISTORY_DB_PATH,
     "decay": DECAY_CONFIG,
     "dream": DREAM_CONFIG,
+    "graph": GRAPH_CONFIG,
 }
 
 
