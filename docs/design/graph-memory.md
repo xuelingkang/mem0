@@ -170,7 +170,7 @@ VM（lima `docker`，vz / aarch64）：
 采用 S2 的依据：
 
 1. **图侧故障不外溢**：容器级 `mem_limit` 与独立重启是主链路安全底线的物理保障；S1 的图侧 OOM 与 mem0 共享同一内存池。
-2. **客户端可完全按本机通道构造**：图桥自行装配 LLM 与 embedder 客户端（E7 证明这是当前唯一可行的通道），图桥不修改 graphiti-core 一行源码，第三方库保持上游状态。
+2. **客户端可完全按本机通道构造**：图桥自行装配 LLM 与 embedder 客户端（当前通道由 E18 实测选定），图桥不修改 graphiti-core 一行源码，第三方库保持上游状态。
 3. **探测与升级面收敛**：图桥的 `/health`、`/stats`、`/graph/{group_id}` 三个端点同时充当运维面与测试面（第 8 节、第 11.6 节）。
 4. **官方镜像的路径已排除**（4.2 三处硬缺口，均为实测），自建薄壳的增量成本已不可避免；既然自建，就取进程隔离与内存上限。
 
@@ -410,7 +410,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 | 文件 | 层 | 改动 |
 | --- | --- | --- |
-| `server/graph-bridge/app.py`（新增） | 图桥 | FastAPI 薄壳：装配 graphiti-core 客户端（LLM 用 `OpenAIClient` 的 `/responses` 通道，embedder 用 OpenAI 兼容 embedder 客户端）、作用域→图键映射、driver 缓存、`/episodes`（含幂等前置）、`/search`、`/stats`、`/health`、`/graph/{group_id}` |
+| `server/graph-bridge/app.py`（新增） | 图桥 | FastAPI 薄壳：装配 graphiti-core 客户端（LLM 用 `OpenAIGenericClient` 的 `/chat/completions` 通道，embedder 用 OpenAI 兼容 embedder 客户端）、作用域→图键映射、driver 缓存、`/episodes`（含幂等前置）、`/search`、`/stats`、`/health`、`/graph/{group_id}` |
 | `server/graph-bridge/requirements.txt`、`Dockerfile`、`README.md`（新增） | 图桥 | 依赖固定 `graphiti-core[falkordb]==0.30.2`；镜像基于 `python:3.12-slim` |
 | `server/docker-compose.yaml` | 部署 | 新增 `falkordb`（`mem_limit: 384m`，仅内网）与 `graph-bridge`（`mem_limit: 512m`，仅内网，`depends_on` falkordb）；`mem0` 服务透传 `MEM0_GRAPH_*` 并 `depends_on` graph-bridge（软依赖） |
 | `server/.env.example` | 部署 | 新增图能力环境变量（默认 `MEM0_GRAPH_ENABLED=false`）。**实际做法**：`server/.env` 未新增变量——它未纳入版本控制（`.gitignore`），运行行为由 compose 的 `${MEM0_GRAPH_ENABLED:-false}` 等默认值兜底；`.env.example` 是模板与文档面 |
@@ -471,8 +471,8 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | E3 | `docker stats`：`falkordb/falkordb:latest` 空载 62.43 → 67.5MiB（分步启动观测） | 图库常驻预算 |
 | E4 | 规模化压测：8150 实体节点 + 3545 边写入后 `INFO memory`：`used_memory` 7.00MiB → 10.53MiB、`used_memory_dataset` 8.25MiB、`used_memory_rss` 37.46MiB 不变；`count(n)=8150`、`count(e)=3545` | 目标规模图数据的内存模型（3.2/4.3） |
 | E5 | `docker stats`：`zepai/graphiti:0.30.2` 容器 idle 145.3MiB、CPU 0.23% | 图服务常驻与 CPU 预算 |
-| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 选定的形态）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；进程峰值 RSS 155MB。**`/search` 时延以 E17 的专门采样为准**——本条当时记录的「0.12–0.23s」只覆盖了轻载样本、未覆盖尾部，核验复跑 40 次即得 `p95 0.520 / max 0.678s`（超 0.4s 3/40），故 0.4s 预算不成立 | 时延预算、LLM 负载 |
-| E7 | 结构化输出探测（`graphiti-core` 三种客户端 × 本机网关 `deepseek-v4.1-flash`）：`OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；`OpenAIGenericClient(json_object)` 短提示通过、长提示下出现 `EdgeDuplicate` 校验失败（`Extra data: line 1 column 847`）；`OpenAIClient(responses.parse)` → 通过 | 图桥按 `/responses` 通道装配 LLM 客户端 |
+| E6 | 端到端（LLM 走 `/responses` 通道，即 E7 当时选定的形态；该通道后因上游 provider 路由变化而失效，见 E18）：5 条中文事实 → 11 实体 + 8 边；摄入时延 min/med/max = 14.24 / 20.52 / 36.65s；进程峰值 RSS 155MB。**`/search` 时延以 E17 的专门采样为准**——本条当时记录的「0.12–0.23s」只覆盖了轻载样本、未覆盖尾部，核验复跑 40 次即得 `p95 0.520 / max 0.678s`（超 0.4s 3/40），故 0.4s 预算不成立 | 时延预算、LLM 负载 |
+| E7 | 结构化输出探测（`graphiti-core` 三种客户端 × 本机网关 `deepseek-v4.1-flash`）：`OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；`OpenAIGenericClient(json_object)` 短提示通过、长提示下出现 `EdgeDuplicate` 校验失败（`Extra data: line 1 column 847`）；`OpenAIClient(responses.parse)` → 通过 | 图桥按 `/responses` 通道装配 LLM 客户端。**该结论已被 E18 推翻**：当时成立的是「三条通道里 `/responses` 是唯一长提示可用者」，而非 `/responses` 通道本身可靠 |
 | E8 | 官方镜像内 `import falkordb` → `None`（不存在），`neo4j` → 存在；带 `db_backend=falkordb` 启动 → `ImportError: falkordb is required for FalkorDriver` | G1 |
 | E9 | 官方镜像 + Neo4j 后端：`/healthcheck` → `{"status":"healthy"}`；`/messages` → 202；`/search` → `422 ... API密钥未配置该模型`（embedder 实际用默认 `text-embedding-3-small`） | G2 |
 | E10 | 镜像内 `graph_service` 源码：`AddMessagesRequest` 无 uuid 回传字段；`/messages` 响应仅 `{"message", "success"}` | G3 |
@@ -483,6 +483,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | E15 | 镜像体积：本机展开 `falkordb/falkordb:latest` 570MB、`zepai/graphiti:0.30.2` 582MB、`neo4j:5.26-community` 660MB；Docker Hub arm64 拉取体积 FalkorDB 206.7MB、Graphiti 192.0MB | 3.2 磁盘预算 |
 | E16 | `graphiti_core` 版本：PyPI 最新 `graphiti-core` 0.30.2（requires_python `>=3.10,<4`），镜像内为同一版本；`Graphiti` 构造器接受 `graph_driver` / `llm_client` / `embedder` / `cross_encoder` | 依赖锁版本与客户端装配方式 |
 | E17 | 图桥 `/search` 尾部分位（核验整改卡实测，`bridge_search_latency.py`）：第 1 轮 n=60 → `p50 0.131 / p90 0.258 / p95 0.343 / p99 0.425 / max 0.472s`；第 2 轮（图键补入实体与关系边）n=100 → `p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s`，其中超 0.4s 共 14/100（14.0%），超 0.6s 4/100，超 0.8s 2/100，无超 1.0s | `timeout_seconds` 默认值取 1.0 的依据：两轮 max 均在预算内，且对 p99/max 仍有 ~19% 裕度；0.4s 只覆盖到约 p85，属「正常请求会落进超时区」 |
+| E18 | 通道重测（上游 provider 路由变更后）：`OpenAIClient(responses.parse)` → 网关 422 `所有模型提供商均请求失败: ... 400 Bad Request from POST https://api.aimindsky.com/v1/responses，The request failed because it is missing messages parameter`（表现为 `/episodes` 500、`graph_synced` 恒为 0）；改 `OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；改 `OpenAIGenericClient(json_object)` → 通过（单条隔离事实 `/episodes` 200 `synced`，9.5s；端到端 `graph_synced` 7→8 且 `graph_failed` 无新增，图键 1 episode / 3 实体 / 2 边） | 图桥按 `OpenAIGenericClient(structured_output_mode="json_object")` 装配；E7 的通道结论作废。E7 记录的 `json_object` 长提示 `EdgeDuplicate` 校验失败在本轮端到端（含长抽取提示）未复现 |
 
 ---
 

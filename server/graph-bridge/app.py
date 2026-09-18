@@ -21,8 +21,8 @@
 3. **幂等必须前置判定**：同 uuid 重放 `add_episode` 不报错但会重新抽取（边数增长），
    所以先查该 uuid 的 `Episodic.entity_edges` 是否非空，非空即直接返回 `already_synced`。
 
-本服务不修改 graphiti-core 一行源码：LLM 客户端走 `/responses` 通道（本机网关实测唯一
-可用形态），embedder 用 OpenAI 兼容客户端并显式指定维度。
+本服务不修改 graphiti-core 一行源码：LLM 客户端走 OpenAI 兼容的 `/chat/completions` 通道
+（`OpenAIGenericClient`，见 `_build_llm_client`），embedder 用 OpenAI 兼容客户端并显式指定维度。
 """
 
 from __future__ import annotations
@@ -101,9 +101,23 @@ class SearchResponse(BaseModel):
 
 
 def _build_llm_client():
-    """装配 LLM 客户端（`/responses` 结构化输出通道，本机网关实测唯一可用形态）。"""
+    """装配 LLM 客户端（OpenAI 兼容的 `/chat/completions` 结构化输出通道）。
+
+    选型依据：`OpenAIClient` 在 `_create_structured_completion()` 里硬走 OpenAI 专有的
+    `responses.parse()`，本机网关 https://esp.xkw.cn/ai/v1 会把 `/responses` 转发给上游
+    provider，而该 provider 只实现 `/chat/completions`，回 400 `missing messages`
+    （表现为 `/episodes` 500、`graph_failed` 持续增长而 `graph_synced` 恒为 0）。
+    `OpenAIGenericClient` 面向任意 OpenAI 兼容端点，走 `chat.completions.create()`，
+    与网关实测互通。曾一度成立的「`/responses` 是本机唯一可用形态」结论随上游 provider
+    路由变化而失效，故不再沿用。
+
+    `structured_output_mode` 显式设为 `json_object`：本机网关对 `json_schema` 形态的
+    `response_format` 回 422 `This response_format type is unavailable now`
+    （`OpenAIGenericClient` 默认即 `json_schema`，故必须显式覆盖），而 `json_object`
+    实测通过。该模式下 schema 由客户端注入 prompt 引导，不由 API 强制校验。
+    """
     from graphiti_core.llm_client.config import LLMConfig
-    from graphiti_core.llm_client.openai_client import OpenAIClient
+    from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
     config = LLMConfig(
         api_key=LLM_API_KEY,
@@ -111,7 +125,7 @@ def _build_llm_client():
         model=LLM_MODEL,
         small_model=LLM_MODEL,
     )
-    return OpenAIClient(config=config)
+    return OpenAIGenericClient(config=config, structured_output_mode="json_object")
 
 
 def _build_embedder():

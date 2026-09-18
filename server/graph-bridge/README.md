@@ -22,7 +22,7 @@ join key 是构造性的：`episode uuid == memory id`，图侧不另存映射�
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `FALKORDB_HOST` / `FALKORDB_PORT` | `falkordb` / `6379` | 图库地址 |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 空 / 空 / `gpt-5-mini` | 抽取管道使用的 LLM（走 `/responses` 结构化输出通道） |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 空 / 空 / `gpt-5-mini` | 抽取管道使用的 LLM（走 OpenAI 兼容的 `/chat/completions` 结构化输出通道） |
 | `EMBEDDER_API_KEY` / `EMBEDDER_BASE_URL` / `EMBEDDER_MODEL` / `EMBEDDER_DIMS` | 回落 `LLM_*` / `text-embedding-3-small` / `1024` | 事实向量化用的 embedder |
 | `SEMAPHORE_LIMIT` | `1` | 并发上限，默认串行入图 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
