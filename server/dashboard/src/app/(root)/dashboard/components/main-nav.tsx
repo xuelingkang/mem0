@@ -9,7 +9,9 @@ import {
   GalleryVerticalEnd,
   KeyRound,
   Settings,
+  Sparkles,
   Users,
+  Waypoints,
   Wrench,
 } from "lucide-react";
 import { useSelector } from "react-redux";
@@ -82,6 +84,50 @@ export function MainNav({
                     url: "/dashboard/export",
                     icon: FolderInput,
                     active: pathname === "/dashboard/export",
+                  },
+                ].map((item) => (
+                  <SidebarMenuItem key={item.title}>
+                    <SidebarMenuButton
+                      asChild
+                      collapsed={isSidebarCollapsed}
+                      active={item.active}
+                      tooltip={isSidebarCollapsed ? item.title : undefined}
+                    >
+                      <Link
+                        href={item.url}
+                        className={cn(
+                          "flex items-center w-full",
+                          isSidebarCollapsed
+                            ? "justify-center mx-auto"
+                            : "gap-1.5",
+                        )}
+                      >
+                        <item.icon className="size-4 shrink-0" />
+                        {!isSidebarCollapsed && <span>{item.title}</span>}
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+              </div>
+
+              <div className="flex flex-col gap-0">
+                {!isSidebarCollapsed && (
+                  <SidebarGroupLabel className="mb-0">
+                    MECHANISMS
+                  </SidebarGroupLabel>
+                )}
+                {[
+                  {
+                    title: "Dream",
+                    url: "/dashboard/dream",
+                    icon: Sparkles,
+                    active: pathname === "/dashboard/dream",
+                  },
+                  {
+                    title: "Graph",
+                    url: "/dashboard/graph",
+                    icon: Waypoints,
+                    active: pathname === "/dashboard/graph",
                   },
                 ].map((item) => (
                   <SidebarMenuItem key={item.title}>

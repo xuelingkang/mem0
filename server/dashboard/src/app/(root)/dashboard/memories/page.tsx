@@ -5,29 +5,37 @@ import { Trash2, Search } from "lucide-react";
 import { format } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
+import { Switch } from "@/components/ui/switch";
 import { DataTable } from "@/components/shared/data-table";
 import { TableSkeleton } from "@/components/shared/table-skeleton";
 import { EmptyState } from "@/components/self-hosted/empty-state";
 import DeleteConfirmationModal from "@/components/ui/delete-confirmation-modal";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from "@/components/ui/sheet";
 import { toast } from "@/components/ui/use-toast";
 import { getErrorMessage } from "@/lib/error-message";
 import { api } from "@/utils/api";
-import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
-import { Memory } from "@/types/api";
+import { GRAPH_ENDPOINTS, MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
+import {
+  GraphStats,
+  GraphStatus,
+  Memory,
+  MemoryListResponse,
+} from "@/types/api";
+import { formatCount, formatScore, isObservation } from "@/utils/mechanism";
+import { deriveGraphKey } from "@/utils/graph-key";
+import {
+  GraphStatusBar,
+  ObservationBadge,
+  ValidityBadge,
+} from "@/components/self-hosted/mechanism-badges";
+import { MemoryDetailSheet } from "@/components/self-hosted/memory-detail-sheet";
 
 // Page size for cursor pagination. The backend returns { results, next_cursor } —
 // we keep a page buffer and append further pages as the user navigates.
 const PAGE_SIZE = 10;
 const CURSOR_FETCH_LIMIT = 10;
+// 检索模式的作用域：通配（管理面检索），与既有行为一致。图键即由它派生出 mem0__。
+const SEARCH_FILTERS = { user_id: "*" };
 
 export default function MemoriesPage() {
   const [query, setQuery] = useState("");
@@ -43,7 +51,15 @@ export default function MemoriesPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [page, setPage] = useState(0);
+  // 检索模式的机制透明：两个既有请求参数 + 图分支状态 + 生效预算。
+  const [includeObservations, setIncludeObservations] = useState(false);
+  const [includeInvalidated, setIncludeInvalidated] = useState(false);
+  const [graphStatus, setGraphStatus] = useState<GraphStatus | null>(null);
+  const [graphBudgetSeconds, setGraphBudgetSeconds] = useState<number | null>(
+    null,
+  );
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
+  const searchGraphKey = deriveGraphKey(SEARCH_FILTERS);
 
   // Browse mode: cursor-paginated GET /memories (newest first).
   const fetchBrowsePage = async (cursor: string | null) => {
@@ -51,7 +67,9 @@ export default function MemoriesPage() {
       top_k: CURSOR_FETCH_LIMIT,
     };
     if (cursor) params.cursor = cursor;
-    const res = await api.get(MEMORY_ENDPOINTS.BASE, { params });
+    const res = await api.get<MemoryListResponse>(MEMORY_ENDPOINTS.BASE, {
+      params,
+    });
     const raw = res.data?.results ?? res.data ?? [];
     const rows: Memory[] = Array.isArray(raw) ? raw : [];
     setNextCursor(res.data?.next_cursor ?? null);
@@ -61,14 +79,34 @@ export default function MemoriesPage() {
   };
 
   // Search mode: semantic (vector) recall via POST /search over the whole collection.
-  const fetchSearchPage = async (q: string) => {
+  // 恒定带 explain=true：分量透明是本次必做项，做成开关会让默认视图没有分量。
+  const fetchSearchPage = async (
+    q: string,
+    options?: { includeObservations?: boolean; includeInvalidated?: boolean },
+  ) => {
     const res = await api.post(MEMORY_ENDPOINTS.SEARCH, {
       query: q,
       top_k: 50,
-      filters: { user_id: "*" },
+      filters: SEARCH_FILTERS,
+      explain: true,
+      include_observations: options?.includeObservations ?? includeObservations,
+      include_invalidated: options?.includeInvalidated ?? includeInvalidated,
     });
     const raw = res.data?.results ?? res.data ?? [];
-    return (Array.isArray(raw) ? raw : []) as Memory[];
+    const rows = (Array.isArray(raw) ? raw : []) as Memory[];
+    // graph_status 在同一响应内恒定；取首条即整次检索的图分支状态。
+    setGraphStatus(rows[0]?.graph_status ?? null);
+    return rows;
+  };
+
+  // 生效的图检索预算用于解释「为什么这次是 timeout」，来自既有计数端点。
+  const fetchGraphBudget = async () => {
+    try {
+      const res = await api.get<GraphStats>(GRAPH_ENDPOINTS.STATS);
+      setGraphBudgetSeconds(res.data?.timeout_seconds ?? null);
+    } catch {
+      setGraphBudgetSeconds(null);
+    }
   };
 
   const loadInitial = async () => {
@@ -83,7 +121,9 @@ export default function MemoriesPage() {
         // Search results are a one-shot ranked list — no server-side pagination.
         setNextCursor(null);
         setHasMore(false);
+        void fetchGraphBudget();
       } else {
+        setGraphStatus(null);
         setMemories(await fetchBrowsePage(null));
       }
       setPage(0);
@@ -148,13 +188,48 @@ export default function MemoriesPage() {
     }
   };
 
+  // 开关切换即重跑同一 query：两个开关直接对应既有请求参数，不是新造过滤。
+  const toggleMechanismFilter = async (
+    key: "observations" | "invalidated",
+    next: boolean,
+  ) => {
+    const nextObservations =
+      key === "observations" ? next : includeObservations;
+    const nextInvalidated = key === "invalidated" ? next : includeInvalidated;
+    if (key === "observations") setIncludeObservations(next);
+    else setIncludeInvalidated(next);
+
+    const q = query.trim();
+    if (!q || !searchMode) return;
+    setIsLoading(true);
+    try {
+      const rows = await fetchSearchPage(q, {
+        includeObservations: nextObservations,
+        includeInvalidated: nextInvalidated,
+      });
+      setMemories(rows);
+      setPage(0);
+    } catch (error) {
+      toast({
+        title: "Failed to re-run search",
+        description: getErrorMessage(error),
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const columns = [
     {
       key: "memory" as keyof Memory,
       label: "Content",
       width: 400,
-      render: (value: string) => (
-        <span className="line-clamp-2 text-sm">{value}</span>
+      render: (value: string, row: Memory) => (
+        <div className="flex items-center gap-2">
+          <span className="line-clamp-2 text-sm">{value}</span>
+          {isObservation(row) && <ObservationBadge />}
+        </div>
       ),
     },
     ...(searchMode
@@ -168,6 +243,19 @@ export default function MemoriesPage() {
           },
         ]
       : []),
+    {
+      key: "invalid_at" as keyof Memory,
+      label: "Status",
+      width: 100,
+      render: (_value: unknown, row: Memory) => <ValidityBadge memory={row} />,
+    },
+    {
+      key: "access_count" as keyof Memory,
+      label: "Accesses",
+      width: 90,
+      align: "right" as const,
+      render: (value: number | null | undefined) => formatCount(value),
+    },
     { key: "user_id" as keyof Memory, label: "User", width: 100 },
     { key: "agent_id" as keyof Memory, label: "Agent", width: 100 },
     {
@@ -208,6 +296,38 @@ export default function MemoriesPage() {
           </Button>
         )}
       </div>
+
+      {searchMode && !isLoading && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-6">
+            <label className="flex items-center gap-2 text-xs text-onSurface-default-secondary">
+              <Switch
+                checked={includeObservations}
+                onCheckedChange={(checked) =>
+                  void toggleMechanismFilter("observations", checked)
+                }
+              />
+              含观察（include_observations）
+            </label>
+            <label className="flex items-center gap-2 text-xs text-onSurface-default-secondary">
+              <Switch
+                checked={includeInvalidated}
+                onCheckedChange={(checked) =>
+                  void toggleMechanismFilter("invalidated", checked)
+                }
+              />
+              含已失效（include_invalidated）
+            </label>
+          </div>
+          {graphStatus && (
+            <GraphStatusBar
+              status={graphStatus}
+              budgetSeconds={graphBudgetSeconds}
+              graphKey={searchGraphKey}
+            />
+          )}
+        </div>
+      )}
 
       {isLoading ? (
         <TableSkeleton rows={5} columns={4} />
@@ -290,76 +410,16 @@ export default function MemoriesPage() {
         </>
       )}
 
-      <Sheet
+      <MemoryDetailSheet
+        memory={selectedMemory}
         open={!!selectedMemory}
         onOpenChange={(open) => {
           if (!open) setSelectedMemory(null);
         }}
-      >
-        <SheetContent className="sm:max-w-md">
-          <SheetHeader>
-            <SheetTitle>Memory Detail</SheetTitle>
-            <SheetDescription className="sr-only">
-              View memory content and metadata
-            </SheetDescription>
-          </SheetHeader>
-          {selectedMemory && (
-            <div className="mt-6 space-y-4">
-              <div className="space-y-1">
-                <Label className="text-xs text-onSurface-default-tertiary">
-                  Content
-                </Label>
-                <p className="text-sm">{selectedMemory.memory}</p>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <Label className="text-xs text-onSurface-default-tertiary">
-                    ID
-                  </Label>
-                  <p className="text-xs font-mono break-all">
-                    {selectedMemory.id}
-                  </p>
-                </div>
-                {selectedMemory.user_id && (
-                  <div className="space-y-1">
-                    <Label className="text-xs text-onSurface-default-tertiary">
-                      User
-                    </Label>
-                    <p className="text-sm">{selectedMemory.user_id}</p>
-                  </div>
-                )}
-                {selectedMemory.agent_id && (
-                  <div className="space-y-1">
-                    <Label className="text-xs text-onSurface-default-tertiary">
-                      Agent
-                    </Label>
-                    <p className="text-sm">{selectedMemory.agent_id}</p>
-                  </div>
-                )}
-                {selectedMemory.created_at && (
-                  <div className="space-y-1">
-                    <Label className="text-xs text-onSurface-default-tertiary">
-                      Created
-                    </Label>
-                    <p className="text-sm">
-                      {new Date(selectedMemory.created_at).toLocaleString()}
-                    </p>
-                  </div>
-                )}
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-onSurface-danger-primary"
-                onClick={() => setMemoryToDelete(selectedMemory)}
-              >
-                <Trash2 className="size-3.5 mr-1" />
-                Delete memory
-              </Button>
-            </div>
-          )}
-        </SheetContent>
-      </Sheet>
+        onSelectMemory={(row) => setSelectedMemory(row)}
+        onDelete={(row) => setMemoryToDelete(row)}
+        graphKey={searchMode ? searchGraphKey : null}
+      />
 
       <DeleteConfirmationModal
         isOpen={!!memoryToDelete}
