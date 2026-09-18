@@ -329,11 +329,14 @@ ACCOUNT    API Keys / Configuration / Settings                        （既有�
 **契约（新增，只读）**
 
 ```
-GET /observations?top_k=<默认 1000，上限沿用既有 ALL_MEMORIES_LIMIT>&cursor=<不透明游标>
+GET /observations?page_size=<默认 1000，上限沿用既有 ALL_MEMORIES_LIMIT>&cursor=<不透明游标>
 → { "results": [ <与 GET /memories 同口径的完整记忆行> ], "next_cursor": <string|null>, "total": <int> }
 ```
 
-- 排序与游标口径与 `GET /memories`（无作用域）完全一致：`created_at` 最新优先，`cursor` 取上一页最后一行的 `created_at`。
+- **排序口径与 `GET /memories`（无作用域）一致**（实测 2026-09-18）：`created_at` 最新优先，页内 `created_at` 单调不增；两端点对同一批观察的**相对序也一致**——79 条观察在 `GET /memories?top_k=1000` 首页里的位置为 98–176，位置随观察的返回序单调递增。`cursor` 取上一页最后一行的 `created_at`，服务端按 `created_at < cursor` 严格递减续读，因此页间永不重叠（`page_size=25` 翻完全库实测 25/25/25/4、79 条 79 唯一、0 重复，`total=79` 与 Qdrant 精确计数一致）。
+- **末页判定与 `GET /memories` 不同，是本端点有意为之的口径**：本页不足 `page_size` 行时即返回 `next_cursor = null`（实测 `page_size=100` 返回 79 行 ⇒ `null`；`page_size=79` 恰好满页 ⇒ 仍返回游标，说明判据是「不足一页」而不是「少于总数」）。`GET /memories` 只要本页有行就返回游标——实测 `top_k=1000` 第 5 页 101 行仍返回游标，第 6 页 0 行才 `null`，客户端需要多请求一次空页才收敛。两者各自服务自己的读法：观察清单是会被反复打开的页面，一次说清「已到末页」省掉那次空往返；管理面列表是游标驱动的全量浏览，收敛点交给调用方。
+  依据：**游标分页在「无更多数据」时返回 `null` 是标准做法**（客户端据此停止取数），实现方的口径更标准，故以实现的语义为准回写本节，而不是为了迁就本节旧稿的字面去改实现。
+- **分页参数名与 `GET /memories` 不同（实测）**：本端点为 `page_size`，`GET /memories` 沿用上游既有的 `top_k`（`upstream/main:server/main.py` 即如此，属既有对外契约，本批不改）。两端点的 `cursor` 语义与页上限（`ALL_MEMORIES_LIMIT = 1000`）一致。`GET /observations` 是本批新增、无既有调用方，故直接取列表接口更通用的 `page_size`；该差异已在 `server/main.py` 的 `get_observations` docstring 中声明。
 - 观察判定沿用既有口径：`memory_kind == "observation"`（`server/routers/dream.py` 已有同一常量与同一只读遍历逻辑）。
 - 需要 `memory_kind` 的 payload 过滤；该字段的 keyword 索引已存在（实测 payload_schema）。
 
