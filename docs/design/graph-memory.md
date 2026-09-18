@@ -312,12 +312,40 @@ GET  /backfill/status?group_id=
 `scope_total` / `graph_episodes` / `remaining` / `errors`）与 `GET /backfill/status`
 （进程内快照：`state`、计数器、`remaining` 估读、失败摘要）共同构成进度可观测面。
 
+### 进度字段的语义与相互关系
+
+两个面**同名的字段同义且同值**：都由同一处取值（`app.py` 的 `_progress_fields`），精度也在那一处定
+（耗时类保留 3 位小数），因此不存在「同一含义在两个地方取值不同」的形态。逐字段如下：
+
+| 字段 | 语义 | 与其他字段的关系 |
+| --- | --- | --- |
+| `scanned` | 本次调用扫过的 Qdrant 记录条数 | 分母；`scanned = processed + already_synced + failed + out_of_scope` |
+| `processed` | 其中**新入图**的条数（消耗 LLM 抽取） | 受 `limit` 约束（到量即返回） |
+| `already_synced` | 其中图侧已同步、被前置判定跳过的条数 | 不耗 LLM，也不消耗限速预算；不占 `limit` |
+| `failed` | 其中入图失败、或事实正文为空的条数 | 不占 `limit`；样本见 `errors` |
+| `out_of_scope` | 其中图键不属于本次 `group_id` 的条数（候选过滤的过采样） | 不占 `limit`，从不入图 |
+| `exhausted` | 该作用域的存量已扫到底（本次没再取到记录） | 与 `processed == 0` 合起来是完成判据 |
+| `next_cursor` | 本次扫到的最深处（`created_at` 原值） | 传回 `cursor` 即续跑，批次不重叠 |
+| `elapsed_seconds` | 本次调用的耗时（到达终态即冻结） | 不随查询时间增长 |
+| `paced_wait_seconds` | 其中因 `rate` 主动等待的时间 | 是「限速生效」的直接读数 |
+| `facts_per_minute` | 实测入图速率（条·分⁻¹） | `= processed × 60 / elapsed_seconds` |
+| `scope_total` | 作用域存量事实数的**上界**（Qdrant 精确计数） | 含候选过采样（作用域值落在低优先级键上的记录） |
+| `graph_episodes` | 图内 episode 总数，**调用结束时**复算 | 已含本次新入图的部分 |
+| `remaining` | 剩余量估读 | `= max(0, scope_total − graph_episodes)` |
+
+两点推论：
+
+1. `remaining` **不得**再减一次 `processed`——`graph_episodes` 取的是终点读数，本次入图已经计入其中；
+   再减就是重复扣减，读数系统性偏小且差值恒等于 `processed`。
+2. `remaining` 只是估读：`scope_total` 是候选过滤的上界，且抽取失败留下的空 episode 会被算作已完成
+   （见下节），故它不替代「连续调用直到 `processed == 0` 且 `exhausted == true`」这一完成判据。
+
 ### 四条语义（按方案 §5.5 落地）
 
 1. **按 Qdrant 游标顺序取事实**：`created_at` 降序 + keyset 游标（`created_at < cursor`，严格小于），与 mem0 侧 `vector_store.list()` 同一读面口径，批次之间不重叠、不遗漏。
 2. **限速入图**：`rate` 直接产生等待（响应里的 `paced_wait_seconds` 是限速生效的直接读数），避免长时间占满 LLM 通道、避免压垮 2 vCPU 的 VM。限速预算只由**实际入图**消耗——跳过（`already_synced`）不等待，否则重扫已入图区域会被人为压到 `rate` 的节奏（实测：6 条已入图在 `rate=1` 下 0.058s 扫完、`paced_wait_seconds = 0`）。
 3. **可中断续跑**：**复用 `/episodes` 的 `already_synced` 前置判定**（同一 `_sync_one` 实现），不另存进度表、不另造一套去重。进程重启 / 客户端放弃 / 批次结束都只留下「已入图的那部分」这一可续状态。
-4. **进度可观测**：响应字段 + `GET /backfill/status` 双向暴露；`remaining` 是估读（作用域事实数 − 图内 episode 数，抽取失败留下的空 episode 会被算作已完成）。已结束的调用在状态面给出其**自身耗时**（到达终态即冻结），不会随查询时间增长；被异常的调用留在读数里标成 `interrupted`，部分进度仍可读。
+4. **进度可观测**：响应字段 + `GET /backfill/status` 双向暴露（同名同值，见上表）；`remaining` 是估读（`scope_total − graph_episodes`，抽取失败留下的空 episode 会被算作已完成）。已结束的调用在状态面给出其**自身耗时**（到达终态即冻结），不会随查询时间增长；被异常的调用留在读数里标成 `interrupted`，部分进度仍可读。
 
 **不做"一次调用跑到完"**：单次调用有 `limit` 与 `scan_limit` 双上界，调用方（编排者）分批次推进；
 推进到全量完成的条件是连续调用直到 `processed == 0` 且 `exhausted == true`。
@@ -336,7 +364,7 @@ GET  /backfill/status?group_id=
 * **抽取中途被杀**的事实：episode 节点已落库但无边，重扫时会被重新抽取（实测：硬中断后一个批次内
   3 条落库、其中 2 条无边，续跑时这 2 条被重抽）。这正是增量路径在「抽取失败后重试」时依赖的形态
   （`_sync_one` 不因失败而把 episode 标成已完成），代价是这类事实不省 LLM 调用；
-* 连带影响：`remaining` 估读把「有空 episode」的事实算作已完成，故中断频繁时它会偏乐观（估读口径见上表）。
+* 连带影响：`remaining` 估读把「有空 episode」的事实算作已完成，故中断频繁时它会偏乐观（口径见「进度字段的语义与相互关系」）。
 
 回填的续跑锚点（响应里的 `next_cursor`）与这条语义正交：游标只决定「从哪里开始扫」，是否入图
 一律由图侧的 `already_synced` 判定。
@@ -537,7 +565,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | 图信号参与度 | `POST /search?explain=true` 的 `score_details` | 含 `graph_boost` / `graph_facts`；图命中为 0 时 `graph_boost = 0.0` |
 | 资源 | `docker stats` + VM `free -m` | 图桥 ≤ 512MiB、FalkorDB ≤ 384MiB；VM `available` ≥ 4GiB；swap 保持 0 |
 | 图键隔离 | 图桥 `GET /graphs` / FalkorDB `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
-| 回填进度 | 图桥 `POST /backfill` 的响应计数 + `GET /backfill/status`（进程内快照） | `processed / already_synced / failed / scanned / remaining` 可读；`exhausted` 标记作用域扫到底 |
+| 回填进度 | 图桥 `POST /backfill` 的响应计数 + `GET /backfill/status`（进程内快照） | `processed / already_synced / failed / scanned / remaining` 可读；两处**同名字段同值**（唯一取值处 `_progress_fields`）；`exhausted` 标记作用域扫到底 |
 | 回填限速生效 | 响应/进度里的 `paced_wait_seconds` 与 `facts_per_minute` | `rate > 0` 时 `paced_wait_seconds > 0`（限速产生了真实等待）且 `facts_per_minute` 显著低于不限速基线；`rate = 0` 时 `paced_wait_seconds = 0`。注意 `facts_per_minute` 是**批次内均值**，首条不受限速延迟，故小批次可略高于 `rate`（实测 `rate=1`/`limit=2` → 1.914 条/分钟 > 1），长跑才收敛到 ≤ `rate` |
 
 ---
