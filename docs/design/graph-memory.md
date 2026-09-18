@@ -286,6 +286,19 @@ FalkorDB 后端的一处机制约束（E13）：`group_id` 即图键（database�
 
 存量回填不在本阶段范围，其接口形态在图桥侧预留：`POST /backfill {group_id, limit, rate}` —— 按 Qdrant 游标顺序取事实、限速入图、可中断续跑。触发条件为「新写入的图覆盖度不足以支撑检索增益」的观测结论（第 12 节列为独立卡）。
 
+## 5.6 已知限制：`json_object` 兜底模式下的 `EdgeDuplicate` 校验失败
+
+图桥的 LLM 客户端走 `OpenAIGenericClient(structured_output_mode="json_object")`（选型依据见 §10 E7/E18）。该模式把 schema 注入 prompt 引导模型输出，**不由 API 侧强制校验**，因此仍有一类概率性的本地校验失败。它属通道兜底模式的固有形态，不由本阶段修（原始 `/responses` 通道的 500 已消除：重建后桥侧 `/responses` 请求数为 0、`/chat/completions` 为 116）。如实记录如下，供运维监控与后续决策：
+
+| 项 | 内容 |
+| --- | --- |
+| 现象 | `/episodes` 偶发 500。实测频率：直连 8 次中 1 次、桥侧容器全程 43 次中 2 次 |
+| 根因位置 | `graphiti_core/utils/maintenance/edge_operations.py:732` 的 `EdgeDuplicate(**llm_response)` 本地 pydantic 校验失败（`duplicate_facts` / `contradicted_facts` 必填字段缺失）。调用链：`/app/app.py:293 → graphiti_core/graphiti.py:1288 → :1202 → :689 → edge_operations.py:490 → :732` |
+| 成因 | `json_object` 模式下 schema 被注入 prompt 而 API 侧不强制校验（`graphiti_core/llm_client/openai_generic_client.py:194`），模型在同 `group_id` 内重复事实触发 `resolve_extracted_edge`、提示词变长时偶发产出非预期 JSON（字段缺失，或 `Extra data: line 1 column 847` 一类截断），校验落到本地兜底 |
+| 影响面 | 直连调用方可见 500；经 mem0 派发路径的样本被 worker `max_retries=3` 重试吸收，故 `graph_failed` 计数器不增、失败在计数面不可见。该形态**不是**本阶段通道修复引入的：修复前镜像同路径同样出现（当时被 `/responses` 通道的内部重试吸收） |
+| 处置立场 | 接受为已知限制。换上游 provider（需其支持 `json_schema`）不由本仓控制，且本机网关当前对 `json_schema` 形态回 422 拒绝（§10 E18） |
+| 可观测痕迹 | 被重试吸收的失败在桥侧日志仍留有 `ERROR graphiti_core.llm_client.openai_generic_client: Error in generating LLM response` 行，运维可按此监控发生频率（计数器面看不到，日志面看得到） |
+
 ---
 
 # 6. 检索融合与降级路径
@@ -401,8 +414,11 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | `queue_size` | 1000 | 派发队列容量 |
 | `max_retries` | 3 | 单条 episode 最大重试次数 |
 | `circuit_breaker_failures` / `circuit_cooldown_seconds` | 5 / 60 | 熔断阈值与冷却窗口 |
+| `request_timeout_seconds` | 120（本部署取 240） | 单次 `/episodes` 请求的客户端超时预算。实测单次 `add_episode` 峰值 101.0s，与 120s 的裕度仅约 16%，真实负载更复杂时会误判为超时；图派发是异步任务（不阻塞用户请求），故本部署抬高到 240s（≈2.4 倍实测峰值） |
 
 回退语义：关闭开关后不产生任何图调用与图写入；`max_possible` 与 `final_score` 回到无图形态；`score_details` 中不出现图分量键，`explain` 输出与引入本机制之前逐位一致；每条结果只多一个只读字段 `graph_status = "disabled"`（不参与打分，也不进入 `score_details`），使「能力关闭」与「图没答上来」在响应上不再同形。
+
+配置生效次序（改这些键时先确认这一条）：`DEFAULT_CONFIG` 由环境变量派生，启动时再叠加 Postgres `settings.config_overrides`（`server/server_state.py::initialize_state`）；`POST /configure` 写入的覆盖项就持久化在后者，**优先级高于环境变量**。因此对已用过运行时配置通道的部署，只改 `server/.env` 并重启**不会**改变 `GET /configure` 的读数——应以 `POST /configure` 为准，或在更新 `.env` 的同时把覆盖项对齐。
 
 ---
 
@@ -483,7 +499,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | E15 | 镜像体积：本机展开 `falkordb/falkordb:latest` 570MB、`zepai/graphiti:0.30.2` 582MB、`neo4j:5.26-community` 660MB；Docker Hub arm64 拉取体积 FalkorDB 206.7MB、Graphiti 192.0MB | 3.2 磁盘预算 |
 | E16 | `graphiti_core` 版本：PyPI 最新 `graphiti-core` 0.30.2（requires_python `>=3.10,<4`），镜像内为同一版本；`Graphiti` 构造器接受 `graph_driver` / `llm_client` / `embedder` / `cross_encoder` | 依赖锁版本与客户端装配方式 |
 | E17 | 图桥 `/search` 尾部分位（核验整改卡实测，`bridge_search_latency.py`）：第 1 轮 n=60 → `p50 0.131 / p90 0.258 / p95 0.343 / p99 0.425 / max 0.472s`；第 2 轮（图键补入实体与关系边）n=100 → `p50 0.163 / p90 0.445 / p95 0.514 / p99 0.812 / max 0.842s`，其中超 0.4s 共 14/100（14.0%），超 0.6s 4/100，超 0.8s 2/100，无超 1.0s | `timeout_seconds` 默认值取 1.0 的依据：两轮 max 均在预算内，且对 p99/max 仍有 ~19% 裕度；0.4s 只覆盖到约 p85，属「正常请求会落进超时区」 |
-| E18 | 通道重测（上游 provider 路由变更后）：`OpenAIClient(responses.parse)` → 网关 422 `所有模型提供商均请求失败: ... 400 Bad Request from POST https://api.aimindsky.com/v1/responses，The request failed because it is missing messages parameter`（表现为 `/episodes` 500、`graph_synced` 恒为 0）；改 `OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；改 `OpenAIGenericClient(json_object)` → 通过（单条隔离事实 `/episodes` 200 `synced`，9.5s；端到端 `graph_synced` 7→8 且 `graph_failed` 无新增，图键 1 episode / 3 实体 / 2 边） | 图桥按 `OpenAIGenericClient(structured_output_mode="json_object")` 装配；E7 的通道结论作废。E7 记录的 `json_object` 长提示 `EdgeDuplicate` 校验失败在本轮端到端（含长抽取提示）未复现 |
+| E18 | 通道重测（上游 provider 路由变更后）：`OpenAIClient(responses.parse)` → 网关 422 `所有模型提供商均请求失败: ... 400 Bad Request from POST https://api.aimindsky.com/v1/responses，The request failed because it is missing messages parameter`（表现为 `/episodes` 500、`graph_synced` 恒为 0）；改 `OpenAIGenericClient(json_schema)` → 422 `This response_format type is unavailable now`；改 `OpenAIGenericClient(json_object)` → 通过（单条隔离事实 `/episodes` 200 `synced`，9.5s；端到端 `graph_synced` 7→8 且 `graph_failed` 无新增，图键 1 episode / 3 实体 / 2 边）。核验复测（t_5dd70a5e）：重建后桥侧对 `/responses` 的请求数为 0、`/chat/completions` 为 116，原始 `/responses` 通道的 500 已消除 | 图桥按 `OpenAIGenericClient(structured_output_mode="json_object")` 装配；E7 的通道结论作废（作废的是 E7 的选型结论，**不是**「`json_object` 兜底模式已无失败形态」）。本轮重建后的复测**证伪**了本条原先的「E7 记录的 `json_object` 长提示 `EdgeDuplicate` 校验失败在本轮端到端（含长抽取提示）未复现」这一条子结论：该形态**可复现**——重建后容器日志出现 `ERROR graphiti_core.llm_client.openai_generic_client: Error in generating LLM response: Extra data: line 1 column 847 (char 846)`（2026-09-18 02:27:13 UTC），与 E7 记录的 `Extra data: line 1 column 847` 同形；同批次另有必填字段缺失导致的 `/episodes` 500（直连 1/8，桥侧容器全程 2/43）。E7/E18 关于**通道选型**的判断（`/responses` 失效、`json_object` 可用）经复测成立，本次只修正被证伪的那一条子结论。成因、影响面与处置立场见 §5.6 |
 
 ---
 

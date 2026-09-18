@@ -59,4 +59,6 @@ curl -s -X DELETE localhost:8000/graph/mem0_test_graph_probe
 ```
 
 一次真实入图需要多次 LLM 调用（实测单条中文事实 14.24–36.65s），因此 `/episodes` 的
-超时预算应按分钟级设置（mem0 侧默认 `MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=120`）。
+超时预算应按分钟级设置（mem0 侧代码缺省 `MEM0_GRAPH_REQUEST_TIMEOUT_SECONDS=120`）。
+核验实测出现过单次 `Completed add_episode in 101031.1 ms`（101.0s），与 120s 的裕度仅约
+16%，故本部署的模板值取 240s（≈2.4 倍实测峰值，见 `.env.example` 与方案 §6.5）。
