@@ -199,3 +199,6 @@ testing.ipynb
 # TypeScript incremental build info and local, uncommitted e2e scripts (used by the integrations, e.g. integrations/deepseek-plugin)
 *.tsbuildinfo
 *.local.mjs
+
+# 本地数据备份（含记忆数据，不入库）
+backups/
