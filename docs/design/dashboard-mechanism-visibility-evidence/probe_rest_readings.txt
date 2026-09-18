@@ -1,0 +1,365 @@
+{
+ "memories_admin_list": {
+  "total": 4043,
+  "page1_rows": 1000,
+  "page2_rows": 1000,
+  "overlap_page1_page2": 0,
+  "page1_newest": "2026-09-18T03:03:20.299533+00:00",
+  "page1_oldest": "2026-09-09T11:37:37.857852+00:00",
+  "page2_newest": "2026-09-09T11:33:24.032171+00:00",
+  "response_keys": [
+   "next_cursor",
+   "results",
+   "total"
+  ],
+  "row_keys": [
+   "access_count",
+   "agent_id",
+   "created_at",
+   "dream_run_id",
+   "evidence_count",
+   "expiration_date",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "memory_kind",
+   "metadata",
+   "observation_key",
+   "run_id",
+   "source_memory_ids",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "invalidated_rows_in_page1": 7,
+  "observation_rows_in_page1": 79,
+  "top_k_10_rows": 10
+ },
+ "memories_scoped_list": {
+  "response_keys": [
+   "results"
+  ],
+  "rows": 5,
+  "row_keys": [
+   "access_count",
+   "agent_id",
+   "created_at",
+   "dream_run_id",
+   "evidence_count",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "memory_kind",
+   "metadata",
+   "observation_key",
+   "source_memory_ids",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "kinds_in_first_5": [
+   "observation",
+   "observation",
+   "observation",
+   "observation",
+   "observation"
+  ],
+  "rows_at_top_k_1000": 1000,
+  "unknown_param_ignored": 20
+ },
+ "search_explain": {
+  "response_keys": [
+   "results"
+  ],
+  "row_keys": [
+   "access_count",
+   "agent_id",
+   "attributed_to",
+   "created_at",
+   "graph_status",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "metadata",
+   "score",
+   "score_details",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "score_details_keys": [
+   "access_count",
+   "bm25_score",
+   "decay_weight",
+   "elapsed_days",
+   "entity_boost",
+   "final_score",
+   "graph_boost",
+   "graph_facts",
+   "max_possible_score",
+   "memory_strength_days",
+   "raw_score",
+   "retention",
+   "semantic_score",
+   "threshold"
+  ],
+  "graph_status_distinct_in_one_response": [
+   "ok"
+  ],
+  "ids_identical_with_and_without_explain": true,
+  "score_details_absent_without_explain": true,
+  "score_fields_sample": {
+   "semantic_score": 0.5234017,
+   "bm25_score": 0.0,
+   "entity_boost": 0.0,
+   "graph_boost": 0.5,
+   "graph_facts": 3,
+   "max_possible_score": 1.5,
+   "raw_score": 1.0234017,
+   "final_score": 0.6822547803973704,
+   "threshold": 0.1,
+   "decay_weight": 0.9999809171667935,
+   "retention": 0.9998091716679353,
+   "memory_strength_days": 21.0,
+   "elapsed_days": 0.0040077773842592595,
+   "access_count": 3
+  }
+ },
+ "search_graph_signal": {
+  "wildcard_scope_boosts": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "wildcard_scope_status": [
+   "ok"
+  ],
+  "xue_scope_boosts": [
+   0.5,
+   0.16666666666666666,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "xue_scope_facts": [
+   3,
+   2,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ]
+ },
+ "search_flags": {
+  "observations_with_include_observations": 5,
+  "observations_without_flag": 0,
+  "invalidated_with_include_invalidated": 1,
+  "invalidated_sample_fields": [
+   {
+    "invalid_at": "2026-09-17",
+    "superseded_by_present": true,
+    "invalid_reason": "superseded_by_newer_fact"
+   }
+  ]
+ },
+ "search_repeatability": {
+  "id_order_identical_across_3_calls": true,
+  "max_score_spread_at_position_0": 5.2201601589696445e-05
+ },
+ "graph_stats": {
+  "enabled": true,
+  "timeout_seconds": 1.0,
+  "circuit_open": false,
+  "consecutive_failures": 0,
+  "queue_size": 0,
+  "graph_dispatched": 11,
+  "graph_synced": 11,
+  "graph_already_synced": 0,
+  "graph_failed": 0,
+  "graph_dropped": 0
+ },
+ "graph_routes_absent": {
+  "/graph/graphs": 404,
+  "/graph/bridge": 404
+ },
+ "dream_runs": {
+  "total": 1,
+  "response_keys": [
+   "limit",
+   "offset",
+   "results",
+   "total"
+  ],
+  "row_keys": [
+   "clusters",
+   "completion_tokens",
+   "duration_seconds",
+   "failed_clusters",
+   "finished_at",
+   "id",
+   "llm_calls",
+   "mode",
+   "observations_superseded",
+   "observations_written",
+   "prompt_tokens",
+   "report_path",
+   "scopes",
+   "started_at",
+   "status"
+  ],
+  "row_sample": {
+   "mode": "live",
+   "status": "completed",
+   "scopes": 4,
+   "clusters": 104,
+   "llm_calls": 104,
+   "failed_clusters": 0,
+   "observations_written": 79,
+   "observations_superseded": 0,
+   "duration_seconds": 361.723
+  }
+ },
+ "dream_run_by_id_keys": [
+  "clusters",
+  "completion_tokens",
+  "duration_seconds",
+  "failed_clusters",
+  "finished_at",
+  "id",
+  "llm_calls",
+  "mode",
+  "observations_superseded",
+  "observations_written",
+  "prompt_tokens",
+  "report_path",
+  "scopes",
+  "started_at",
+  "status"
+ ],
+ "dream_evidence_chain": {
+  "observation_rows_shape": {},
+  "observation_detail_keys": [
+   "access_count",
+   "agent_id",
+   "created_at",
+   "dream_run_id",
+   "evidence_count",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "memory_kind",
+   "metadata",
+   "observation_key",
+   "score",
+   "source_memory_ids",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "observation_row_keys_in_admin_list": [
+   "access_count",
+   "agent_id",
+   "created_at",
+   "dream_run_id",
+   "evidence_count",
+   "expiration_date",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "memory_kind",
+   "metadata",
+   "observation_key",
+   "run_id",
+   "source_memory_ids",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "observation_row_lacks_full_text": true,
+  "sources_response_keys": [
+   "missing",
+   "observation_id",
+   "results",
+   "total"
+  ],
+  "sources_total": 4,
+  "sources_missing": 0,
+  "source_row_keys": [
+   "access_count",
+   "agent_id",
+   "attributed_to",
+   "created_at",
+   "hash",
+   "id",
+   "invalid_at",
+   "invalid_reason",
+   "last_accessed",
+   "memory",
+   "metadata",
+   "score",
+   "superseded_by",
+   "updated_at",
+   "user_id",
+   "valid_at"
+  ],
+  "sources_of_non_observation_status": 400,
+  "reverse_response_keys": [
+   "memory_id",
+   "results",
+   "total"
+  ],
+  "reverse_row_keys": [
+   "dream_run_id",
+   "evidence_count",
+   "id",
+   "memory_kind",
+   "observation_key",
+   "source_memory_ids"
+  ],
+  "reverse_finds_the_observation": true,
+  "reverse_total": 1
+ },
+ "config_switches": {
+  "decay": {
+   "enabled": true,
+   "halflife_days": 12.0,
+   "strength_step_days": 3.0,
+   "access_cap": 20,
+   "floor": 0.9,
+   "cooldown_seconds": 300
+  },
+  "dream_enabled": true,
+  "graph_enabled": true,
+  "graph_timeout_seconds": 1.0
+ }
+}

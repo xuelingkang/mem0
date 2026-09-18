@@ -1,0 +1,49 @@
+{
+ "health": {
+  "status": "healthy",
+  "backend": "falkordb",
+  "falkordb": "ok"
+ },
+ "graphs_before": [
+  "default_db",
+  "mem0__",
+  "mem0_xue"
+ ],
+ "stats_mem0_xue": {
+  "group_id": "mem0_xue",
+  "episodes": 63,
+  "entity_nodes": 108,
+  "entity_edges": 130
+ },
+ "probe_key_stats_reading": {
+  "group_id": "mem0_dashboard_probe_key",
+  "episodes": 0,
+  "entity_nodes": 0,
+  "entity_edges": 0
+ },
+ "graphs_after_reading_unknown_key": [
+  "default_db",
+  "mem0__",
+  "mem0_dashboard_probe_key",
+  "mem0_xue"
+ ],
+ "read_created_a_new_key": [
+  "mem0_dashboard_probe_key"
+ ],
+ "mem0_xue_after_probe": {
+  "group_id": "mem0_xue",
+  "episodes": 63,
+  "entity_nodes": 108,
+  "entity_edges": 130
+ },
+ "probe_key_deleted": {
+  "group_id": "mem0_dashboard_probe_key",
+  "dropped": true
+ },
+ "graphs_after_cleanup": [
+  "default_db",
+  "mem0__",
+  "mem0_xue"
+ ],
+ "cleanup_restored_original_key_set": true
+}

@@ -1,0 +1,110 @@
+{
+ "collection": "memories_2048",
+ "total_points": 4047,
+ "valid_at_non_null": 480,
+ "invalid_at_non_null": 7,
+ "superseded_by_non_null": 7,
+ "access_count_non_zero": 932,
+ "last_accessed_non_null": 932,
+ "observations": 79,
+ "memory_kind_counter": {
+  "None": 3968,
+  "observation": 79
+ },
+ "invalid_reason_counter": {
+  "superseded_by_newer_fact": 7
+ },
+ "observation_scopes": {
+  "xue:ying": 74,
+  "xue:shi": 5
+ },
+ "observation_dream_runs": {
+  "80b83679-cce2-4eb1-b80e-18b75be0abd0": 79
+ },
+ "invalidated_ids": [
+  "2026-09-17T04:00:19.409357+00:00",
+  "2026-09-17T07:54:58.197446+00:00",
+  "2026-09-17T08:56:31.040317+00:00",
+  "2026-09-17T05:09:32.198406+00:00",
+  "2026-09-17T06:49:03.725368+00:00",
+  "2026-09-17T08:44:23.517943+00:00",
+  "2026-09-18T01:59:03.540355+00:00"
+ ],
+ "invalidated_positions_in_newest_first_order": [
+  128,
+  305,
+  320,
+  379,
+  442,
+  499,
+  527
+ ],
+ "observations_positions_in_newest_first_order": [
+  44,
+  45,
+  46,
+  47,
+  48
+ ],
+ "observations_position_max_in_newest_first_order": 122,
+ "scope_agent_ying_total": 3251,
+ "scope_agent_ying_newest_1000_observations": 74,
+ "global_newest_1000_observations": 79,
+ "invalid_field_values_sample": {
+  "id_present": true,
+  "valid_at": null,
+  "invalid_at": "2026-09-17",
+  "superseded_by_present": true,
+  "invalid_reason": "superseded_by_newer_fact"
+ },
+ "access_field_values_sample": {
+  "access_count": 2,
+  "last_accessed": "2026-09-18T03:11:07.521206+00:00"
+ },
+ "payload_schema": {
+  "user_id": {
+   "data_type": "keyword",
+   "points": 4047
+  },
+  "observation_key": {
+   "data_type": "keyword",
+   "points": 79
+  },
+  "last_accessed": {
+   "data_type": "datetime",
+   "points": 932
+  },
+  "run_id": {
+   "data_type": "keyword",
+   "points": 0
+  },
+  "agent_id": {
+   "data_type": "keyword",
+   "points": 4047
+  },
+  "valid_at": {
+   "data_type": "datetime",
+   "points": 480
+  },
+  "actor_id": {
+   "data_type": "keyword",
+   "points": 0
+  },
+  "invalid_at": {
+   "data_type": "datetime",
+   "points": 7
+  },
+  "memory_kind": {
+   "data_type": "keyword",
+   "points": 79
+  },
+  "source_memory_ids": {
+   "data_type": "keyword",
+   "points": 79
+  },
+  "created_at": {
+   "data_type": "datetime",
+   "points": 4047
+  }
+ }
+}

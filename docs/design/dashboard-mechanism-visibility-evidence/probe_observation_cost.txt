@@ -1,0 +1,15 @@
+{
+ "path_a_full_walk": {
+  "requests": 6,
+  "rows": 4047,
+  "bytes": 4767759,
+  "seconds": 0.31,
+  "observations_found": 79
+ },
+ "path_b_server_side_filter": {
+  "requests": 1,
+  "rows": 79,
+  "seconds": 0.0059
+ },
+ "payload_index_present": true
+}

@@ -1,0 +1,29 @@
+{
+ "container_pid1_started_at": "2026-09-18T02:55:39Z",
+ "reading_1": {
+  "enabled": true,
+  "timeout_seconds": 1.0,
+  "circuit_open": false,
+  "consecutive_failures": 0,
+  "queue_size": 0,
+  "graph_dispatched": 15,
+  "graph_synced": 15,
+  "graph_already_synced": 0,
+  "graph_failed": 0,
+  "graph_dropped": 0
+ },
+ "reading_2_after_5s": {
+  "enabled": true,
+  "timeout_seconds": 1.0,
+  "circuit_open": false,
+  "consecutive_failures": 0,
+  "queue_size": 0,
+  "graph_dispatched": 15,
+  "graph_synced": 15,
+  "graph_already_synced": 0,
+  "graph_failed": 0,
+  "graph_dropped": 0
+ },
+ "counters_move_within_one_instance": false,
+ "note": "计数归当前 mem0 容器实例：新建的 GraphSync 在首次派发时惰性创建，计数从 0 起。本文件对应的容器实例见 container_pid1_started_at；换实例后同一读法会得到更小的数。"
+}

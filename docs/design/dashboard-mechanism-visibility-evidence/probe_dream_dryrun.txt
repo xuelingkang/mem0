@@ -1,0 +1,36 @@
+{
+ "before": {
+  "runs_total": 1,
+  "points": 4043
+ },
+ "after": {
+  "runs_total": 1,
+  "points": 4043
+ },
+ "runs_row_delta": 0,
+ "points_delta": 0,
+ "preview": {
+  "mode": "dry_run",
+  "status": "completed",
+  "duration_seconds": 4.191,
+  "observations_written": 0,
+  "observations_superseded": 0,
+  "would_write": 0,
+  "candidates": 0,
+  "errors": [],
+  "totals": {
+   "facts": 3964,
+   "observations": 79,
+   "clusters": 0,
+   "llm_calls": 0,
+   "failed_clusters": 0,
+   "prompt_tokens": 0,
+   "completion_tokens": 0,
+   "clusters_skipped": 104,
+   "clusters_deferred": 0
+  }
+ },
+ "report_written_to": "/app/history/dream-reports/c83ffbcf-4c68-415c-b725-7b80b68b53d1.json",
+ "report_file_equals_response_body": true,
+ "probe_report_removed": true
+}
