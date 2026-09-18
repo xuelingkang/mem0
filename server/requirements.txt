@@ -11,6 +11,11 @@ psycopg-pool>=3.2.6,<4.0.0
 anthropic>=0.39,<1.0
 google-generativeai>=0.8,<1.0
 
+# Read-only graph observability proxy: `GET /graph/keys` reads the graph bridge's
+# `/graphs` and `/stats`. httpx is already pulled in by the mem0 SDK; listed here
+# because the server now imports it directly.
+httpx>=0.28.0
+
 # Auth & database (Phase 1)
 sqlalchemy>=2.0,<3.0
 alembic>=1.13,<2.0

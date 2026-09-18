@@ -647,6 +647,88 @@ def get_all_memories(
         raise upstream_error()
 
 
+# Dream 观察条目标记。与 `mem0.configs.prompts.MEMORY_KIND_OBSERVATION` / `routers/dream.py`
+# 同值；此处不 import SDK 常量，避免为取一个字符串而依赖整合内核。
+OBSERVATION_KIND = "observation"
+_OBSERVATION_FILTER = {"memory_kind": {"eq": OBSERVATION_KIND}}
+
+
+def _count_with_filter(filters: Dict[str, Any]) -> Optional[int]:
+    """按与 `vector_store.list()` 相同的过滤口径取集合内精确条数。
+
+    取不到时返回 None（前端按既有约定回落为「已加载 N+」），绝不因计数失败而让清单
+    接口 5xx。仅 Qdrant 实现有 `_create_filter`；其它实现直接跳过精确总数。
+    """
+    try:
+        vs = get_memory_instance().vector_store
+        build_filter = getattr(vs, "_create_filter", None)
+        if build_filter is None:
+            return None
+        count_filter = build_filter(filters)
+        if count_filter is None:
+            return None
+        counted = vs.client.count(collection_name=vs.collection_name, count_filter=count_filter, exact=True)
+        return int(counted.count)
+    except Exception:
+        return None
+
+
+def _list_observations(limit: int = ALL_MEMORIES_LIMIT, cursor: Optional[str] = None) -> Dict[str, Any]:
+    """列全部 Dream 观察（最新优先 + keyset 游标）。
+
+    排序与游标口径取自管理面列表：`created_at` 最新优先，`cursor` 取上一页最后一行的
+    `created_at`，服务端 `created_at < cursor` 严格递减续读，因此页间永不重叠。
+
+    与 `GET /memories` 的唯一差别是**末页判定**：本页不足 `limit` 行时显式返回
+    `next_cursor = null`（`GET /memories` 在该情形仍回一个游标，由客户端再请求一次
+    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返。
+    """
+    filters = _OBSERVATION_FILTER
+    results = get_memory_instance().vector_store.list(filters=filters, top_k=limit, cursor=cursor)
+    rows = results[0] if results and isinstance(results, (list, tuple)) and isinstance(results[0], list) else results or []
+    rows = list(rows)
+    rows.sort(
+        key=lambda r: (getattr(r, "payload", None) or {}).get("created_at") or "",
+        reverse=True,
+    )
+    next_cursor = None
+    if rows and len(rows) == limit:
+        last = (getattr(rows[-1], "payload", None) or {}).get("created_at")
+        if last:
+            next_cursor = str(last)
+    return {
+        "results": [_serialize_memory(row) for row in rows],
+        "next_cursor": next_cursor,
+        "total": _count_with_filter(filters),
+    }
+
+
+@app.get("/observations", summary="List Dream observations")
+def get_observations(
+    top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
+    cursor: Optional[str] = Query(None),
+    _auth=Depends(verify_auth),
+):
+    """列出全部 Dream 观察条目（`memory_kind == "observation"`），只读。
+
+    行口径与 `GET /memories` 完全一致（同一序列化器），因此观察的正文、证据链与
+    bi-temporal 字段一并返回；分页用 `top_k` + `cursor`（上一页响应的 `next_cursor`）。
+
+    为什么另开端点而不复用 `GET /memories`：管理面列表是 raw 全量，观察在其中按
+    `created_at` 位置漂移，客户端只能在自己已加载的页里过滤，写入量一涨就会误报空集；
+    这里由服务端按 `memory_kind` 的 keyword 索引过滤（一次请求即可拿全量清单）。
+    """
+    try:
+        return _list_observations(
+            limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT,
+            cursor=cursor,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise upstream_error()
+
+
 MAX_EXPORT_PAGES = 200
 EXPORT_CSV_COLUMNS = [
     "id",
