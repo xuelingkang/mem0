@@ -679,9 +679,10 @@ def _list_observations(limit: int = ALL_MEMORIES_LIMIT, cursor: Optional[str] = 
     排序与游标口径取自管理面列表：`created_at` 最新优先，`cursor` 取上一页最后一行的
     `created_at`，服务端 `created_at < cursor` 严格递减续读，因此页间永不重叠。
 
-    与 `GET /memories` 的唯一差别是**末页判定**：本页不足 `limit` 行时显式返回
+    行为上与 `GET /memories` 的差别只有**末页判定**：本页不足 `limit` 行时显式返回
     `next_cursor = null`（`GET /memories` 在该情形仍回一个游标，由客户端再请求一次
-    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返。
+    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返；
+    分页参数名的差别见 `get_observations` 的说明。
     """
     filters = _OBSERVATION_FILTER
     results = get_memory_instance().vector_store.list(filters=filters, top_k=limit, cursor=cursor)
@@ -705,14 +706,19 @@ def _list_observations(limit: int = ALL_MEMORIES_LIMIT, cursor: Optional[str] = 
 
 @app.get("/observations", summary="List Dream observations")
 def get_observations(
-    top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
+    page_size: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
     cursor: Optional[str] = Query(None),
     _auth=Depends(verify_auth),
 ):
     """列出全部 Dream 观察条目（`memory_kind == "observation"`），只读。
 
     行口径与 `GET /memories` 完全一致（同一序列化器），因此观察的正文、证据链与
-    bi-temporal 字段一并返回；分页用 `top_k` + `cursor`（上一页响应的 `next_cursor`）。
+    bi-temporal 字段一并返回；分页用 `page_size` + `cursor`（上一页响应的 `next_cursor`）。
+
+    分页参数名与 `GET /memories` 不同是**有意**的：`GET /memories` 的 `top_k` 是上游既有
+    对外契约（`upstream/main` 即如此），本批不改名；而本端点为本批新增、无既有调用方，
+    故取列表接口更通用的 `page_size`，不复用 `top_k` 这个语义偏「检索条数」的拼法。
+    页上限（`ALL_MEMORIES_LIMIT`）与 `cursor` 语义两端点一致。
 
     为什么另开端点而不复用 `GET /memories`：管理面列表是 raw 全量，观察在其中按
     `created_at` 位置漂移，客户端只能在自己已加载的页里过滤，写入量一涨就会误报空集；
@@ -720,7 +726,7 @@ def get_observations(
     """
     try:
         return _list_observations(
-            limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT,
+            limit=page_size if page_size is not None else ALL_MEMORIES_LIMIT,
             cursor=cursor,
         )
     except HTTPException:

@@ -112,7 +112,7 @@ export default function DreamPage() {
       setIsLoadingObservations(true);
       try {
         const params: Record<string, string | number> = {
-          top_k: OBSERVATIONS_PAGE_SIZE,
+          page_size: OBSERVATIONS_PAGE_SIZE,
         };
         if (cursor) params.cursor = cursor;
         const res = await api.get<ObservationListResponse>(
