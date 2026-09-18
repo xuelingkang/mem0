@@ -182,7 +182,8 @@ class BackfillRequest(BaseModel):
 
 
 class BackfillResponse(BaseModel):
-    """一次回填调用的计数与续跑锚点（`status` 端点的字段是其子集）。"""
+    """一次回填调用的计数与续跑锚点（与 `GET /backfill/status` 同名的字段**同值同口径**，
+    两处共用唯一取值处 `_progress_fields`）。"""
 
     group_id: str
     processed: int = Field(default=0, description="本次新入图的事实条数。")
@@ -197,7 +198,7 @@ class BackfillResponse(BaseModel):
     facts_per_minute: float = Field(default=0.0, description="本次调用的实测入图速率（`processed / elapsed`）。")
     scope_total: int = Field(default=0, description="估读：该作用域的存量事实总数（Qdrant 精确计数，含候选过采样）。")
     graph_episodes: int = Field(default=0, description="估读：图内 episode 总数。")
-    remaining: int = Field(default=0, description="估读剩余量：`scope_total - graph_episodes`（下限 0）。")
+    remaining: int = Field(default=0, description="估读剩余量：`scope_total - graph_episodes`（下限 0）；与 `/backfill/status` 同值。")
     errors: List[str] = Field(default_factory=list, description="最近的失败摘要（最多若干条）。")
 
 
@@ -528,6 +529,9 @@ class BackfillRun:
     # 调用给出固定的耗时读数（否则它会随查询时间无限增长，`facts_per_minute` 随之衰减）。
     finished_monotonic: Optional[float] = None
     state: str = "running"  # running / completed / interrupted
+    # 进度计数（与响应 `BackfillResponse` 同名同义，取值处见 `_progress_fields`）：`scanned`
+    # 是分母，每条扫过的记录恰好落进 `processed` / `already_synced` / `failed` /
+    # `out_of_scope` 之一，故 `scanned == 四者之和`；`limit` 只约束 `processed`。
     processed: int = 0
     already_synced: int = 0
     failed: int = 0
@@ -557,18 +561,57 @@ class BackfillRun:
         return round(self.processed * 60.0 / elapsed, 3) if elapsed > 0 else 0.0
 
     def remaining_estimate(self) -> int:
-        """剩余量估读：作用域事实数 − 图内 episode 数（`scope_total` 在调用开始时取一次，
-        之后随本进程入图数推进）。抽取失败留下的空 episode 会被算作已完成，故这是估读。"""
-        return max(0, self.scope_total - self.graph_episodes - self.processed)
+        """剩余量估读：口径见 `_remaining`（`scope_total − graph_episodes`）。"""
+        return _remaining(self.scope_total, self.graph_episodes)
 
     def as_payload(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload.pop("started_monotonic", None)
         payload.pop("finished_monotonic", None)
-        payload["elapsed_seconds"] = round(self.elapsed_seconds(), 3)
-        payload["facts_per_minute"] = self.facts_per_minute()
-        payload["remaining"] = self.remaining_estimate()
+        # 计数读数（含 `remaining` 与浮点精度）与 `/backfill` 响应同源：同名即同义即同值。
+        payload.update(_progress_fields(self))
         return payload
+
+
+def _remaining(scope_total: int, graph_episodes: int) -> int:
+    """剩余量估读：作用域事实数 − 图内 episode 数（下限 0）。
+
+    **此口径是 `/backfill` 响应与 `/backfill/status` 的唯一取值处**。`graph_episodes` 取自调用
+    结束时的图规模读数，**已含本次新入图的部分**，故不能再减一次 `processed`——否则读数是
+    重复扣减（系统性偏小，差值恒等于 `processed`）。两点使它只是估读：`scope_total` 是候选
+    过滤的精确计数（含作用域值落在低优先级键上的过采样），且抽取失败留下的空 episode 会被
+    算作已完成。
+    """
+    return max(0, scope_total - graph_episodes)
+
+
+def _progress_fields(run: BackfillRun) -> Dict[str, Any]:
+    """一次调用的进度读数（`/backfill` 响应与 `/backfill/status` 的唯一取值处）。
+
+    两个面共享同名字段，就必须由同一处计算、以同一精度发布：`elapsed_seconds` /
+    `paced_wait_seconds` 保留 3 位小数，否则同一含义的字段会在两个面上给出不同的数。
+
+    字段关系（详见方案 §5.5 的字段语义表）：`scanned` 是分母，每条扫过的记录恰好落进
+    `processed`（新入图，消耗 LLM）/ `already_synced`（图侧已同步，未耗 LLM）/ `failed`
+    （入图失败或事实正文为空）/ `out_of_scope`（图键不属于本次 `group_id`）之一；
+    `remaining` 由 `_remaining` 给出。
+    """
+    return {
+        "processed": run.processed,
+        "already_synced": run.already_synced,
+        "failed": run.failed,
+        "out_of_scope": run.out_of_scope,
+        "scanned": run.scanned,
+        "exhausted": run.exhausted,
+        "next_cursor": run.next_cursor,
+        "elapsed_seconds": round(run.elapsed_seconds(), 3),
+        "paced_wait_seconds": round(run.paced_wait_seconds, 3),
+        "facts_per_minute": run.facts_per_minute(),
+        "scope_total": run.scope_total,
+        "graph_episodes": run.graph_episodes,
+        "remaining": run.remaining_estimate(),
+        "errors": list(run.errors),
+    }
 
 
 # 每个图键只保留最近一次调用的读数；全服务同时只允许一个回填在跑（见 `backfill`）。
@@ -675,23 +718,8 @@ async def _run_backfill(request: BackfillRequest, run: BackfillRun) -> BackfillR
         await source.aclose()
 
     run.finish("completed")
-    return BackfillResponse(
-        group_id=request.group_id,
-        processed=run.processed,
-        already_synced=run.already_synced,
-        failed=run.failed,
-        out_of_scope=run.out_of_scope,
-        scanned=run.scanned,
-        exhausted=run.exhausted,
-        next_cursor=run.next_cursor,
-        elapsed_seconds=round(run.elapsed_seconds(), 3),
-        paced_wait_seconds=round(run.paced_wait_seconds, 3),
-        facts_per_minute=run.facts_per_minute(),
-        scope_total=run.scope_total,
-        graph_episodes=run.graph_episodes,
-        remaining=max(0, run.scope_total - run.graph_episodes),
-        errors=list(run.errors),
-    )
+    # 响应字段与 `/backfill/status` 的同名字段同源（`_progress_fields`），口径与精度只在一处定。
+    return BackfillResponse(group_id=request.group_id, **_progress_fields(run))
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -825,8 +853,9 @@ async def backfill_status(group_id: Optional[str] = None) -> Dict[str, Any]:
     """回填进度读数（只读，进程内快照）。
 
     长跑任务（单批 `limit` 条可达数十分钟）在调用进行中也能读到实时计数，因此不必等
-    响应返回才知道「跑到哪了」。`running: true` 表示当前有调用在跑；`remaining` 是
-    估读（作用域事实数 − 图内 episode 数 − 本进程已入图数）。
+    响应返回才知道「跑到哪了」。`running: true` 表示当前有调用在跑；同名计数与
+    `POST /backfill` 的响应**同值同口径**（唯一取值处 `_progress_fields`），`remaining`
+    即 `scope_total − graph_episodes` 的估读。
 
     快照是**进程内**的：图桥重启后这里只剩空表，续跑本身不受影响（正确性只依赖图侧的
     `already_synced` 判定）。不传 `group_id` 时返回全部图键的最近一次读数。

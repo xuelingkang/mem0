@@ -136,6 +136,9 @@ def harness(monkeypatch):
             if uuid in state["synced"]:
                 return "already_synced", 0, 0
             state["synced"].add(uuid)
+            # 真实入图让图内 episode 数 +1：调用结束时的 `graph_episodes` 读数因此**含**本次
+            # 新入图的部分（这正是 `remaining` 不能再减一次 `processed` 的原因）。
+            state["graphiti"].episodes += 1
             return "synced", 2, 1
 
         monkeypatch.setattr(app, "_sync_one", _sync_one)
@@ -373,6 +376,9 @@ class TestBatchSemantics:
         assert response.errors and "episodes 500" in response.errors[0]
 
     def test_remaining_is_recomputed_from_the_graph_scale(self, harness):
+        """`remaining` 取的是**终点**图规模读数，不是起点读数加计数推断：本批新入图 2 条后
+        `graph_episodes` 为 3（起点 1 + 本批 2），故 `remaining = 4 − 3 = 1`；若实现用的是起点
+        读数（1），这里会读到 3。"""
         harness["install"](self._facts(count=4), episodes=1)
         run = app.BackfillRun(
             group_id=GROUP_ID,
@@ -385,8 +391,125 @@ class TestBatchSemantics:
         )
         response = asyncio.run(app._run_backfill(app.BackfillRequest(group_id=GROUP_ID, limit=2, scan_limit=50), run))
         assert response.scope_total == 4
-        assert response.graph_episodes == 1
-        assert response.remaining == 3
+        assert response.graph_episodes == 3
+        assert response.remaining == 1
+
+
+# --------------------------------------------------------------------------- 进度读数口径
+
+
+# 响应与 `/backfill/status` 的同名字段集合：同名即同义，必须同值（唯一取值处见 app.py 的
+# `_progress_fields`）。核验实测（`bfchk_a` 16 vs 12、`bfchk_b` 16 vs 12、`bfchk_tie` 3 vs 2）
+# 的形态就是两侧只有 `remaining` 一个字段不一致，而差值恒等于 `processed`。
+_SHARED_PROGRESS_FIELDS = (
+    "group_id",
+    "processed",
+    "already_synced",
+    "failed",
+    "out_of_scope",
+    "scanned",
+    "exhausted",
+    "next_cursor",
+    "elapsed_seconds",
+    "paced_wait_seconds",
+    "facts_per_minute",
+    "scope_total",
+    "graph_episodes",
+    "remaining",
+    "errors",
+)
+
+
+class TestProgressReadingConsistency:
+    """[AC-1][AC-2][AC-3][AC-4] 进度读数：`POST /backfill` 的响应与 `GET /backfill/status`
+    必须同口径、同值。
+
+    `remaining` 的口径是 `scope_total − graph_episodes`，其中 `graph_episodes` 是**调用结束时**
+    的图规模读数，已含本次新入图的部分；再减一次 `processed` 就是重复扣减（读数系统性偏小，
+    差值恒等于 `processed`）。这里把「同名即同值」钉成不变式，而不是只钉 `remaining` 一个字段。
+    """
+
+    def _facts(self, count=4):
+        # created_at 降序：f1 最新，与 Qdrant 的读面口径一致（扫过顺序即 f1, f2, ...）。
+        return [
+            _record(f"f{index}", f"2026-09-18T05:{20 - index:02d}:00.00000{index}+00:00")
+            for index in range(1, count + 1)
+        ]
+
+    def _post(self, harness, client, **body):
+        payload = {"group_id": GROUP_ID, "limit": 2, "scan_limit": 50, **body}
+        response = client.post("/backfill", json=payload)
+        assert response.status_code == 200
+        return response.json()
+
+    def _status(self, client):
+        body = client.get("/backfill/status", params={"group_id": GROUP_ID}).json()
+        assert body["running"] is False
+        return body["runs"][0]
+
+    def test_status_and_response_agree_on_every_shared_field(self, harness):
+        """限速批次（`paced_wait_seconds` 非整）也要求逐字段相等：浮点读数的精度同样只在
+        一处定，否则同一含义的字段会在两个面上给出不同的数。"""
+        harness["install"](self._facts())
+        client = TestClient(app.app)
+        response = self._post(harness, client, rate=600)
+
+        status = self._status(client)
+        assert {field: status[field] for field in _SHARED_PROGRESS_FIELDS} == {
+            field: response[field] for field in _SHARED_PROGRESS_FIELDS
+        }
+
+    def test_remaining_is_scope_total_minus_graph_episodes(self, harness):
+        """数值验算：`remaining == scope_total − graph_episodes`，`processed` 只经由终点
+        `graph_episodes` 读数参与一次（修复前 status 侧读到的是 `max(0, 4 − 2 − 2) = 0`）。"""
+        harness["install"](self._facts())
+        client = TestClient(app.app)
+        response = self._post(harness, client)
+
+        assert app._backfill_runs[GROUP_ID].processed == 2
+        # 终点读数含本次新入图：起点 0 + 本批 2 = 2（`_run_backfill` 的终点复算）。
+        assert response["graph_episodes"] == 2
+        assert response["scope_total"] == 4
+        assert response["remaining"] == response["scope_total"] - response["graph_episodes"]
+        assert response["remaining"] == 2
+        assert self._status(client)["remaining"] == 2
+
+    def test_a_resumed_batch_keeps_both_readings_on_the_same_scale(self, harness):
+        """[AC-4] 续跑：第二批接着第一批的 `next_cursor` 推进，两处的 `processed` / `remaining`
+        同步反映真实剩余（同作用域、同一批数据）。"""
+        harness["install"](self._facts(count=4))
+        client = TestClient(app.app)
+        first = self._post(harness, client)
+        second = self._post(harness, client, cursor=first["next_cursor"])
+
+        assert (first["processed"], first["remaining"]) == (2, 2)
+        assert (second["processed"], second["remaining"]) == (2, 0)
+        status = self._status(client)
+        assert status["state"] == "completed"
+        assert {field: status[field] for field in _SHARED_PROGRESS_FIELDS} == {
+            field: second[field] for field in _SHARED_PROGRESS_FIELDS
+        }
+
+    def test_the_scan_breakdown_covers_every_scanned_record(self, harness):
+        """[AC-3] `scanned` 是分母：每条扫过的记录恰好落进 `processed` / `already_synced` /
+        `failed` / `out_of_scope` 之一，故四者之和恒等于 `scanned`（各字段关系的可复核形态）。"""
+        records = [
+            _record("f1", "2026-09-18T05:04:00.000001+00:00"),
+            _record("f2", "2026-09-18T05:03:00.000002+00:00"),
+            _record("f3", "2026-09-18T05:02:00.000003+00:00"),
+            _record("other1", "2026-09-18T05:01:00.000004+00:00", user_id="other"),
+            _record("empty1", "2026-09-18T05:00:00.000005+00:00", data="   "),
+        ]
+        harness["synced"].update({"f1"})
+        harness["install"](records)
+        client = TestClient(app.app)
+        response = self._post(harness, client, limit=5, scan_limit=5)
+
+        assert (response["already_synced"], response["processed"]) == (1, 2)
+        assert (response["out_of_scope"], response["failed"], response["scanned"]) == (1, 1, 5)
+        assert response["scanned"] == (
+            response["processed"] + response["already_synced"] + response["failed"] + response["out_of_scope"]
+        )
 
 
 # --------------------------------------------------------------------------- 限速
