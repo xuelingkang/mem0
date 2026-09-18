@@ -14,14 +14,55 @@
 | GET | `/health` | 存活 + `backend=falkordb` + 图库连通性 |
 | GET | `/graphs` | 图键清单 |
 | DELETE | `/graph/{group_id}` | 整体删除一个图键（隔离验证数据的清理面） |
+| POST | `/backfill` | 存量回填：按 Qdrant 游标顺序取事实、限速入图、可中断续跑（见下节） |
+| GET | `/backfill/status?group_id=` | 回填进度读数（进程内快照，只读） |
 
 join key 是构造性的：`episode uuid == memory id`，图侧不另存映射表。
+
+## 存量回填（`POST /backfill`）
+
+设计见 [`docs/design/graph-memory.md`](../../docs/design/graph-memory.md) §5.5。背景：增量路径只覆盖
+新写入，存量覆盖率 2.8%（116 episodes / 4105 条），图检索对历史查询等于无效。
+
+```bash
+# 一批：最多新入图 5 条，限速 6 条/分钟，扫过最多 500 条记录
+curl -s -X POST http://graph-bridge:8000/backfill -H 'content-type: application/json' \
+  -d '{"group_id":"mem0_<scope>","limit":5,"rate":6,"scan_limit":500}'
+# 续跑：把上一次响应的 next_cursor 传回 cursor
+curl -s -X POST http://graph-bridge:8000/backfill -H 'content-type: application/json' \
+  -d '{"group_id":"mem0_<scope>","limit":5,"rate":6,"cursor":"<next_cursor>"}'
+# 进度
+curl -s 'http://graph-bridge:8000/backfill/status?group_id=mem0_<scope>'
+# 完成判定：processed == 0 且 exhausted == true
+```
+
+| 参数 | 默认 | 语义 |
+| --- | --- | --- |
+| `group_id` | 必填 | 图键（`mem0_<scope>`）；非该形态回 400 且不建键 |
+| `limit` | 20 | 本次最多**新入图**条数（已同步的跳过不计数） |
+| `rate` | 0 | 入图速率上限「条/分钟」；`0` = 不限速 |
+| `cursor` | 无 | 续跑锚点（`created_at` 原值）；缺省从最新一条起扫 |
+| `scan_limit` | 200 | 本次允许扫过的记录条数上限（防全已同步时无界扫描） |
+
+四条语义：**游标顺序取事实**（`created_at` 降序 + `created_at < cursor`，与 mem0 侧
+`vector_store.list()` 同一口径）；**限速**（相邻两次入图起始间隔 ≥ `60/rate` 秒，读数见响应的
+`paced_wait_seconds`）；**可中断续跑**（复用 `/episodes` 的 `already_synced` 前置判定，同一
+`_sync_one` 实现，不另存进度表）；**进度可观测**（响应计数 + `/backfill/status`）。
+
+两个上界决定了它不会「一次调用跑到完」：`limit`（新入图条数）与 `scan_limit`（扫描条数），
+由编排者分批推进。运行期间全服务只允许一个回填（否则 409）：回填与图派发共用同一 LLM 通道与
+2 vCPU，限速存在的理由就是别把主链路压住。
+
+`memory_kind == "observation"` 的 Dream 观察条目不入图（与增量派发口径一致）。单条入图耗时由
+LLM 抽取主导（实测中位 20.5s），故全量 4105 条 ≈ 20+ 小时串行 LLM 占用。
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `FALKORDB_HOST` / `FALKORDB_PORT` | `falkordb` / `6379` | 图库地址 |
+| `QDRANT_HOST` / `QDRANT_PORT` | `qdrant` / `6333` | 事实主存地址（回填读取用；与 mem0 侧 `QDRANT_*` 同源） |
+| `QDRANT_COLLECTION_NAME` | `memories` | 事实主存集合名（本部署为 `memories_2048`） |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | 空 / 空 / `gpt-5-mini` | 抽取管道使用的 LLM（走 OpenAI 兼容的 `/chat/completions` 结构化输出通道） |
 | `EMBEDDER_API_KEY` / `EMBEDDER_BASE_URL` / `EMBEDDER_MODEL` / `EMBEDDER_DIMS` | 回落 `LLM_*` / `text-embedding-3-small` / `1024` | 事实向量化用的 embedder |
 | `SEMAPHORE_LIMIT` | `1` | 并发上限，默认串行入图 |

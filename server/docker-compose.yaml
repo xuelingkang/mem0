@@ -89,6 +89,10 @@ services:
     environment:
       - FALKORDB_HOST=falkordb
       - FALKORDB_PORT=6379
+      # 存量回填的数据面：回填直读事实主存（Qdrant），读面口径与 mem0 侧一致。
+      - QDRANT_HOST=${QDRANT_HOST:-qdrant}
+      - QDRANT_PORT=${QDRANT_PORT:-6333}
+      - QDRANT_COLLECTION_NAME=${QDRANT_COLLECTION_NAME:-memories}
       # 抽取管道按 OpenAI 兼容的 /chat/completions 通道装配（`response_format` 用
       # json_object：本机网关对 json_schema 回 422，实测见方案 §10 的 E7/E18）；
       # LLM_MODEL 缺省跟随后端默认 LLM 模型。
