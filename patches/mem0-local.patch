@@ -554,6 +554,2107 @@ index 00000000..ccfe0a39
 +| Graphiti：`resolve_edge_contradictions` / `resolve_duplicate_invalidations`（候选边更早生效则不退役；每个事件只允许一次失效，取最早失效时间） | 1c 的 R3 / R5 规则参照 |
 +| graphiti issue #1728：纯时间规则无法判断「两条事实是否同一命题」 | 1b 提示词显式约束「同主体 + 同属性 + 互斥值」三条件的依据 |
 +
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/README.md b/docs/design/dashboard-mechanism-visibility-evidence/README.md
+new file mode 100644
+index 00000000..d95eb0aa
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/README.md
+@@ -0,0 +1,39 @@
++# dashboard-mechanism-visibility 实测证据
++
++本目录是 `docs/design/dashboard-mechanism-visibility.md` 第 10 节「实测证据」的原始材料，采集于
++2026-09-18，基线 commit `737d10e0`（`upstream/main` = `0df3e4b8`）。
++
++运行环境：macOS 宿主 + lima `docker` VM；compose 五服务在线（mem0 `:8888`、dashboard `:3000`、
++postgres、qdrant、graph-bridge + falkordb）。三项特性开关均为 `true`（`decay` / `graph` / `dream`）。
++
++## 脚本
++
++| 文件 | 作用 | 复跑方式 |
++| --- | --- | --- |
++| `probe_payload_inventory.py` | 全库 payload 清单：有效/失效/观察/召回足迹计数，机制条目在最新优先序中的位置，payload 索引 | `docker compose cp` 进 mem0 后 `docker compose exec -T mem0 python /tmp/<file>` |
++| `probe_rest_readings.py` | 全部读端点实测：管理面列表与作用域列表的形状差异、`score_details` 全键与检索确定性、`include_observations` / `include_invalidated` 行为、`/graph/stats`、`/dream/runs`、双向追溯端点、三个开关取值 | 先在 `/tmp/mem0_token.txt` 放一个管理员 token，再 `python3 <file>`（脚本内含 token 生成命令） |
++| `probe_dream_dryrun.py` | dry-run 零写入验证：前后 `dream_runs` 行数与 Qdrant 点数、报告与响应体逐字段相等 | 同上（token 由脚本内 `users` 表查 admin 生成，不写死 id）；脚本末尾删掉自己那份报告 |
++| `probe_observation_cost.py` | 观察清单两条取数路径的成本对比（逐页拉全量再前端过滤 vs 服务端按索引过滤） | 同上 |
++| `probe_graph_bridge.py` | 图桥 `/graphs` / `/stats` 读数与「读即建键」副作用 | `docker compose cp` 进 graph-bridge 后执行；**脚本会删除自己的探针键**并在末尾核对键集合复原 |
++| `probe_graph_counters.py` | 图派发计数器的实例归属（容器 1 号进程启动时刻 + 两次读数） | `docker compose cp` 进 mem0 后执行 |
++
++## 原始输出
++
++| 文件 | 对应发现 |
++| --- | --- |
++| `probe_payload_inventory.txt` | F-1、F-4、F-9（全库计数、位置分布、payload 索引） |
++| `probe_rest_readings.txt` | F-1～F-5、F-8（端点形状、`score_details` 14 键、检索确定性、计数快照、追溯端点字段面） |
++| `probe_dream_dryrun.txt` | §4.4 预览语义（零写入、报告与响应体一致） |
++| `probe_observation_cost.txt` | F-7（6 次 / 4.77 MB vs 1 次 / 6 ms） |
++| `probe_graph_bridge.txt` | F-6（图键清单、`mem0_xue` 规模、读即建键与清理复原） |
++| `probe_graph_counters.txt` | F-5、F-10（计数归实例、进程起点） |
++
++## 数据安全
++
++探针**只读业务数据**，不写 `user_id=xue` 的记忆、不改 `mem0_xue` 图键、不动三项开关。全部输出
++只含计数、id 与机制字段值，**不含记忆正文**——正文里出现过用户自述的凭据片段，落盘即泄痕，
++故所有探针在打印前已排除 `data` 字段。
++
++例外只有一处，已在脚本内自证并复原：`probe_graph_bridge.py` 为验证「对未知图键读 `/stats` 会新建
++空图键」而创建了探针键 `mem0_dashboard_probe_key`，同一脚本随后 `DELETE` 它，并在输出里核对
++`cleanup_restored_original_key_set = true`。
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.py
+new file mode 100644
+index 00000000..6ddff044
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.py
+@@ -0,0 +1,103 @@
++"""dashboard-mechanism-visibility 设计探针 D：dry-run 零写入验证（读两次 + 一次 dry-run）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    docker compose cp ../docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.py mem0:/tmp/
++    docker compose exec -T mem0 python /tmp/probe_dream_dryrun.py
++
++结论口径：dry-run 前后 `dream_runs` 行数不变、Qdrant 点数不变、观察数不变；唯一新增
++产物是 `/app/history/dream-reports/<run_id>.json`（本探针在末尾删掉自己那份，避免污染
++后续核验环境）。
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++import urllib.request
++
++sys.path.insert(0, "/app")
++
++from auth import create_access_token  # noqa: E402
++from db import SessionLocal  # noqa: E402
++from models import User  # noqa: E402
++from qdrant_client import QdrantClient  # noqa: E402
++from sqlalchemy import select  # noqa: E402
++
++BASE = "http://localhost:8000"
++COLL = "memories_2048"
++
++
++def admin_user_id() -> str:
++    """取本机第一个 admin 用户的 id（不把 id 写死进仓库）。"""
++    session = SessionLocal()
++    try:
++        return str(session.scalar(select(User).where(User.role == "admin").order_by(User.created_at.asc())).id)
++    finally:
++        session.close()
++
++
++def call(path: str, method: str = "GET", body=None, timeout: int = 600):
++    data = json.dumps(body).encode() if body is not None else None
++    token = create_access_token(admin_user_id(), "admin")
++    req = urllib.request.Request(
++        BASE + path,
++        data=data,
++        method=method,
++        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
++    )
++    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
++
++
++def point_counts():
++    client = QdrantClient(url="http://qdrant:6333")
++    total = client.count(collection_name=COLL, exact=True).count
++    return total
++
++
++def main() -> None:
++    before = {
++        "runs_total": call("/dream/runs?limit=1").get("total"),
++        "points": point_counts(),
++    }
++    report = call("/dream/preview", "POST", {})
++    after = {
++        "runs_total": call("/dream/runs?limit=1").get("total"),
++        "points": point_counts(),
++    }
++
++    report_path = report.get("report_path")
++    report_body_matches = None
++    if report_path and os.path.exists(report_path):
++        on_disk = json.load(open(report_path, encoding="utf-8"))
++        report_body_matches = on_disk == report
++
++    out = {
++        "before": before,
++        "after": after,
++        "runs_row_delta": (after["runs_total"] or 0) - (before["runs_total"] or 0),
++        "points_delta": after["points"] - before["points"],
++        "preview": {
++            "mode": report.get("mode"),
++            "status": report.get("status"),
++            "duration_seconds": report.get("duration_seconds"),
++            "observations_written": report.get("observations_written"),
++            "observations_superseded": report.get("observations_superseded"),
++            "would_write": len(report.get("would_write") or []),
++            "candidates": len(report.get("candidates") or []),
++            "errors": report.get("errors"),
++            "totals": report.get("totals"),
++        },
++        "report_written_to": report_path,
++        "report_file_equals_response_body": report_body_matches,
++    }
++
++    if report_path and os.path.exists(report_path):
++        os.remove(report_path)
++        out["probe_report_removed"] = not os.path.exists(report_path)
++
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.txt
+new file mode 100644
+index 00000000..d5756af6
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_dream_dryrun.txt
+@@ -0,0 +1,36 @@
++{
++ "before": {
++  "runs_total": 1,
++  "points": 4043
++ },
++ "after": {
++  "runs_total": 1,
++  "points": 4043
++ },
++ "runs_row_delta": 0,
++ "points_delta": 0,
++ "preview": {
++  "mode": "dry_run",
++  "status": "completed",
++  "duration_seconds": 4.191,
++  "observations_written": 0,
++  "observations_superseded": 0,
++  "would_write": 0,
++  "candidates": 0,
++  "errors": [],
++  "totals": {
++   "facts": 3964,
++   "observations": 79,
++   "clusters": 0,
++   "llm_calls": 0,
++   "failed_clusters": 0,
++   "prompt_tokens": 0,
++   "completion_tokens": 0,
++   "clusters_skipped": 104,
++   "clusters_deferred": 0
++  }
++ },
++ "report_written_to": "/app/history/dream-reports/c83ffbcf-4c68-415c-b725-7b80b68b53d1.json",
++ "report_file_equals_response_body": true,
++ "probe_report_removed": true
++}
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.py
+new file mode 100644
+index 00000000..795ae58e
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.py
+@@ -0,0 +1,55 @@
++"""dashboard-mechanism-visibility 设计探针 C：图桥侧只读面与「读即建键」副作用（读多写一）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    docker compose exec -T graph-bridge python - <<'PY'   # 或 cp 进容器执行本文件
++    ...
++
++本探针刻意包含一次**删除**：它先证明「对未知 group_id 读 /stats 会新建空图键」，再把该
++探针键删掉（键名带 probe 前缀，非业务键）。business 键 `mem0_xue` 只读不删。
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.request
++
++BRIDGE = "http://localhost:8000"
++PROBE_KEY = "mem0_dashboard_probe_key"
++
++
++def get(path: str):
++    return json.loads(urllib.request.urlopen(BRIDGE + path, timeout=60).read().decode())
++
++
++def delete(path: str):
++    req = urllib.request.Request(BRIDGE + path, method="DELETE")
++    return json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
++
++
++def main() -> None:
++    out = {}
++    out["health"] = get("/health")
++    before = get("/graphs")["graphs"]
++    out["graphs_before"] = before
++
++    out["stats_mem0_xue"] = get("/stats?group_id=mem0_xue")
++
++    # 副作用验证：对未知 group_id 读 /stats
++    probe_stats = get(f"/stats?group_id={PROBE_KEY}")
++    after_read = get("/graphs")["graphs"]
++    out["probe_key_stats_reading"] = probe_stats
++    out["graphs_after_reading_unknown_key"] = after_read
++    out["read_created_a_new_key"] = sorted(set(after_read) - set(before))
++
++    out["mem0_xue_after_probe"] = get("/stats?group_id=mem0_xue")
++
++    # 清掉探针键，恢复原状
++    out["probe_key_deleted"] = delete(f"/graph/{PROBE_KEY}")
++    out["graphs_after_cleanup"] = get("/graphs")["graphs"]
++    out["cleanup_restored_original_key_set"] = sorted(out["graphs_after_cleanup"]) == sorted(before)
++
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.txt
+new file mode 100644
+index 00000000..4e24f906
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_bridge.txt
+@@ -0,0 +1,49 @@
++{
++ "health": {
++  "status": "healthy",
++  "backend": "falkordb",
++  "falkordb": "ok"
++ },
++ "graphs_before": [
++  "default_db",
++  "mem0__",
++  "mem0_xue"
++ ],
++ "stats_mem0_xue": {
++  "group_id": "mem0_xue",
++  "episodes": 63,
++  "entity_nodes": 108,
++  "entity_edges": 130
++ },
++ "probe_key_stats_reading": {
++  "group_id": "mem0_dashboard_probe_key",
++  "episodes": 0,
++  "entity_nodes": 0,
++  "entity_edges": 0
++ },
++ "graphs_after_reading_unknown_key": [
++  "default_db",
++  "mem0__",
++  "mem0_dashboard_probe_key",
++  "mem0_xue"
++ ],
++ "read_created_a_new_key": [
++  "mem0_dashboard_probe_key"
++ ],
++ "mem0_xue_after_probe": {
++  "group_id": "mem0_xue",
++  "episodes": 63,
++  "entity_nodes": 108,
++  "entity_edges": 130
++ },
++ "probe_key_deleted": {
++  "group_id": "mem0_dashboard_probe_key",
++  "dropped": true
++ },
++ "graphs_after_cleanup": [
++  "default_db",
++  "mem0__",
++  "mem0_xue"
++ ],
++ "cleanup_restored_original_key_set": true
++}
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.py
+new file mode 100644
+index 00000000..d5020a73
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.py
+@@ -0,0 +1,74 @@
++"""dashboard-mechanism-visibility 设计探针 F：图派发计数器的归属实例（只读）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    docker compose cp ../docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.py mem0:/tmp/
++    docker compose exec -T mem0 python /tmp/probe_graph_counters.py
++
++用途：证明 `GET /graph/stats` 的计数是**进程内累计**（归当前 mem0 容器实例），因此页面上
++必须标注计数起点，否则用户会把「重启后归零」误读为数据丢失。
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++import time
++import urllib.request
++
++sys.path.insert(0, "/app")
++
++from auth import create_access_token  # noqa: E402
++from db import SessionLocal  # noqa: E402
++from models import User  # noqa: E402
++from sqlalchemy import select  # noqa: E402
++
++BASE = "http://localhost:8000"
++
++
++def token() -> str:
++    session = SessionLocal()
++    try:
++        uid = str(session.scalar(select(User).where(User.role == "admin").order_by(User.created_at.asc())).id)
++    finally:
++        session.close()
++    return create_access_token(uid, "admin")
++
++
++def stats():
++    req = urllib.request.Request(
++        BASE + "/graph/stats", headers={"Authorization": f"Bearer {token()}"}
++    )
++    return json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
++
++
++def pid1_started_at() -> str:
++    """从 /proc 推出容器 1 号进程的启动时刻（epoch 秒）。"""
++    stat = open("/proc/1/stat", encoding="utf-8").read().split()
++    start_ticks = int(stat[21])
++    hz = 100
++    btime = None
++    for line in open("/proc/stat", encoding="utf-8"):
++        if line.startswith("btime "):
++            btime = int(line.split()[1])
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(btime + start_ticks / hz))
++
++
++def main() -> None:
++    first = stats()
++    time.sleep(5)
++    second = stats()
++    out = {
++        "container_pid1_started_at": pid1_started_at(),
++        "reading_1": first,
++        "reading_2_after_5s": second,
++        "counters_move_within_one_instance": first != second,
++        "note": (
++            "计数归当前 mem0 容器实例：新建的 GraphSync 在首次派发时惰性创建，计数从 0 起。"
++            "本文件对应的容器实例见 container_pid1_started_at；换实例后同一读法会得到更小的数。"
++        ),
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.txt
+new file mode 100644
+index 00000000..2d91b44f
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_graph_counters.txt
+@@ -0,0 +1,29 @@
++{
++ "container_pid1_started_at": "2026-09-18T02:55:39Z",
++ "reading_1": {
++  "enabled": true,
++  "timeout_seconds": 1.0,
++  "circuit_open": false,
++  "consecutive_failures": 0,
++  "queue_size": 0,
++  "graph_dispatched": 15,
++  "graph_synced": 15,
++  "graph_already_synced": 0,
++  "graph_failed": 0,
++  "graph_dropped": 0
++ },
++ "reading_2_after_5s": {
++  "enabled": true,
++  "timeout_seconds": 1.0,
++  "circuit_open": false,
++  "consecutive_failures": 0,
++  "queue_size": 0,
++  "graph_dispatched": 15,
++  "graph_synced": 15,
++  "graph_already_synced": 0,
++  "graph_failed": 0,
++  "graph_dropped": 0
++ },
++ "counters_move_within_one_instance": false,
++ "note": "计数归当前 mem0 容器实例：新建的 GraphSync 在首次派发时惰性创建，计数从 0 起。本文件对应的容器实例见 container_pid1_started_at；换实例后同一读法会得到更小的数。"
++}
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.py
+new file mode 100644
+index 00000000..009fb694
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.py
+@@ -0,0 +1,112 @@
++"""dashboard-mechanism-visibility 设计探针 E：观察清单的两条取数路径成本对比（只读）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    docker compose cp ../docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.py mem0:/tmp/
++    docker compose exec -T mem0 python /tmp/probe_observation_cost.py
++
++路径 A（纯前端可行方案）：逐页拉全量管理列表，客户端过滤 `memory_kind == "observation"`。
++路径 B（服务端过滤）：Qdrant payload 过滤 `memory_kind`（已建 keyword 索引），一次取回观察。
++
++输出：两条路径的请求次数、传输字节数、耗时与结果条数——用于论证观察清单是否需要服务端过滤。
++"""
++
++from __future__ import annotations
++
++import json
++import time
++import urllib.parse
++import urllib.request
++
++BASE = "http://localhost:8000"
++COLL = "memories_2048"
++
++
++def _admin_token() -> str:
++    import sys
++
++    sys.path.insert(0, "/app")
++    from auth import create_access_token
++    from db import SessionLocal
++    from models import User
++    from sqlalchemy import select
++
++    session = SessionLocal()
++    try:
++        uid = str(session.scalar(select(User).where(User.role == "admin").order_by(User.created_at.asc())).id)
++    finally:
++        session.close()
++    return create_access_token(uid, "admin")
++
++
++TOKEN = _admin_token()
++
++
++def get(path: str):
++    req = urllib.request.Request(
++        BASE + path, headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
++    )
++    raw = urllib.request.urlopen(req, timeout=300).read()
++    return json.loads(raw.decode()), len(raw)
++
++
++def main() -> None:
++    out = {}
++
++    # 路径 A：逐页拉全量再客户端过滤
++    started = time.time()
++    cursor = None
++    requests = 0
++    bytes_total = 0
++    rows = 0
++    observations = 0
++    while True:
++        path = "/memories?top_k=1000" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
++        page, nbytes = get(path)
++        requests += 1
++        bytes_total += nbytes
++        rows += len(page["results"])
++        observations += sum(1 for r in page["results"] if r.get("memory_kind") == "observation")
++        cursor = page.get("next_cursor")
++        if not cursor or not page["results"]:
++            break
++        if requests >= 200:
++            break
++    out["path_a_full_walk"] = {
++        "requests": requests,
++        "rows": rows,
++        "bytes": bytes_total,
++        "seconds": round(time.time() - started, 2),
++        "observations_found": observations,
++    }
++
++    # 路径 B：服务端按 payload 索引过滤（SDK get_all 的 memory_kind 条件）
++    from qdrant_client import QdrantClient
++
++    client = QdrantClient(url="http://qdrant:6333")
++    started = time.time()
++    points, _ = client.scroll(
++        collection_name=COLL,
++        limit=200,
++        with_payload=["data", "memory_kind", "evidence_count", "source_memory_ids", "dream_run_id"],
++        with_vectors=False,
++        scroll_filter={
++            "must": [
++                {"key": "memory_kind", "match": {"value": "observation"}},
++            ]
++        },
++    )
++    out["path_b_server_side_filter"] = {
++        "requests": 1,
++        "rows": len(points),
++        "seconds": round(time.time() - started, 4),
++    }
++
++    out["payload_index_present"] = "memory_kind" in json.loads(
++        urllib.request.urlopen(f"http://qdrant:6333/collections/{COLL}").read().decode()
++    )["result"]["payload_schema"]
++
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.txt
+new file mode 100644
+index 00000000..b1cfd996
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_observation_cost.txt
+@@ -0,0 +1,15 @@
++{
++ "path_a_full_walk": {
++  "requests": 6,
++  "rows": 4047,
++  "bytes": 4767759,
++  "seconds": 0.31,
++  "observations_found": 79
++ },
++ "path_b_server_side_filter": {
++  "requests": 1,
++  "rows": 79,
++  "seconds": 0.0059
++ },
++ "payload_index_present": true
++}
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.py
+new file mode 100644
+index 00000000..eb373136
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.py
+@@ -0,0 +1,129 @@
++"""dashboard-mechanism-visibility 设计探针 A：payload 清单（只读，不落任何写入）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    docker compose cp ../docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.py mem0:/tmp/
++    docker compose exec -T mem0 python /tmp/probe_payload_inventory.py
++
++说明：本探针**只输出计数、id 与机制字段值**，不输出记忆正文——正文里出现过用户自述的
++凭据片段，落盘到仓库即为泄痕。机制字段值本身来自 `valid_at` / `invalid_at` /
++`superseded_by` / `invalid_reason` / `access_count` / `last_accessed`，不含敏感值。
++"""
++
++from __future__ import annotations
++
++import json
++from collections import Counter
++
++from qdrant_client import QdrantClient
++
++COLL = "memories_2048"
++
++FIELDS = [
++    "valid_at",
++    "invalid_at",
++    "superseded_by",
++    "invalid_reason",
++    "memory_kind",
++    "access_count",
++    "last_accessed",
++    "user_id",
++    "agent_id",
++    "dream_run_id",
++    "evidence_count",
++    "source_memory_ids",
++    "created_at",
++]
++
++
++def main() -> None:
++    client = QdrantClient(url="http://qdrant:6333")
++
++    rows = []
++    offset = None
++    while True:
++        batch, offset = client.scroll(
++            collection_name=COLL,
++            limit=1000,
++            offset=offset,
++            with_payload=FIELDS,
++            with_vectors=False,
++        )
++        rows.extend([p.payload for p in batch])
++        if offset is None:
++            break
++
++    invalid = [r for r in rows if r.get("invalid_at")]
++    obs = [r for r in rows if r.get("memory_kind") == "observation"]
++    newest = sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
++
++    out = {
++        "collection": COLL,
++        "total_points": len(rows),
++        "valid_at_non_null": sum(1 for r in rows if r.get("valid_at")),
++        "invalid_at_non_null": len(invalid),
++        "superseded_by_non_null": sum(1 for r in rows if r.get("superseded_by")),
++        "access_count_non_zero": sum(1 for r in rows if r.get("access_count")),
++        "last_accessed_non_null": sum(1 for r in rows if r.get("last_accessed")),
++        "observations": len(obs),
++        "memory_kind_counter": dict(Counter(str(r.get("memory_kind")) for r in rows)),
++        "invalid_reason_counter": dict(Counter(r.get("invalid_reason") for r in invalid)),
++        "observation_scopes": dict(
++            Counter(f"{r.get('user_id')}:{r.get('agent_id')}" for r in obs)
++        ),
++        "observation_dream_runs": dict(Counter(str(r.get("dream_run_id")) for r in obs)),
++        "invalidated_ids": [r.get("created_at") for r in invalid],
++        "invalidated_positions_in_newest_first_order": [
++            idx for idx, r in enumerate(newest) if r.get("invalid_at")
++        ],
++        "observations_positions_in_newest_first_order": [
++            idx for idx, r in enumerate(newest) if r.get("memory_kind") == "observation"
++        ][:5],
++        "observations_position_max_in_newest_first_order": max(
++            (idx for idx, r in enumerate(newest) if r.get("memory_kind") == "observation"),
++            default=None,
++        ),
++        "scope_agent_ying_total": sum(1 for r in rows if r.get("agent_id") == "ying"),
++        "scope_agent_ying_newest_1000_observations": sum(
++            1
++            for r in [x for x in newest if x.get("agent_id") == "ying"][:1000]
++            if r.get("memory_kind") == "observation"
++        ),
++        "global_newest_1000_observations": sum(
++            1 for r in newest[:1000] if r.get("memory_kind") == "observation"
++        ),
++        "invalid_field_values_sample": next(
++            (
++                {
++                    "id_present": True,
++                    "valid_at": r.get("valid_at"),
++                    "invalid_at": r.get("invalid_at"),
++                    "superseded_by_present": bool(r.get("superseded_by")),
++                    "invalid_reason": r.get("invalid_reason"),
++                }
++                for r in invalid
++            ),
++            None,
++        ),
++        "access_field_values_sample": next(
++            (
++                {
++                    "access_count": r.get("access_count"),
++                    "last_accessed": r.get("last_accessed"),
++                }
++                for r in rows
++                if r.get("access_count")
++            ),
++            None,
++        ),
++        "payload_schema": json.loads(
++            __import__("urllib.request", fromlist=["urlopen"])
++            .urlopen(f"http://qdrant:6333/collections/{COLL}")
++            .read()
++            .decode()
++        )["result"]["payload_schema"],
++    }
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.txt
+new file mode 100644
+index 00000000..1a638df6
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_payload_inventory.txt
+@@ -0,0 +1,110 @@
++{
++ "collection": "memories_2048",
++ "total_points": 4047,
++ "valid_at_non_null": 480,
++ "invalid_at_non_null": 7,
++ "superseded_by_non_null": 7,
++ "access_count_non_zero": 932,
++ "last_accessed_non_null": 932,
++ "observations": 79,
++ "memory_kind_counter": {
++  "None": 3968,
++  "observation": 79
++ },
++ "invalid_reason_counter": {
++  "superseded_by_newer_fact": 7
++ },
++ "observation_scopes": {
++  "xue:ying": 74,
++  "xue:shi": 5
++ },
++ "observation_dream_runs": {
++  "80b83679-cce2-4eb1-b80e-18b75be0abd0": 79
++ },
++ "invalidated_ids": [
++  "2026-09-17T04:00:19.409357+00:00",
++  "2026-09-17T07:54:58.197446+00:00",
++  "2026-09-17T08:56:31.040317+00:00",
++  "2026-09-17T05:09:32.198406+00:00",
++  "2026-09-17T06:49:03.725368+00:00",
++  "2026-09-17T08:44:23.517943+00:00",
++  "2026-09-18T01:59:03.540355+00:00"
++ ],
++ "invalidated_positions_in_newest_first_order": [
++  128,
++  305,
++  320,
++  379,
++  442,
++  499,
++  527
++ ],
++ "observations_positions_in_newest_first_order": [
++  44,
++  45,
++  46,
++  47,
++  48
++ ],
++ "observations_position_max_in_newest_first_order": 122,
++ "scope_agent_ying_total": 3251,
++ "scope_agent_ying_newest_1000_observations": 74,
++ "global_newest_1000_observations": 79,
++ "invalid_field_values_sample": {
++  "id_present": true,
++  "valid_at": null,
++  "invalid_at": "2026-09-17",
++  "superseded_by_present": true,
++  "invalid_reason": "superseded_by_newer_fact"
++ },
++ "access_field_values_sample": {
++  "access_count": 2,
++  "last_accessed": "2026-09-18T03:11:07.521206+00:00"
++ },
++ "payload_schema": {
++  "user_id": {
++   "data_type": "keyword",
++   "points": 4047
++  },
++  "observation_key": {
++   "data_type": "keyword",
++   "points": 79
++  },
++  "last_accessed": {
++   "data_type": "datetime",
++   "points": 932
++  },
++  "run_id": {
++   "data_type": "keyword",
++   "points": 0
++  },
++  "agent_id": {
++   "data_type": "keyword",
++   "points": 4047
++  },
++  "valid_at": {
++   "data_type": "datetime",
++   "points": 480
++  },
++  "actor_id": {
++   "data_type": "keyword",
++   "points": 0
++  },
++  "invalid_at": {
++   "data_type": "datetime",
++   "points": 7
++  },
++  "memory_kind": {
++   "data_type": "keyword",
++   "points": 79
++  },
++  "source_memory_ids": {
++   "data_type": "keyword",
++   "points": 79
++  },
++  "created_at": {
++   "data_type": "datetime",
++   "points": 4047
++  }
++ }
++}
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.py b/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.py
+new file mode 100644
+index 00000000..b772235e
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.py
+@@ -0,0 +1,266 @@
++"""dashboard-mechanism-visibility 设计探针 B：REST 读面清点（全部只读，零写入）。
++
++复跑：
++    cd /Users/xuelingkang/Documents/Containers/mem0/server
++    # 1) 取一个管理员 access token（30 分钟有效，本机 admin 用户）
++    docker compose exec -T mem0 python -c "
++    import sys; sys.path.insert(0,'/app')
++    from auth import create_access_token
++    print(create_access_token('<users.id>', 'admin'))" > /tmp/mem0_token.txt
++    # 2) 跑探针
++    python3 ../docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.py
++
++输出仅含字段名、计数、id 前缀与机制字段值，**不含记忆正文**（正文里出现过用户自述的
++凭据片段）。开关态由 server/.env 决定（本次：decay/graph/dream 均为 true）。
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++BASE = "http://localhost:8888"
++TOKEN = open("/tmp/mem0_token.txt").read().strip()
++
++
++def call(path: str, method: str = "GET", body=None, timeout: int = 300):
++    data = json.dumps(body).encode() if body is not None else None
++    req = urllib.request.Request(
++        BASE + path,
++        data=data,
++        method=method,
++        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
++    )
++    try:
++        return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
++    except urllib.error.HTTPError as exc:
++        return {"http_status": exc.code, "http_body": exc.read().decode()[:200]}
++
++
++def main() -> None:
++    out = {}
++
++    # 1. 管理面列表（无作用域）：游标翻页 + total
++    page1 = call("/memories?top_k=1000")
++    ids1 = [r["id"] for r in page1["results"]]
++    page2 = call(f"/memories?top_k=1000&cursor={urllib.parse.quote(page1['next_cursor'])}")
++    ids2 = [r["id"] for r in page2["results"]]
++    out["memories_admin_list"] = {
++        "total": page1.get("total"),
++        "page1_rows": len(ids1),
++        "page2_rows": len(ids2),
++        "overlap_page1_page2": len(set(ids1) & set(ids2)),
++        "page1_newest": page1["results"][0]["created_at"],
++        "page1_oldest": page1["results"][-1]["created_at"],
++        "page2_newest": page2["results"][0]["created_at"],
++        "response_keys": sorted(page1.keys()),
++        "row_keys": sorted(page1["results"][0].keys()),
++        "invalidated_rows_in_page1": sum(1 for r in page1["results"] if r.get("invalid_at")),
++        "observation_rows_in_page1": sum(
++            1 for r in page1["results"] if r.get("memory_kind") == "observation"
++        ),
++        "top_k_10_rows": len(call("/memories?top_k=10")["results"]),
++    }
++
++    # 2. 作用域列表：形状 + 观察可见性 + 上限
++    scoped = call("/memories?user_id=xue&agent_id=ying&top_k=5")
++    scoped_max = call("/memories?user_id=xue&agent_id=ying&top_k=1000")
++    out["memories_scoped_list"] = {
++        "response_keys": sorted(scoped.keys()),
++        "rows": len(scoped["results"]),
++        "row_keys": sorted(scoped["results"][0].keys()),
++        "kinds_in_first_5": [r.get("memory_kind") for r in scoped["results"]],
++        "rows_at_top_k_1000": len(scoped_max["results"]),
++        "unknown_param_ignored": len(call("/memories?user_id=xue&kind=observation")["results"]),
++    }
++
++    # 3. 检索：解释分量、图分支状态、观察可见性、失效可见性
++    explain = call(
++        "/search",
++        "POST",
++        {
++            "query": "记忆衰减 机制",
++            "top_k": 8,
++            "filters": {"user_id": "xue"},
++            "explain": True,
++        },
++    )
++    plain = call(
++        "/search", "POST", {"query": "记忆衰减 机制", "top_k": 8, "filters": {"user_id": "xue"}}
++    )
++    out["search_explain"] = {
++        "response_keys": sorted(explain.keys()),
++        "row_keys": sorted(explain["results"][0].keys()),
++        "score_details_keys": sorted(explain["results"][0]["score_details"].keys()),
++        "graph_status_distinct_in_one_response": sorted(
++            {r.get("graph_status") for r in explain["results"]}
++        ),
++        "ids_identical_with_and_without_explain": [r["id"] for r in explain["results"]]
++        == [r["id"] for r in plain["results"]],
++        "score_details_absent_without_explain": "score_details" not in plain["results"][0],
++        "score_fields_sample": {
++            k: explain["results"][0]["score_details"].get(k)
++            for k in (
++                "semantic_score",
++                "bm25_score",
++                "entity_boost",
++                "graph_boost",
++                "graph_facts",
++                "max_possible_score",
++                "raw_score",
++                "final_score",
++                "threshold",
++                "decay_weight",
++                "retention",
++                "memory_strength_days",
++                "elapsed_days",
++                "access_count",
++            )
++        },
++    }
++
++    wildcard = call(
++        "/search",
++        "POST",
++        {"query": "记忆衰减 机制", "top_k": 8, "filters": {"user_id": "*"}, "explain": True},
++    )
++    scoped_graph = call(
++        "/search",
++        "POST",
++        {"query": "记忆衰减 机制", "top_k": 8, "filters": {"user_id": "xue"}, "explain": True},
++    )
++    out["search_graph_signal"] = {
++        "wildcard_scope_boosts": [r["score_details"]["graph_boost"] for r in wildcard["results"]],
++        "wildcard_scope_status": sorted({r.get("graph_status") for r in wildcard["results"]}),
++        "xue_scope_boosts": [r["score_details"]["graph_boost"] for r in scoped_graph["results"]],
++        "xue_scope_facts": [r["score_details"]["graph_facts"] for r in scoped_graph["results"]],
++    }
++
++    obs_search = call(
++        "/search",
++        "POST",
++        {
++            "query": "iris",
++            "top_k": 5,
++            "filters": {"user_id": "xue", "agent_id": "ying", "memory_kind": {"eq": "observation"}},
++            "include_observations": True,
++        },
++    )
++    obs_search_without_flag = call(
++        "/search",
++        "POST",
++        {
++            "query": "iris",
++            "top_k": 5,
++            "filters": {"user_id": "xue", "agent_id": "ying", "memory_kind": {"eq": "observation"}},
++        },
++    )
++    invalid_search = call(
++        "/search",
++        "POST",
++        {
++            "query": "看板任务 graph-memory",
++            "top_k": 5,
++            "filters": {"user_id": "xue"},
++            "include_invalidated": True,
++        },
++    )
++    out["search_flags"] = {
++        "observations_with_include_observations": len(obs_search["results"]),
++        "observations_without_flag": len(obs_search_without_flag["results"]),
++        "invalidated_with_include_invalidated": sum(
++            1 for r in invalid_search["results"] if r.get("invalid_at")
++        ),
++        "invalidated_sample_fields": [
++            {
++                "invalid_at": r.get("invalid_at"),
++                "superseded_by_present": bool(r.get("superseded_by")),
++                "invalid_reason": r.get("invalid_reason"),
++            }
++            for r in invalid_search["results"]
++            if r.get("invalid_at")
++        ],
++    }
++
++    # 4. 检索确定性：id 序稳定，分值因向量检索本身有末位抖动
++    repeat = [
++        call("/search", "POST", {"query": "记忆衰减 机制", "top_k": 5, "filters": {"user_id": "xue"}})
++        for _ in range(3)
++    ]
++    out["search_repeatability"] = {
++        "id_order_identical_across_3_calls": len({tuple(r["id"] for r in x["results"]) for x in repeat})
++        == 1,
++        "max_score_spread_at_position_0": max(x["results"][0]["score"] for x in repeat)
++        - min(x["results"][0]["score"] for x in repeat),
++    }
++
++    # 5. 图分支计数快照（进程内）
++    out["graph_stats"] = call("/graph/stats")
++    out["graph_routes_absent"] = {
++        "/graph/graphs": call("/graph/graphs").get("http_status"),
++        "/graph/bridge": call("/graph/bridge").get("http_status"),
++    }
++
++    # 6. Dream 运行审计
++    runs = call("/dream/runs?limit=5")
++    out["dream_runs"] = {
++        "total": runs.get("total"),
++        "response_keys": sorted(runs.keys()),
++        "row_keys": sorted(runs["results"][0].keys()) if runs.get("results") else [],
++        "row_sample": {
++            k: runs["results"][0].get(k)
++            for k in ("mode", "status", "scopes", "clusters", "llm_calls", "failed_clusters",
++                      "observations_written", "observations_superseded", "duration_seconds")
++        }
++        if runs.get("results")
++        else None,
++    }
++    if runs.get("results"):
++        out["dream_run_by_id_keys"] = sorted(
++            call(f"/dream/runs/{runs['results'][0]['id']}").keys()
++        )
++
++    # 7. 证据链双向（取一条观察与它的第一条源事实）
++    all_rows = page1["results"] + page2["results"]
++    observation = next((r for r in all_rows if r.get("memory_kind") == "observation"), None)
++    if observation:
++        sources = call(f"/memories/{observation['id']}/sources")
++        out["dream_evidence_chain"] = {
++            "observation_rows_shape": {},
++            "observation_detail_keys": sorted(call(f"/memories/{observation['id']}").keys()),
++            "observation_row_keys_in_admin_list": sorted(observation.keys()),
++            "observation_row_lacks_full_text": "memory" in observation,
++            "sources_response_keys": sorted(sources.keys()),
++            "sources_total": sources.get("total"),
++            "sources_missing": sources.get("missing"),
++            "source_row_keys": sorted(sources["results"][0].keys()) if sources.get("results") else [],
++            "sources_of_non_observation_status": call(
++                "/memories/" + page1["results"][0]["id"] + "/sources"
++            ).get("http_status"),
++        }
++        if sources.get("results"):
++            reverse = call(f"/memories/{sources['results'][0]['id']}/observations")
++            out["dream_evidence_chain"]["reverse_response_keys"] = sorted(reverse.keys())
++            out["dream_evidence_chain"]["reverse_row_keys"] = (
++                sorted(reverse["results"][0].keys()) if reverse.get("results") else []
++            )
++            out["dream_evidence_chain"]["reverse_finds_the_observation"] = any(
++                r.get("id") == observation["id"] for r in reverse.get("results", [])
++            )
++            out["dream_evidence_chain"]["reverse_total"] = reverse.get("total")
++
++    # 8. 配置面（三个开关的当前取值）
++    cfg = call("/configure")
++    out["config_switches"] = {
++        "decay": cfg.get("decay"),
++        "dream_enabled": (cfg.get("dream") or {}).get("enabled"),
++        "graph_enabled": (cfg.get("graph") or {}).get("enabled"),
++        "graph_timeout_seconds": (cfg.get("graph") or {}).get("timeout_seconds"),
++    }
++
++    print(json.dumps(out, ensure_ascii=False, indent=1))
++
++
++main()
+diff --git a/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.txt b/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.txt
+new file mode 100644
+index 00000000..1dd2c226
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility-evidence/probe_rest_readings.txt
+@@ -0,0 +1,365 @@
++{
++ "memories_admin_list": {
++  "total": 4043,
++  "page1_rows": 1000,
++  "page2_rows": 1000,
++  "overlap_page1_page2": 0,
++  "page1_newest": "2026-09-18T03:03:20.299533+00:00",
++  "page1_oldest": "2026-09-09T11:37:37.857852+00:00",
++  "page2_newest": "2026-09-09T11:33:24.032171+00:00",
++  "response_keys": [
++   "next_cursor",
++   "results",
++   "total"
++  ],
++  "row_keys": [
++   "access_count",
++   "agent_id",
++   "created_at",
++   "dream_run_id",
++   "evidence_count",
++   "expiration_date",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "memory_kind",
++   "metadata",
++   "observation_key",
++   "run_id",
++   "source_memory_ids",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "invalidated_rows_in_page1": 7,
++  "observation_rows_in_page1": 79,
++  "top_k_10_rows": 10
++ },
++ "memories_scoped_list": {
++  "response_keys": [
++   "results"
++  ],
++  "rows": 5,
++  "row_keys": [
++   "access_count",
++   "agent_id",
++   "created_at",
++   "dream_run_id",
++   "evidence_count",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "memory_kind",
++   "metadata",
++   "observation_key",
++   "source_memory_ids",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "kinds_in_first_5": [
++   "observation",
++   "observation",
++   "observation",
++   "observation",
++   "observation"
++  ],
++  "rows_at_top_k_1000": 1000,
++  "unknown_param_ignored": 20
++ },
++ "search_explain": {
++  "response_keys": [
++   "results"
++  ],
++  "row_keys": [
++   "access_count",
++   "agent_id",
++   "attributed_to",
++   "created_at",
++   "graph_status",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "metadata",
++   "score",
++   "score_details",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "score_details_keys": [
++   "access_count",
++   "bm25_score",
++   "decay_weight",
++   "elapsed_days",
++   "entity_boost",
++   "final_score",
++   "graph_boost",
++   "graph_facts",
++   "max_possible_score",
++   "memory_strength_days",
++   "raw_score",
++   "retention",
++   "semantic_score",
++   "threshold"
++  ],
++  "graph_status_distinct_in_one_response": [
++   "ok"
++  ],
++  "ids_identical_with_and_without_explain": true,
++  "score_details_absent_without_explain": true,
++  "score_fields_sample": {
++   "semantic_score": 0.5234017,
++   "bm25_score": 0.0,
++   "entity_boost": 0.0,
++   "graph_boost": 0.5,
++   "graph_facts": 3,
++   "max_possible_score": 1.5,
++   "raw_score": 1.0234017,
++   "final_score": 0.6822547803973704,
++   "threshold": 0.1,
++   "decay_weight": 0.9999809171667935,
++   "retention": 0.9998091716679353,
++   "memory_strength_days": 21.0,
++   "elapsed_days": 0.0040077773842592595,
++   "access_count": 3
++  }
++ },
++ "search_graph_signal": {
++  "wildcard_scope_boosts": [
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0
++  ],
++  "wildcard_scope_status": [
++   "ok"
++  ],
++  "xue_scope_boosts": [
++   0.5,
++   0.16666666666666666,
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0,
++   0.0
++  ],
++  "xue_scope_facts": [
++   3,
++   2,
++   0,
++   0,
++   0,
++   0,
++   0,
++   0
++  ]
++ },
++ "search_flags": {
++  "observations_with_include_observations": 5,
++  "observations_without_flag": 0,
++  "invalidated_with_include_invalidated": 1,
++  "invalidated_sample_fields": [
++   {
++    "invalid_at": "2026-09-17",
++    "superseded_by_present": true,
++    "invalid_reason": "superseded_by_newer_fact"
++   }
++  ]
++ },
++ "search_repeatability": {
++  "id_order_identical_across_3_calls": true,
++  "max_score_spread_at_position_0": 5.2201601589696445e-05
++ },
++ "graph_stats": {
++  "enabled": true,
++  "timeout_seconds": 1.0,
++  "circuit_open": false,
++  "consecutive_failures": 0,
++  "queue_size": 0,
++  "graph_dispatched": 11,
++  "graph_synced": 11,
++  "graph_already_synced": 0,
++  "graph_failed": 0,
++  "graph_dropped": 0
++ },
++ "graph_routes_absent": {
++  "/graph/graphs": 404,
++  "/graph/bridge": 404
++ },
++ "dream_runs": {
++  "total": 1,
++  "response_keys": [
++   "limit",
++   "offset",
++   "results",
++   "total"
++  ],
++  "row_keys": [
++   "clusters",
++   "completion_tokens",
++   "duration_seconds",
++   "failed_clusters",
++   "finished_at",
++   "id",
++   "llm_calls",
++   "mode",
++   "observations_superseded",
++   "observations_written",
++   "prompt_tokens",
++   "report_path",
++   "scopes",
++   "started_at",
++   "status"
++  ],
++  "row_sample": {
++   "mode": "live",
++   "status": "completed",
++   "scopes": 4,
++   "clusters": 104,
++   "llm_calls": 104,
++   "failed_clusters": 0,
++   "observations_written": 79,
++   "observations_superseded": 0,
++   "duration_seconds": 361.723
++  }
++ },
++ "dream_run_by_id_keys": [
++  "clusters",
++  "completion_tokens",
++  "duration_seconds",
++  "failed_clusters",
++  "finished_at",
++  "id",
++  "llm_calls",
++  "mode",
++  "observations_superseded",
++  "observations_written",
++  "prompt_tokens",
++  "report_path",
++  "scopes",
++  "started_at",
++  "status"
++ ],
++ "dream_evidence_chain": {
++  "observation_rows_shape": {},
++  "observation_detail_keys": [
++   "access_count",
++   "agent_id",
++   "created_at",
++   "dream_run_id",
++   "evidence_count",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "memory_kind",
++   "metadata",
++   "observation_key",
++   "score",
++   "source_memory_ids",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "observation_row_keys_in_admin_list": [
++   "access_count",
++   "agent_id",
++   "created_at",
++   "dream_run_id",
++   "evidence_count",
++   "expiration_date",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "memory_kind",
++   "metadata",
++   "observation_key",
++   "run_id",
++   "source_memory_ids",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "observation_row_lacks_full_text": true,
++  "sources_response_keys": [
++   "missing",
++   "observation_id",
++   "results",
++   "total"
++  ],
++  "sources_total": 4,
++  "sources_missing": 0,
++  "source_row_keys": [
++   "access_count",
++   "agent_id",
++   "attributed_to",
++   "created_at",
++   "hash",
++   "id",
++   "invalid_at",
++   "invalid_reason",
++   "last_accessed",
++   "memory",
++   "metadata",
++   "score",
++   "superseded_by",
++   "updated_at",
++   "user_id",
++   "valid_at"
++  ],
++  "sources_of_non_observation_status": 400,
++  "reverse_response_keys": [
++   "memory_id",
++   "results",
++   "total"
++  ],
++  "reverse_row_keys": [
++   "dream_run_id",
++   "evidence_count",
++   "id",
++   "memory_kind",
++   "observation_key",
++   "source_memory_ids"
++  ],
++  "reverse_finds_the_observation": true,
++  "reverse_total": 1
++ },
++ "config_switches": {
++  "decay": {
++   "enabled": true,
++   "halflife_days": 12.0,
++   "strength_step_days": 3.0,
++   "access_cap": 20,
++   "floor": 0.9,
++   "cooldown_seconds": 300
++  },
++  "dream_enabled": true,
++  "graph_enabled": true,
++  "graph_timeout_seconds": 1.0
++ }
++}
+diff --git a/docs/design/dashboard-mechanism-visibility.md b/docs/design/dashboard-mechanism-visibility.md
+new file mode 100644
+index 00000000..56f04ead
+--- /dev/null
++++ b/docs/design/dashboard-mechanism-visibility.md
+@@ -0,0 +1,635 @@
++# dashboard 机制可视化设计（mem0 自托管：bi-temporal / 衰减 / Dream / Graph 的可见面）
++
++| 项 | 值 |
++| --- | --- |
++| 目标仓库 | `/Users/xuelingkang/Documents/Containers/mem0`（`main`） |
++| 基线 commit | `737d10e0`（graph-memory 收口后），`upstream/main` = `0df3e4b8` |
++| 依赖机制 | bi-temporal 事实模型、Ebbinghaus 衰减 + 访问强化、Dream 后台整合、Graphiti 旁路图检索——四项均已实现并通过独立核验 |
++| 前置文档 | `docs/design/bitemporal-fact-model.md`、`docs/design/memory-decay.md`、`docs/design/memory-dream.md`、`docs/design/graph-memory.md` |
++| 生效面 | `server/dashboard/`（Next.js 前端）；另含两个**只读**后端端点补充 |
++| 影响面 | dashboard 新增 2 个页面、memories 页新增列与详情区、检索模式新增两个开关；`server/main.py` / `server/routers/dream.py` / `server/routers/graph.py` 各新增一个只读端点 |
++| 实现形态 | 仅本地改动（相对 `upstream/main`），不提交上游 PR |
++| 本次实测 | 见 `docs/design/dashboard-mechanism-visibility-evidence/`（6 组探针 + 原始输出） |
++
++> 本文档为本地设计文档，位于仓库 `docs/design/`，与 Mintlify 文档站（`docs/**/*.mdx`）无关，不参与 `llms.txt` 收录检查。
++
++---
++
++# 1. 项目概述
++
++## 1.1 背景
++
++四项记忆机制已全部实现并通过独立核验，但它们的作用面全部在数据里，dashboard 上一处也读不到：
++
++- 事实是否已失效、被谁取代、为什么失效（bi-temporal）；
++- 一条记忆被召回多少次、上次什么时候被召回（衰减的输入）；
++- 检索结果为什么这样排序、图分支这次答没答上来（融合与降级）；
++- Dream 什么时候跑过、产出多少观察、观察的证据链是什么；
++- 图派发了多少、成功多少、图里有几个节点几条边。
++
++前端对 `invalid_at` / `valid_at` / `decay_weight` / `retention` / `graph_boost` / `score_details` / `memory_kind` / `observation` 的引用为 **0 处**（§2.1），memories 页浏览模式只有 Content / User / Agent / Created 四列，检索模式多一列 Score。
++
++## 1.2 目标
++
++1. 四项机制在 dashboard 上**可看见**：每条机制至少有一个明确的展示位置与一条可核对的读数。
++2. 可查：从一条记忆能查到它的失效原因与后继、它的召回足迹、它派生的观察，并从观察查到它的源事实。
++3. 可验证：页面上的每个机制字段都能与后端实际返回值逐条对上（渲染不改变语义、不做二次推断）。
++4. 不破坏既有行为：既有 8 个页面的既有功能、memories 列表的游标翻页、三项特性开关的默认值全部不动。
++
++## 1.3 范围
++
++**包含**
++
++- `server/dashboard/src/`：memories 页（列表列 + 详情区 + 检索模式）、两个新增页面（Dream / Graph）、与之配套的类型定义、端点常量、API 封装。
++- `server/main.py` / `server/routers/dream.py` / `server/routers/graph.py`：**两个只读端点补充**（§6，卡片允许提出必要补充，逐条论证）。
++
++**非目标（明确不做）**
++
++- 不写记忆数据：不提供「一键实跑 Dream」（`POST /dream/run`）、不提供「按作用域删除图」（图桥 `DELETE /graph/{group_id}`）、不提供任何删除/失效/覆盖入口。本次只做可见性，不做控制面。
++- 不改写检索语义：不动打分、不动时间因子、不动图加分、不改 `decay`/`graph`/`dream` 开关。
++- 不改既有端点的对外契约：不新增 query 参数到 `GET /memories`、不改既有响应字段语义（§6.4）。
++- 不做跨全库的离线统计视图（如「全库衰减分布」）：那需要全量扫描 payload 并离线算 `decay_weight`（`memory-decay.md` §8 定其为离线脚本），不是前端能拿到的读数。
++
++---
++
++# 2. 现状清点（本次实测）
++
++## 2.1 前端零接入
++
++`server/dashboard/src/` 全目录检索下列标识的命中数为 0：
++
++| 标识 | 命中 | 标识 | 命中 |
++| --- | --- | --- | --- |
++| `invalid_at` | 0 | `valid_at` | 0 |
++| `superseded_by` | 0 | `access_count` | 0 |
++| `last_accessed` | 0 | `decay_weight` | 0 |
++| `retention` | 0 | `graph_boost` | 0 |
++| `score_details` | 0 | `graph_status` | 0 |
++| `memory_kind` | 0 | `observation` | 0 |
++| `evidence_count` | 0 | `dream` | 0 |
++
++memories 页（`app/(root)/dashboard/memories/page.tsx`）的列定义为 Content / （检索模式下）Score / User / Agent / Created；行点击打开右侧 Sheet（Content / ID / User / Agent / Created / 删除按钮）；`types/api.ts` 的 `Memory` 接口只有 7 个字段。
++
++## 2.2 后端数据面（实测，全部只读）
++
++| 端点 | 响应形状 | 与机制相关的字段 | 实测要点 |
++| --- | --- | --- | --- |
++| `GET /memories`（无作用域，管理员） | `{results, next_cursor, total}` | `valid_at` `invalid_at` `superseded_by` `invalid_reason` `access_count` `last_accessed` `memory_kind` `observation_key` `source_memory_ids` `evidence_count` `dream_run_id` | 最新优先；游标 keyset；`total` 精确（实测 4043）；单页上限 1000；**含已失效条目**（第 1 页 7 条）与观察（第 1 页 79 条） |
++| `GET /memories?user_id=&agent_id=&top_k=` | `{results}` | 同上（无 `run_id` / `expiration_date`） | **无 `next_cursor` / `total`**；`top_k` 上限 1000；按设计 §5.4.1 过滤已失效——实测 `user_id=xue` 前 1000 行 0 条已失效；`include_observations=true` 被服务端固定写入，观察照常返回（79 条） |
++| `POST /search` | `{results}` | 上述全部 + `graph_status` + `score_details` | `score_details` 仅在 `explain=true` 时出现；`graph_status` 在**同一响应内恒定**（20/20 同值）；`include_observations` 默认 false，置 true 才纳入观察；`include_invalidated=true` 返回已失效条目 |
++| `GET /graph/stats` | 扁平对象 | `enabled` `timeout_seconds` `circuit_open` `consecutive_failures` `queue_size` `graph_dispatched` `graph_synced` `graph_already_synced` `graph_failed` `graph_dropped` | **进程内累计**：新建实例后从 0 起（实测两个实例分别读到 63/51/6 与 15/15/0）；同一实例 5 秒内读数不变 |
++| `GET /dream/runs`、`GET /dream/runs/{id}` | `{total, limit, offset, results}` | `mode` `status` `started_at` `finished_at` `scopes` `clusters` `llm_calls` `failed_clusters` `observations_written` `observations_superseded` `prompt_tokens` `completion_tokens` `duration_seconds` `report_path` | dry-run **不落行**（实测预览前后 `total` 都是 1） |
++| `POST /dream/preview` | 完整报告 | `candidates[]`（`observation_key` `members` `text` `source_memory_ids` `evidence_count` `counterexample` `decision` `skip_reason` `would_write`）、`supersede_preview[]`、`would_write[]`、`errors[]`、`totals{...clusters_skipped, clusters_deferred}` | 零写入实测：前后 Qdrant 点数 4043→4043、`dream_runs` 1→1；产物只有 `history/dream-reports/<run_id>.json`，内容与响应体逐字段相等；本轮 4.2 秒（全部簇已判定 ⇒ `llm_calls=0`、`clusters_skipped=104`） |
++| `GET /memories/{id}/observations` | `{memory_id, total, results}` | 每行只有 `id` `memory_kind` `observation_key` `source_memory_ids` `evidence_count` `dream_run_id` | **无正文（`memory`）与作用域字段**——反向追溯可定位，但不足以直接渲染观察内容 |
++| `GET /memories/{id}/sources` | `{observation_id, total, missing, results}` | 每行是完整序列化记忆行（与 `GET /memories` 同口径） | 非观察 id 返回 400；`missing` 统计源事实缺失数 |
++| `GET /memories/{id}` | 完整行 | 事实与观察同口径；观察另有 `memory_kind` `observation_key` `source_memory_ids` `evidence_count` `dream_run_id` | 观察亦可直接取到全量 |
++| 图桥 `GET /stats?group_id=`、`GET /graphs` | `{group_id, episodes, entity_nodes, entity_edges}` / `{graphs: [...]}` | 图规模与图键清单 | mem0 侧**未代理**；图桥未映射宿主端口（compose 中无 `ports`）；`GET /stats` 对未知键**读即建键**（§2.4 / F-6） |
++
++## 2.3 既有设计语言资产（复用面）
++
++| 资产 | 位置 | 复用方式 |
++| --- | --- | --- |
++| `DataTable` | `components/shared/data-table.tsx` | 列定义（`key` / `label` / `width` / `render` / `align`）、`getRowKey`、`getRowClassName`、`onRowClick`；宽度按权重分配 |
++| `Sheet` | `components/ui/sheet.tsx` | 右侧详情抽屉（memories 详情既有形态） |
++| `Card` / `Badge` / `Button` / `Tooltip` / `HoverCard` / `Dialog` | `components/ui/*` | 卡片容器、状态徽章、按钮、悬浮与弹窗（`Dialog` 的既有消费者是 `delete-confirmation-modal`） |
++| `Switch` | `components/ui/switch.tsx` | 组件库已有、既有页面尚未使用（`checkbox` / `slider` 同为未使用的同族组件）；本次是它的首次使用，视觉来自同一生成套件 |
++| `EmptyState` / `TableSkeleton` | `components/self-hosted/empty-state.tsx`、`components/shared/table-skeleton.tsx` | 空态与加载态（既有约定） |
++| `useApiQuery` | `hooks/use-api-query.ts` | 取数 + 加载态 + 错误 toast |
++| `toast` / `getErrorMessage` | `components/ui/use-toast.ts`、`lib/error-message.ts` | 错误提示与 `detail` 文案提取 |
++| 统计卡排版（含图表范例） | `app/(root)/dashboard/analytics/page.tsx`（recharts） | 数字卡片的排版（`grid md:grid-cols-4` + `Card`）直接沿用；本次不新增图表依赖 |
++| 配色 token | `styles/globals.css` + `tailwind.config.ts` | `memBorder-primary`、`onSurface-default-{primary,secondary,tertiary}`、`surface-default-{primary,secondary,tertiary,fg-secondary}`、`memPurple-*` / `memGreen-*` / `memGold-*` / `memBlue-*` / `memRed-*`、`onSurface-{danger,positive}-primary` |
++| 导航 | `app/(root)/dashboard/components/main-nav.tsx` | 分组 `ACTIVITY` / `ACCOUNT` 的条目写法（title / url / icon / active） |
++
++## 2.4 关键实测发现（结论均来自本次探针）
++
++| 编号 | 发现 | 对设计的影响 |
++| --- | --- | --- |
++| F-1 | 管理面列表（无作用域）**含**已失效条目与观察，且有 `total` 与游标；作用域列表**不含**已失效条目（时间过滤）且无游标/总数 | 失效状态与观察的列表展示落在默认浏览模式（管理面路径）；作用域列表不做失效呈现 |
++| F-2 | `POST /search` 的 `graph_status` 在同一响应内恒定；`score_details` 仅在 `explain=true` 时出现；加不加 `explain` 返回的 id 序与分值口径一致（重复调用分值有 ~5e-5 的末位抖动，id 序稳定） | `graph_status` 每次检索展示**一条**汇总，不做逐行徽章；检索恒定带 `explain=true` |
++| F-3 | `include_observations` 与 `include_invalidated` 默认 false，正是「为什么我在检索里看不到观察 / 看不到已失效条目」的答案 | 检索模式落两个开关，直接对应这两个既有参数 |
++| F-4 | 全库 4043 点中：已失效 7、观察 79（`xue:ying` 74 / `xue:shi` 5，全部来自同一次 Dream 运行）、有召回足迹（`access_count` 非 0）923、`valid_at` 非空 476 | 规模小，页面无需虚拟滚动；观察清单可一次取回 |
++| F-5 | `GET /graph/stats` 的计数归当前进程实例（两个实例读到 63/51/6 与 15/15/0）；`enabled` / `timeout_seconds` / 熔断状态同响应可读 | 计数区必须标注「自本进程启动以来」，否则「重启归零」会被读成数据丢失 |
++| F-6 | 图桥 `GET /stats?group_id=<不存在的键>` **会新建一个空图键**（实测读数后 `/graphs` 从 `[default_db, mem0__]` 变为 `[default_db, mem0__, mem0_dashboard_probe_key]`）；图桥未映射宿主端口，宿主只能经 compose 网络或 `exec` 访问 | 图规模必须由 mem0 侧代理，且代理**只对清单内的键**取规模（§6.3）；探针键已在同一探针内删除并核对键集合复原 |
++| F-7 | 观察清单的两条取数路径成本：逐页拉全量再前端过滤 = 6 次请求 / 4047 行 / 4.77 MB；服务端按 `memory_kind` 索引过滤 = 1 次请求 / 79 行 / 6 毫秒（`memory_kind` keyword 索引已在 Qdrant 就绪） | 观察清单走服务端过滤（§6.2） |
++| F-8 | 反向追溯端点返回的观察行**无正文与作用域字段**，仅 6 个字段 | 观察清单不能由反向端点拼出；详情里的「派生观察」区只需定位与跳转 |
++| F-9 | 观察在最新优先序中的位置实测分布于 44–122（前 1000 行内 79 条齐全），已失效条目位置 128–527 | 列表浏览能遇到机制条目；但位置随写入量漂移 ⇒ 不能把「列表里看得见」当作清单的保证（§6.2 的论证依据） |
++| F-10 | 图键由 `user_id` 派生：`{user_id: xue, agent_id: ying}` → `mem0_xue`、`{user_id: "*"}` → `mem0__`、`{agent_id: ying}` → `mem0_ying`；现网图键为 `default_db` `mem0__` `mem0_xue`，其中 `mem0__`（前端检索模式的通配作用域）为空图 | 图规模按**图键**呈现，不造「按 agent」的伪维度；检索模式下 `graph_boost=0` 必须与图键、`graph_facts` 同屏，才能区分「图里确实没有这条」与「图没答上来」 |
++
++---
++
++# 3. 信息架构
++
++## 3.1 归属判断
++
++四项机制的作用面不同，落到不同的位置——判断依据是「该机制的读数从哪来、回答什么问题」，不是「实现代码有几个文件」。
++
++| 机制 | 展示位置 | 取舍理由 |
++| --- | --- | --- |
++| bi-temporal（有效/已失效） | **并入 memories 页**（列表列 + 详情区 + 检索模式开关） | 它是**每条记录自身的属性**，不产生独立的运行或状态面。已失效条目与有效条目同在一个集合里，脱离记录列表没有可展示的对象；新开一页只会得到一张与 memories 重复的列表。 |
++| 衰减 + 访问强化 | **并入 memories 页**（列表列 + 详情区 + 检索分项） | 同上：`access_count` / `last_accessed` 是记录属性。其**唯一**能解释的现象是「检索排序为什么降了」，而那必须与 `score_details` 同屏（检索模式），单独一页既无数据也无语境。 |
++| Dream 后台整合 | **新增页 `/dashboard/dream`** | 它有自己的**运行面**（`dream_runs` 表、运行报告）与**产物面**（观察条目 + 证据链），两者都不是「某条记忆的属性」。且观察清单只能经服务端过滤取得（§6.2），需要一个承载分页清单的页面。 |
++| Graph 旁路图检索 | **新增页 `/dashboard/graph`** | 读数来自**两个不同的存储**（mem0 进程内计数 + FalkorDB 图规模）与服务侧代理，与记录列表、与 Dream 运行都无归属关系。图规模的单位是「图键」，不是记忆，放进 memories 页无处安放。 |
++
++## 3.2 导航结构
++
++在既有两个分组之外新增一个分组，两个条目各占一页：
++
++```
++ACTIVITY   Requests / Memories / Entities / Analytics / Export        （既有，不动）
++MECHANISMS Dream / Graph                                              （新增分组）
++ACCOUNT    API Keys / Configuration / Settings                        （既有，不动）
++```
++
++- 分组名 `MECHANISMS` 与既有的大写分组标签（`ACTIVITY` / `ACCOUNT`）同形。
++- 图标沿用 `lucide-react`（已装 `0.542.0`）：Dream 用 `Sparkles`，Graph 用 `Waypoints`——与既有 `Activity` / `GalleryVerticalEnd` / `Users` / `ChartLine` / `FolderInput` 的「单色线条图标」风格一致。
++- 两个页面用**平级路由**而非一层 Tabs：两页的数据源、刷新节奏与读法互不相关（一个读 Postgres 的运行审计 + 一个写读的预览动作，一个读进程内计数 + 图规模代理），共享一条 URL 只会让「刷新这一页」的语义变得含糊。
++
++## 3.3 被否方案
++
++| 方案 | 否决理由 |
++| --- | --- |
++| 四项机制各开一页（4 个新页面） | bi-temporal 与衰减的展示对象与 memories 页**完全相同**（同一条记录），单开页会得到两张重复列表，且让用户在两处核对同一字段。 |
++| 全部并入 memories 页 | Dream 的运行面（什么时候跑、跑多久、多少簇被跳过）不是记录属性；图规模的单位是图键。硬塞进 memories 会让该页同时承担「记录浏览」与「子系统运行审计」两种读法，且既有页已经从 375 行的浏览/检索/详情/删除四件事。 |
++| 四项机制合成一页 + Tabs | Tabs 内的各页若要各自分页、各自刷新，就会在同一个路由下维护多套互不相干的取数状态；Dream 页还要承载观察清单与预览动作，塞进 tab 后「刷新」无法表达刷新的是哪一部分。 |
++| 图规模由 dashboard 服务端直连图桥 | 图桥无鉴权且未对外映射端口，dashboard 直连等于把无鉴权的内部图服务变成第二个可被前端触达的面；图桥 `GET /stats` 对未知键**读即建键**（F-6），前端试探键会制造垃圾图键；UI 还会耦合图桥的私有 API 形状。改由 mem0 侧代理（§6.3）。 |
++| 衰减单独做「全库衰减分布」图表 | 需要全量扫描 payload 并离线计算 `decay_weight`（`memory-decay.md` §8 已定为离线脚本），前端拿不到这份读数；做一个只有形状没有数据的图，比不做更坏。 |
++| 在 `GET /memories` 上新增 `memory_kind` / `validity` 过滤参数 | 该端点有两条既有语义：无作用域是「raw 全量」，有作用域是「作用域内有效事实且默认排除观察」（`memory-dream.md` §5.5）。再加参数会让「默认排除观察」这一既有口径可被翻转，语义面变宽；观察清单另开端点更窄（§6.2）。 |
++
++---
++
++# 4. 页面与组件方案
++
++## 4.1 memories 页 —— 列表
++
++**展示什么**
++
++| 列 | 内容 | 依据字段 | 备注 |
++| --- | --- | --- | --- |
++| Content | 既有 | `memory` | 不动 |
++| Score | 既有（仅检索模式） | `score` | 不动 |
++| **Status**（新增） | 「有效」/「已失效」 | `invalid_at` 为空 / 非空 | 已失效行另附「被取代」标记（`superseded_by` 非空时） |
++| **Accesses**（新增） | 召回次数（`--` 表示从未被召回） | `access_count` | 该机制在列表上的证据；详情里给完整足迹 |
++| User / Agent / Created | 既有 | `user_id` / `agent_id` / `created_at` | 不动 |
++| （行内标记） | 观察条目标一个 `observation` 徽章 | `memory_kind` | 观察已经出现在该列表里（实测第 1 页 79 条），不标识会让用户把合成信念当成用户事实 |
++
++**为什么这样取舍**
++
++- 新增列全部是 `DataTable` 的列定义追加，不改既有列的 `key` / `label` / `render`，也不动 `getRowKey` / `onRowClick` 语义 ⇒ 行点击打开详情、删除入口、游标翻页三条既有链路完全不受影响。
++- **Status 列做在默认浏览模式**，因为只有管理面列表返回已失效条目（F-1）；作用域列表本来就不返回它们，加列也不会亮。
++- **不给列表加「仅显示有效」过滤**：管理面列表是游标驱动的，客户端过滤会让「1–10 of 4043」这个既有计数失效（显示的是已加载缓冲区里的一部分），而把过滤放服务端又要动 `GET /memories` 的契约（§3.3）。需要定向查看已失效条目时走检索模式的开关（§4.3）——那是一个既有的服务端语义。
++- `Accesses` 放在列表而非只放详情：`memory-decay.md` 的作用面是**检索排序**，用户是在看到排序结果时才产生「为什么这条降了」的问题；列表上的一栏数字是最短的解释路径，详情给的是完整推导。
++
++**复用的组件**：`DataTable`（列定义）、`Card`（表格容器，既有写法 `border-memBorder-primary`）、`Badge`（`observation` 徽章，既有 `variant="outline"`）、`TableSkeleton`、`EmptyState`。新增徽章样式只用既有 token（观察用 `bg-memPurple-…`，已失效用 `onSurface-default-tertiary` 弱化，被取代用 `onSurface-danger-primary`）。
++
++## 4.2 memories 页 —— 详情（右侧 Sheet）
++
++在既有 Sheet 内按「记录属性 / 机制属性 / 关联」三段扩展，既有字段（Content / ID / User / Agent / Created / 删除）位置与行为不动。
++
++| 段 | 展示项 | 来源字段 | 呈现方式 |
++| --- | --- | --- | --- |
++| bi-temporal | 生效时刻 / 失效时刻 / 失效原因 / 被谁取代 | `valid_at` `invalid_at` `invalid_reason` `superseded_by` | 定义列表；`superseded_by` 可点击跳到被取代方（点击时按 id 取该条，沿用同一个 Sheet） |
++| 衰减足迹 | 召回次数 / 上次召回 | `access_count` `last_accessed` | 定义列表；从未召回时显示 `--` 并附一句说明（「从未被检索返回过」） |
++| 观察身份（仅观察） | 观察键 / 证据条数 / 所属运行 / 源事实数 | `observation_key` `evidence_count` `dream_run_id` `source_memory_ids` | 定义列表；`dream_run_id` 链接到 `/dashboard/dream` |
++| 派生观察（仅非观察） | 由该记忆派生的观察 | `GET /memories/{id}/observations` | 列表；每行显示观察键 + 证据条数 + 所属运行，点击时按 id 取该观察的全量并以同一个 Sheet 打开 |
++| 源事实（仅观察） | 该观察的全部源事实 | `GET /memories/{id}/sources` | 列表；`total` 与 `missing` 都显示（缺失源事实按端点口径**原样呈现为缺失数**，不做清洗） |
++
++**为什么这样取舍**
++
++- 双向追溯是既有端点的现成能力（`memory-dream.md` §5.9），详情是最自然的入口：用户从一条事实出发，能沿着「事实 → 派生观察 → 该观察的源事实」走完一个闭环，而不必先知道观察 id。
++- 「派生观察」区的行**不含正文**（F-8），因此不做就地展开，只做定位与跳转；跳转时取一次全量（实测 `GET /memories/{id}` 20–50 ms），避免为列表逐行发请求。
++- Sheet 内不做写入类操作（除既有的删除按钮）：可见性不引入新的写路径。
++
++**复用的组件**：`Sheet`（既有）、`Label` / 定义列表排版（既有详情写法）、`Button`（可点击的关联 id）、`EmptyState` 的小型变体（无派生观察时的一行文案）、`CopyButton`（id 复制，既有）。
++
++## 4.3 memories 页 —— 检索模式（机制透明）
++
++检索模式是「为什么这条排在前面」的唯一场景，机制透明固定在此处落地。
++
++**展示什么**
++
++| 展示项 | 来源字段 | 呈现方式 |
++| --- | --- | --- |
++| 图分支状态（每次检索一条汇总） | `graph_status` | 结果表上方一行状态条：`ok` / `skipped` / `timeout` / `error` / `disabled`，附生效预算 `timeout_seconds`（来自 `GET /graph/stats`）；`disabled` 与 `timeout` / `error` 文案各不相同 |
++| 分值构成（逐条，在详情 Sheet） | `score_details` | 分量表：语义 `semantic_score` / 关键词 `bm25_score` / 实体 `entity_boost` / 图 `graph_boost`（含 `graph_facts`）/ 合计 `raw_score` / 分母 `max_possible_score` / 阈值 `threshold` / 最终 `final_score`；**分母必须显示**，否则用户拿不到复算口径 |
++| 衰减分量（逐条，在详情 Sheet） | `score_details.decay_weight` `retention` `memory_strength_days` `elapsed_days` `access_count` | 同一张分量表的下半段，标注「时间因子 = 0.90 + 0.10 × 保留率，只下调」 |
++| 机制开关（两个） | 请求参数 `include_observations` / `include_invalidated` | 结果表上方的两个 `Switch`，默认关；与既有参数一一对应（F-3） |
++| 状态列与召回列 | 同 §4.1 | 检索结果沿用同一套列 |
++
++**为什么这样取舍**
++
++- `graph_status` 做成**一次检索一条汇总**而不是逐行徽章：实测同一响应内 20/20 行同值（F-2），逐行重复渲染同一状态是噪声；而它回答的问题（这次图分支答没答上来）本来就是整次检索的问题。
++- **检索恒定带 `explain=true`**：分量透明是本次必做项，做成开关会让默认视图没有分量。实测加 `explain` 前后返回的 id 序一致、分值口径一致（差异是向量检索本身的 ~5e-5 末位抖动），代价只是响应体变大。这条差异必须写进核对方式（AC-B4），避免核验时把末位抖动误判为「排序被 explain 改变」。
++- 两个开关直接对应既有参数，而不是新造过滤：`include_observations=false` 与 `include_invalidated=false` 正是默认视图看不到观察与失效条目的原因（F-3）——把它们做成开关，既是可见性，也是最省的解释。
++- 「`graph_boost=0`」不能解释成「图没命中」：只有当**候选池里没有任何条目被图事实引用**时加分才为 0，而它与「图键为空」在响应上同形——两者都表现为 `graph_boost=0` 且 `graph_status=ok`（对空图键发起检索在图桥侧同样是成功返回，机制见 `mem0/memory/graph_sync.py` 的 `search_graph_facts_with_status` 与 `_graph_hits`）。因此分量表必须同时给出 `graph_facts`（被图引用的事实条数）与**本次检索所用的图键**（口径：作用域派生，`user_id` 优先 ⇒ `mem0_<归一化值>`，与后端 `derive_group_id` 同规则），让「图里确实没有这条」与「图没答上来」在 UI 上可分。
++
++**复用的组件**：`Switch`（既有）、`Badge` / `Alert`（状态条）、`Card`（分量区容器）、Sheet 详情（与 §4.2 同一个）、`Tooltip`（口径说明）。
++
++## 4.4 Dream 页（新增 `/dashboard/dream`）
++
++**分区一：运行列表**
++
++| 列 | 字段 | 备注 |
++| --- | --- | --- |
++| 开始 / 结束 / 耗时 | `started_at` `finished_at` `duration_seconds` | 时间格式化沿用 `date-fns` 既有写法 |
++| 模式 / 状态 | `mode`（`live` / `dry_run`）/ `status`（`completed` / `failed` / `timeout` / `skipped` / `running`） | 状态用徽章 |
++| 作用域数 / 簇数 | `scopes` `clusters` | 数字右对齐（既有 `Entity` 表的 `align: "right"` 写法） |
++| 产出 / 取代 | `observations_written` `observations_superseded` | |
++| 失败簇 / LLM 调用 | `failed_clusters` `llm_calls` | 失败簇非 0 时高亮（`onSurface-danger-primary`） |
++| 报告 | `report_path` | 显示为路径文本 + 复制按钮（**不做文件下载**：报告在容器内 `/app/history/`，前端无读取通道） |
++
++分页用端点自带的 `limit` / `offset` / `total`，与既有 `Pagination` 组件配套。
++
++**分区二：观察清单**
++
++数据来自**新增的只读端点** `GET /observations`（§6.2）。列：观察内容（截断 + 悬浮展开，沿用 `TruncatedText`）、证据条数 `evidence_count`、源事实数 `len(source_memory_ids)`、所属运行 `dream_run_id`、生效时刻 `valid_at`、状态 `invalid_at`。行点击打开观察详情（复用 §4.2 的 Sheet，含源事实区）。游标翻页、`total` 计数与 memories 页同一套既有写法。
++
++**分区三：dry-run 预览入口**
++
++- 形态：一个「预览整合（dry-run）」按钮 + 确认对话框（沿用 `delete-confirmation-modal` 的 `Dialog` 形态与文案口径）；确认为必需，因为该动作会走完整四阶段并占用与实跑同一把锁。
++- 结果呈现：确认后展示报告摘要（本次候选簇数、`would_write` 条数、跳过原因分布、`clusters_skipped` / `clusters_deferred`、耗时、token 数），并明示「本轮预览**未写入任何数据**」。
++- 必须写明的语义（来自实测）：dry-run 不落 `dream_runs` 行（列表不会新增一行）、不写 Qdrant、不写状态表；它唯一产生的产物是一份报告文件。全量已判定时几秒返回（实测 4.2 秒、`llm_calls=0`）；存在待判定簇时会逐簇调用 LLM（上一轮实跑 104 簇 / 6 分钟 / 182k token），期间按钮保持禁用并显示进行中。
++- **不做「一键实跑」**：`POST /dream/run` 会真正写入观察并可能取代既有事实，属于控制面，超出可见性目标。
++
++**为什么这样取舍**
++
++- 运行列表与观察清单同页：观察是运行的产物，`dream_run_id` 是它们之间的连接字段；分两页会让「这次运行产出了什么」需要两次跳转。
++- dry-run 入口保留而非省略：这是**唯一**能在不写数据的前提下看到「整合会做什么」的通道（实测零写入），删掉它，用户对 Dream 的判读就只能依赖已落地的事实。
++
++**复用的组件**：`DataTable`、`Card` / `CardHeader` / `CardTitle`、`Badge`、`Dialog`（确认；与既有 `delete-confirmation-modal` 同一形态）、`Button`、`Tooltip`、`TruncatedText`、`table-skeleton` / `EmptyState`、数字卡片排版（analytics 页的 `grid md:grid-cols-4` 卡片）。
++
++## 4.5 Graph 页（新增 `/dashboard/graph`）
++
++**分区一：能力与派发计数**（数据来自既有 `GET /graph/stats`）
++
++| 展示项 | 字段 | 说明文案（必须出现） |
++| --- | --- | --- |
++| 能力开关 / 检索预算 | `enabled` `timeout_seconds` | 预算值用于解释「为什么这次是 timeout」 |
++| 派发 / 入图成功 / 幂等跳过 / 失败 / 丢弃 | `graph_dispatched` `graph_synced` `graph_already_synced` `graph_failed` `graph_dropped` | **标注「自本进程启动以来」**（F-5：计数是进程内累计，重启归零） |
++| 队列长度（瞬时） | `queue_size` | 标注「瞬时值」 |
++| 熔断状态 / 连续失败 | `circuit_open` `consecutive_failures` | 熔断开启时状态条高亮 |
++
++**分区二：图键与图规模**（数据来自**新增**只读端点 `GET /graph/keys`，§6.3）
++
++| 列 | 字段 |
++| --- | --- |
++| 图键 | `group_id` |
++| 记忆节点 / 实体节点 / 关系边 | `episodes` / `entity_nodes` / `entity_edges` |
++| 判定 | 三者为 0 时标「空图键」（实测 `mem0__` 即此形态，来源是检索模式的通配作用域） |
++
++页面附一句口径说明：图键由作用域派生（`user_id` 优先 ⇒ `mem0_<user_id>`），同一 `user_id` 的不同 `agent_id` **共用**一个图键——因此规模不是「按 agent」的维度（F-10）。
++
++**分区三（只读提示）**：图桥不可用时，本页显示「图桥无响应」而不是 0 计数——两者语义不同（前者是读数失败，后者是「确实没有派发」）。
++
++**复用的组件**：数字卡片排版（analytics 页）、`Card`、`DataTable`、`Badge`、`Alert`（图桥不可用）、`TableSkeleton` / `EmptyState`。
++
++---
++
++# 5. 数据来源映射表
++
++| 展示项 | 端点 | 字段 |
++| --- | --- | --- |
++| 记忆列表（内容 / 用户 / 助手 / 创建时间） | `GET /memories`（无作用域，游标分页） | `results[].memory` `user_id` `agent_id` `created_at` |
++| 列表总数与游标 | 同上 | `total` `next_cursor` |
++| 有效 / 已失效 | 同上 | `invalid_at`（空 / 非空） |
++| 失效原因 / 被谁取代 / 生效时刻 | 同上（列表列以简述呈现，详情给全值） | `invalid_reason` `superseded_by` `valid_at` |
++| 召回次数 | 同上 | `access_count` |
++| 上次召回 | 同上 | `last_accessed` |
++| 观察标记 | 同上 | `memory_kind == "observation"` |
++| 观察身份（键 / 证据数 / 所属运行） | 同上 | `observation_key` `evidence_count` `dream_run_id` |
++| 检索结果与分值 | `POST /search` | `results[].score` |
++| 分值构成（语义 / 关键词 / 实体 / 图 / 合计 / 分母 / 阈值 / 最终） | `POST /search`（`explain=true`） | `score_details.semantic_score` `bm25_score` `entity_boost` `graph_boost` `graph_facts` `raw_score` `max_possible_score` `threshold` `final_score` |
++| 衰减分量（时间因子 / 保留率 / 强度 / 经过天数 / 召回次数） | 同上 | `score_details.decay_weight` `retention` `memory_strength_days` `elapsed_days` `access_count` |
++| 图分支状态 | `POST /search`（逐条返回，同响应内恒定） | `graph_status` |
++| 被图引用的事实条数 | 同上（`explain=true`） | `score_details.graph_facts` |
++| 观察纳入 / 失效纳入 | `POST /search` 请求参数 | `include_observations` `include_invalidated` |
++| 检索结果中的观察（含观察开关） | 同上（`include_observations=true`，配 `filters.memory_kind` 可只取观察） | `results[].memory_kind` |
++| 派生观察（事实 → 观察） | `GET /memories/{id}/observations` | `results[].id` `observation_key` `evidence_count` `dream_run_id` `source_memory_ids` |
++| 源事实（观察 → 事实） | `GET /memories/{id}/sources` | `results[]`（完整记忆行）、`total` `missing` |
++| 单条记忆 / 单条观察全量 | `GET /memories/{id}` | 全字段（含上述机制字段） |
++| Dream 运行列表 | `GET /dream/runs` | `total` `results[].started_at` `finished_at` `duration_seconds` `mode` `status` `scopes` `clusters` `failed_clusters` `llm_calls` `observations_written` `observations_superseded` `prompt_tokens` `completion_tokens` `report_path` |
++| Dream 单轮统计 | `GET /dream/runs/{id}` | 同上 |
++| 观察清单 | **`GET /observations`（新增，§6.2）** | `results[]`（完整记忆行：`memory` `evidence_count` `source_memory_ids` `dream_run_id` `valid_at` `invalid_at` `created_at`）、`total` `next_cursor` |
++| 预览报告摘要 | `POST /dream/preview` | `totals.*` `would_write` `candidates[].decision` `candidates[].skip_reason` `supersede_preview` `errors` `duration_seconds` `report_path` |
++| 图能力开关与预算 | `GET /graph/stats` | `enabled` `timeout_seconds` |
++| 图派发计数 | 同上 | `graph_dispatched` `graph_synced` `graph_already_synced` `graph_failed` `graph_dropped` |
++| 队列长度 / 熔断状态 | 同上 | `queue_size` `circuit_open` `consecutive_failures` |
++| 图键清单与规模 | **`GET /graph/keys`（新增，§6.3）** | `keys[].group_id` `episodes` `entity_nodes` `entity_edges` |
++| 检索时的图键（派生口径展示） | 前端按作用域派生（与后端 `derive_group_id` 同规则：`user_id` 优先、其余字符归一为下划线、前缀 `mem0_`） | — |
++
++---
++
++# 6. 后端补充
++
++## 6.1 结论
++
++**需要补充，共 2 项，都是只读端点**：`GET /observations`（观察清单）与 `GET /graph/keys`（图键与规模）。其余全部展示项由既有端点直接提供，不需要补字段。
++
++## 6.2 补充一：`GET /observations`
++
++**契约（新增，只读）**
++
++```
++GET /observations?top_k=<默认 1000，上限沿用既有 ALL_MEMORIES_LIMIT>&cursor=<不透明游标>
++→ { "results": [ <与 GET /memories 同口径的完整记忆行> ], "next_cursor": <string|null>, "total": <int> }
++```
++
++- 排序与游标口径与 `GET /memories`（无作用域）完全一致：`created_at` 最新优先，`cursor` 取上一页最后一行的 `created_at`。
++- 观察判定沿用既有口径：`memory_kind == "observation"`（`server/routers/dream.py` 已有同一常量与同一只读遍历逻辑）。
++- 需要 `memory_kind` 的 payload 过滤；该字段的 keyword 索引已存在（实测 payload_schema）。
++
++**为何既有端点不够**
++
++1. **没有可用的清单入口**。反向追溯端点 `GET /memories/{id}/observations` 以「某条源事实」为入参，要列全量观察就得遍历 4000+ 条记忆逐个调用；且它返回的行**只有 6 个字段、没有正文**（F-8），连观察内容都渲染不出来。
++2. **靠管理面列表客户端过滤会误报空集**。`GET /memories` 能返回观察，但客户端只能在自己已加载的页里找。观察在最新优先序里的位置实测是 44–122（F-9），位置由「上次 Dream 之后又写入了多少事实」决定——写入超过 1000 条新事实后，观察就整体滑出已加载页，页面会显示「无观察」而库里仍有 79 条。这正是卡片要求避免的「不误导」。
++3. **成本差两个数量级**。走管理面列表逐页拉全量再过滤：6 次请求 / 4047 行 / 4.77 MB；走服务端按索引过滤：1 次请求 / 79 行 / 6 毫秒（F-7）。清单是会被反复打开的页面，前者不合适。
++4. **为什么不改 `GET /memories`**：见 §3.3（怕把「默认排除观察」的既有口径做成可翻转参数）。新增端点的变更面更窄，也不影响既有两条路径的语义。
++
++**代价**：多一个端点与其维护面；行口径沿用既有序列化，因此作用域字段（`user_id` / `agent_id`）一并返回，前端按需展示。
++
++## 6.3 补充二：`GET /graph/keys`
++
++**契约（新增，只读）**
++
++```
++GET /graph/keys
++→ { "keys": [ { "group_id": <string>, "episodes": <int>, "entity_nodes": <int>, "entity_edges": <int> } ], "degraded": <bool> }
++```
++
++- 图键清单取自图桥 `GET /graphs`；规模取自图桥 `GET /stats?group_id=`。
++- **硬约束（必须实现，否则本端点比不加更坏）**：代理端点**只对清单内已存在的键**取规模，绝不因读数而对未知键调用图桥 `GET /stats`——实测该调用会新建一个空图键（F-6）。该约束须写进端点注释并有一条可复跑的判定（[AC-E2]）。
++- 图桥不可用时返回 `keys: []`、`degraded: true`（与既有降级原则一致：图侧故障不外溢，不影响 mem0 的其它端点）。
++- 只读：不派发、不建键、不删键。
++
++**为何既有端点不够**
++
++1. 图规模与图键清单在图桥侧（`GET /stats?group_id=`、`GET /graphs`），**mem0 侧没有任何代理**：实测 `GET /graph/stats` 只返回十项计数与熔断状态，`GET /graph/graphs`、`GET /graph/bridge` 在 mem0 侧是 404。
++2. 图桥**未映射宿主端口**（compose 中该服务无 `ports`），宿主上的任何消费者都进不去；由 mem0 代理是唯一不破「服务拓扑」的通道。
++3. 不让 dashboard 直连图桥：图桥**无鉴权**——dashboard 直连等于把无鉴权的内部图服务暴露成一个前端可达面；且前端试探键会因「读即建键」制造垃圾图键；UI 还会耦合图桥的私有 API 形状（§3.3）。
++4. 「图规模」不可能是纯前端读数：图键清单只能来自图桥，而图桥的 `/stats` 还有上述副作用，必须由服务端做「先取清单、后取规模」的顺序约束。
++
++**代价**：mem0 侧新增一次（最多两次）对图桥的往返；图桥不可用时该段为空，页面按 `degraded` 显示「图桥无响应」。规模读数不缓存（图规模是单调上升的运维读数，缓存只会让人看到过期数字）。
++
++## 6.4 明确不需要补充的部分
++
++| 展示项 | 既有依据 |
++| --- | --- |
++| 有效/失效、失效原因、后继、生效时刻 | `GET /memories` 与 `POST /search` 已把四个字段作为一等字段返回（`bitemporal-fact-model.md` §5.4.3） |
++| 召回次数与上次召回 | 同上，`access_count` / `last_accessed` 已在顶层（`memory-decay.md` §4.1） |
++| 分值构成与图分支状态 | `POST /search` 的 `explain=true` + `graph_status` 已提供全部 14 个 `score_details` 键与五种状态 |
++| 观察纳入 / 失效纳入 | 两个既有请求参数，无需后端改动 |
++| 派生观察 / 源事实 | 两个既有端点构成双向追溯 |
++| Dream 运行审计与报告摘要 | `GET /dream/runs`、`GET /dream/runs/{id}`、`POST /dream/preview` 已提供 |
++| 图派发计数与熔断状态 | `GET /graph/stats` 已提供 |
++| 单条记忆/观察全量 | `GET /memories/{id}` 已提供（观察与事实同口径） |
++
++---
++
++# 7. 设计语言与状态规范
++
++## 7.1 组件复用清单（不新增视觉体系）
++
++新增页面与新增区块只使用 §2.3 列出的既有组件；**不引入新的 UI 库、不引入新的图表依赖**（数字卡片与既有 `Card` 排版足够，向量规模的呈现不需要图表）。表格一律走 `DataTable`（宽度按权重），详情一律走 `Sheet`，加载/空/错误三态一律走 `TableSkeleton` / `EmptyState` / `Card` + `text-onSurface-danger-primary`（既有 analytics 页写法）。
++
++## 7.2 配色 token（全部取自既有变量）
++
++| 语义 | token |
++| --- | --- |
++| 有效 / 正常 | `onSurface-positive-primary`（仅在需要强调时；默认用 `onSurface-default-secondary` 弱化） |
++| 已失效（弱化） | `onSurface-default-tertiary` |
++| 失效原因 / 被取代 | `onSurface-danger-primary`（少量） |
++| 观察身份 | `memPurple-*`（与既有 `memPurple-*` 用法同族） |
++| 图相关（状态条、图键） | `memBlue-*` |
++| 降级 / 超时 | `memGold-*` |
++| 容器与分隔 | `border-memBorder-primary`、`bg-surface-default-{primary,secondary,tertiary}` |
++
++## 7.3 空态 / 错误态 / 降级态（逐条判定）
++
++| 场景 | 期望表现 | 判定依据 |
++| --- | --- | --- |
++| 全库无观察（`total=0`） | 观察清单纯空态文案，不显示「0 条」的空表 | `GET /observations.total == 0` |
++| 无 Dream 运行记录 | 运行列表空态；预览按钮仍可用 | `GET /dream/runs.total == 0` |
++| 机制字段缺失（存量记忆无 `valid_at`） | Status 显示「有效」（只由 `invalid_at` 判定），详情里 `valid_at` 显示 `--`，不做任何推断 | 实测 `valid_at` 非空 476 / 4043 |
++| 记忆从未被召回（`access_count` 为 null） | 列显示 `--`，详情附「从未被检索返回过」 | 实测 `access_count` 非空 923 / 4043 |
++| `graph_status = disabled` | 状态条显式标注「图能力已关闭（未发起图调用）」，与 `ok`、`timeout` 区分 | `graph.status.enabled=false` 时的检索响应 |
++| `graph_status = skipped` | 标注「无作用域键或候选池为空，未发起调用」 | 设计 §6.4 |
++| `graph_status = timeout` / `error` | 各自独立文案，超时附预算值 | `score_details` 与 `GET /graph/stats.timeout_seconds` |
++| 图桥不可用 | Graph 页计数区显示读数（进程内计数仍可读）、图键区显示「图桥无响应」；**不显示 0 规模** | `GET /graph/keys.degraded == true` |
++| 衰减关闭（`decay.enabled=false`） | 分量表中不出现衰减分量（`score_details` 无这些键），且不显示「0.0」占位 | 键缺失即隐藏（既有开关语义） |
++| 图关闭（`graph.enabled=false`） | 分量表中不出现 `graph_boost` / `graph_facts`；Graph 页状态条为 `disabled` | 同上 |
++| 取数失败（5xx / 401） | 既有 toast + 错误卡片；页面不白屏 | `getErrorMessage` 既有链路 |
++| 预览被拒 | `409` 的 `detail` 原文呈现为「另一轮整合进行中」/「Dream 已关闭」两种文案（按 `status=skipped` / `disabled` 区分） | `POST /dream/preview` 的 409 语义 |
++
++## 7.4 数值格式化
++
++- 分值：3 位小数（沿用既有 `toFixed(3)`）；`decay_weight` / `retention` 3 位；`elapsed_days` / `memory_strength_days` 1 位并标单位「天」。
++- 计数：整数、千分位（`toLocaleString`，既有 analytics 用法）。
++- 时间：`date-fns` 的 `format` / `formatDistanceToNow`（既有用法）。
++- 标识：等宽字体（`font-mono`，既有 id 写法）+ `CopyButton`。
++
++---
++
++# 8. 性能与安全约束的落实
++
++| 约束 | 落实方式 |
++| --- | --- |
++| 游标翻页不被破坏 | memories 页的浏览模式：既有 `PAGE_SIZE` / `CURSOR_FETCH_LIMIT` / 缓冲区与 `next_cursor` 逻辑**一行不改**，只在列定义与 Schema 段落追加；两处新增机制数据（详情里的观察/源事实）都是**点击后**才发起，不进入列表取数路径 |
++| 新增列不影响单页负载 | 列表取数仍是 `top_k=10` 的既有请求；新增展示项全部来自同一响应里已经存在的字段（响应体不因前端改动而变大） |
++| 观察清单不分页爆炸 | 服务端过滤 + 游标分页（§6.2），单页上限沿用既有常量；实测全量观察 79 行 |
++| 图规模读数不放大副作用 | 代理端点只对清单内的键读规模（§6.3 硬约束），读数不写库、不建键 |
++| 预览动作的时长 | 按钮在请求期间禁用并显示进行中；不引入流式（响应是一次性完整报告） |
++| 不暴露敏感值 | 前端不新增任何凭据读取路径：不使用 `api_key` / `ADMIN_API_KEY` / `LLM_API_KEY` / `EMBEDDER_API_KEY` / `JWT_SECRET`；`GET /configure` 的 `[redacted]` 行为不动（既有配置页语义）。判定方式见 [AC-F4]（构建产物检索 + 浏览器网络请求逐条核对） |
++| 前端不做二次推断 | 页面上的每个机制字段直接来自响应；派生展示（如图键）用与后端同一规则的纯拼接，并在页面上标注口径 |
++
++---
++
++# 9. 边界与不变量
++
++**不变量（不得动）**
++
++1. `user_id=xue` 的记忆数据、`mem0_xue` 图键：只读。不写入、不失效、不删除、不重建。
++2. 三项特性开关保持 `true`（`decay.enabled` / `graph.enabled` / `dream.enabled`）；不新增开关、不改默认值。
++3. 既有 8 个页面（memories / analytics / export / entities / requests / configuration / settings / api-keys）的既有功能不回退：既有列、既有按钮、既有跳转、既有 toast 语义不动。
++4. 既有 REST 端点的对外契约不变（新增端点与新增响应字段除外）：不改既有字段名、不改既有字段含义、不新增必填参数。
++5. 游标翻页语义不变（键集、页大小上限、`next_cursor` 口径）。
++6. 不引入写路径：不调用 `POST /memories`、`PUT /memories/{id}`、`DELETE /memories*`、`POST /reset`、`POST /dream/run`、图桥 `DELETE /graph/{group_id}`。
++
++**允许的改动面（白名单）**
++
++- `server/dashboard/src/**`（页面、组件、类型、端点常量、API 封装、导航）。
++- `server/main.py` 或 `server/routers/dream.py`、`server/routers/graph.py`：仅新增 §6 的两个只读端点及其序列化辅助。
++- `patches/mem0-local.patch`：若后端有改动，按仓库惯例刷新。
++
++---
++
++# 10. 实测证据
++
++证据目录：`docs/design/dashboard-mechanism-visibility-evidence/`（基线 `737d10e0`，运行时为 compose 五服务，dashboard `:3000` 健康、API `:8888` 可达）。
++
++| 文件 | 内容 | 对应发现 |
++| --- | --- | --- |
++| `probe_payload_inventory.py` / `.txt` | 全库 payload 清单：有效/失效/观察/召回足迹计数、最新优先序中的位置、payload 索引 | F-1、F-4、F-9 |
++| `probe_rest_readings.py` / `.txt` | 全部读端点实测：管理面列表（游标、`total`、含失效与观察）与作用域列表（无游标、不含失效）、`/search` 的 `score_details` 全键与确定性、`include_observations` / `include_invalidated` 行为、`/graph/stats`、`/dream/runs`、双向追溯端点、三个开关取值 | F-1～F-5、F-8 |
++| `probe_dream_dryrun.py` / `.txt` | dry-run 零写入：前后 `dream_runs` 行数、Qdrant 点数、报告与响应体逐字段相等 | §4.4 预览语义 |
++| `probe_observation_cost.py` / `.txt` | 观察清单两条取数路径的成本对比（6 次 / 4.77 MB vs 1 次 / 6 ms） | F-7 |
++| `probe_graph_bridge.py` / `.txt` | 图桥 `/graphs`、`/stats`、**读即建键**副作用与清理复原 | F-6 |
++| `probe_graph_counters.py` / `.txt` | 计数器的实例归属（容器 1 号进程启动时刻 + 两次读数） | F-5、F-10 |
++
++关键读数（原文见上述文件）：
++
++- 全库 4043 点：`valid_at` 非空 476、`invalid_at` 非空 7（全部 `superseded_by_newer_fact`）、`access_count` 非 0 923、观察 79（`xue:ying` 74 / `xue:shi` 5，同一 `dream_run_id`）。
++- 管理面列表：`total=4043`、`top_k=1000` 可得 1000 行、第 1/2 页重叠 0、第 1 页含 7 条已失效与 79 条观察；`top_k=10` 返回 10 行（既有前端页大小的取数路径可用）。
++- 作用域列表 `user_id=xue&top_k=1000`：1000 行、已失效 0、观察 79；响应键只有 `results`。
++- 检索：`score_details` 14 键齐全（含 `graph_boost=0.5` / `graph_facts=3` / `max_possible_score=1.5` 的命中样本）；同一响应内 `graph_status` 唯一；三次重复调用 id 序一致、首条分值极差 5.2e-5。
++- 通配作用域（前端检索模式现状）`graph_boost` 全 0 且 `graph_status=ok`；`user_id=xue` 同一查询 `graph_boost` 出现 0.5 / 0.167。
++- 图：桥 `/graphs` = `[default_db, mem0__, mem0_xue]`；`mem0_xue` 规模 63 / 108 / 130（episodes / 实体 / 边）；对未知键读 `/stats` 后新键出现，删除后键集合复原。
++- `dream_runs`：1 行（live / completed / 104 簇 / 104 次 LLM / 79 观察 / 361.7 秒）；dry-run 前后行数与点数均不变。
++
++---
++
++# 11. 验收标准
++
++判定基线：实现卡的提交（`git log` 上的实现 commit）与其后重建的 dashboard 镜像；页面判定以浏览器实际渲染为准；接口判定以运行中的服务读数为准。**不认工作区当下状态**。
++
++## 11.1 memories 页：状态与足迹（bi-temporal + 衰减）
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-A1] | 浏览模式存在 **Status** 列，取值由 `invalid_at` 决定（空 ⇒「有效」，非空 ⇒「已失效」），且两种取值都实际渲染过 | ① 首屏 10 行逐行核对 Status 与 `GET /memories?top_k=10` 的 `invalid_at` 一一对应；② 取一条 `invalid_at` 非空的行（共 7 条，在最新优先序的位置为 128–527）核对渲染为「已失效」——可用检索模式的「含已失效」开关直达，或连续翻页至其出现 |
++| [AC-A2] | 已失效行可见其**失效原因**与**后继** | 对 [AC-A1] 中定位到的失效行，打开详情，核对 `invalid_reason` 与 `superseded_by` 与 API 原值逐字符一致（`superseded_by` 应为可点击的 id） |
++| [AC-A3] | 列表存在 **Accesses** 列，值与 `access_count` 一致；`access_count` 为 null 时显示 `--` | 取 `access_count` 非 0 与为 null 的记录各 2 条，逐条核对 |
++| [AC-A4] | 详情展示完整 bi-temporal 四字段（`valid_at` / `invalid_at` / `superseded_by` / `invalid_reason`），字段缺失时显示 `--` 而非推断值 | 分别打开一条有 `valid_at` 的记录与一条无 `valid_at` 的存量记录，核对 |
++| [AC-A5] | 详情展示召回足迹（`access_count` / `last_accessed`），从未召回时显示 `--` 且带说明文案 | 同上抽样 |
++| [AC-A6] | 观察条目在列表中带观察标记 | 列表第 1 页内的 79 条观察中抽 3 条，核对标记存在；再抽 3 条 `memory_kind` 为 null 的记录，核对无标记 |
++
++## 11.2 memories 页：检索透明
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-B1] | 一次检索在结果表上方展示**一条** `graph_status` 汇总，取值与响应逐条一致 | 同一 query 用 `POST /search`（带 `explain=true`）取响应，核对页面状态条与 `results[*].graph_status` 的唯一值一致；对同一响应断言「所有条目同值」 |
++| [AC-B2] | 五种 `graph_status` 取值在 UI 上的文案两两不同（`ok` / `skipped` / `timeout` / `error` / `disabled`） | ① 运行时证据：`ok` 为常态；`error` 以「停掉 graph-bridge 后检索」稳定触发；`timeout` 若在核验窗口内自然出现则一并取证（本设计探针期间出现过）。② 映射核对：UI 的取值→文案映射含全部五种且两两不同。③ 机制依据：`disabled` 由 `graph.enabled=false` 产出、`skipped` 由无图键或空候选池产出（见 `mem0/memory/graph_sync.py` 与 `mem0/memory/main.py` 的 `_graph_hits`）。**不要求关闭任何特性开关**；`disabled` / `skipped` 两项即以 ②③ 判定 |
++| [AC-B3] | 检索结果的详情展示 `score_details` 全部分量，且 `max_possible_score` 必现 | 取一次命中图加分的响应（`graph_boost > 0`）与一次未命中的响应，各抽 1 条，把页面数值与响应原文逐字段比对（`score_details` 的 14 个键逐个核对） |
++| [AC-B4] | 检索模式的开启 `explain` 不改变返回条目的 id 序 | 对同一 query 连续两次 `POST /search`（`explain=true`）核对 id 序一致；页面加载后的网络请求确认为带 `explain=true` 的同一 query。**分值允许末位抖动**（实测 ~5e-5），判定以 id 序为准 |
++| [AC-B5] | 检索模式提供「含观察」与「含已失效」两个开关，默认关；开启后返回集变化与端点参数语义一致 | 关—开各跑一次同一 query：`include_observations=false → true` 时结果中出现 `memory_kind=observation` 的行；`include_invalidated=false → true` 时结果中出现 `invalid_at` 非空的行（实测该开关下可稳定取到失效条目） |
++| [AC-B6] | `graph_boost = 0` 与「图没答上来」在 UI 上可区分：分值区同时给出 `graph_facts` 与本次检索的图键 | 取一次 `graph_boost=0` 但 `graph_status=ok` 的检索（通配作用域下可稳定取得，其图键为 `mem0__`），核对页面同屏出现图键与 `graph_facts`，且文案未把 0 加分表述为「图没命中」；再取一次 `graph_status=timeout` 的检索，核对两种情形文案不同 |
++
++## 11.3 Dream 页
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-C1] | 运行列表字段齐全：开始/结束/耗时、模式、状态、作用域数、簇数、产出、取代、失败簇、LLM 调用数 | 与 `GET /dream/runs` 逐行逐字段比对（以既有 1 行 live 运行为准；`dry_run` 模式不落行、实跑会写数据，故不以造行方式取证，改为以 `GET /dream/runs?limit=5` 的字段集逐列核对） |
++| [AC-C2] | 观察清单经 `GET /observations` 取数，含正文、证据条数、源事实数、所属运行、状态；`total` 与实际观察数一致 | 页面 `total` 与 Qdrant 侧 `memory_kind=observation` 的精确计数一致；抽样 3 条核对 `evidence_count` 与 `len(source_memory_ids)` |
++| [AC-C3] | 观察行可打开详情并展示**源事实**列表；源事实可再打开为一条记忆详情 | 取一条 `evidence_count >= 4` 的观察，逐条核对源事实 id 与 `GET /memories/{id}/sources` 的 `results[].id` 一致；`total` / `missing` 都显示 |
++| [AC-C4] | 一条**非观察**记忆的详情展示它派生的观察 | 取 `GET /memories/{id}/observations` 返回 `total >= 1` 的源事实，核对页面列出的观察 id 集合与端点一致 |
++| [AC-C5] | dry-run 预览入口：需二次确认；执行后展示报告摘要；**不新增 `dream_runs` 行、不改变 Qdrant 点数** | 预览前后各取 `GET /dream/runs?limit=1` 的 `total` 与 Qdrant 精确点数，断言不变；页面摘要的 `would_write` 条数与响应 `would_write` 长度一致 |
++| [AC-C6] | 无运行记录 / 无观察时页面正确显示空态，不崩、不误导 | 以 `total=0` 的空响应核对渲染分支（不构造假数据、不改开关）；结论记录实际观测 |
++| [AC-C7] | 无「一键实跑」入口 | 页面检索不存在触发 `POST /dream/run` 的交互（网络请求核对） |
++
++## 11.4 Graph 页
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-D1] | 展示 `enabled`、`timeout_seconds`、五项 `graph_*` 计数、`queue_size`、熔断状态与连续失败数 | 与 `GET /graph/stats` 逐个字段比对 |
++| [AC-D2] | 计数区标注「自本进程启动以来」 | 页面文案核对；并给出「同一实例 5 秒内读数不变、跨实例读数不同」的实测依据（`probe_graph_counters.txt`） |
++| [AC-D3] | 图键清单与每个键的规模（episodes / 实体 / 边）展示正确 | 与图桥 `GET /graphs`、`GET /stats?group_id=` 逐个键比对（含 `mem0_xue`、空键 `mem0__`） |
++| [AC-D4] | 空图键（三规模为 0）有显式标记，不被当作正常规模展示 | 对 `mem0__` 核对标记存在 |
++| [AC-D5] | 图桥不可用时不显示 0 规模，而显示读数失败 | 停掉 graph-bridge 后刷新页面（或让代理返回 `degraded: true`），核对页面文案；恢复容器后复核 |
++| [AC-D6] | 页面不展示/不触发图键删除入口 | 交互与网络请求核对 |
++
++## 11.5 后端补充端点
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-E1] | `GET /observations` 返回 `{results, next_cursor, total}`，行为与 `GET /memories` 同口径（最新优先、键集游标、页上限） | 逐页翻完全部观察：页间 id 集合无重叠、总条数等于 `total`、最后一页 `next_cursor` 为 null；与 Qdrant 精确计数一致 |
++| [AC-E2] | `GET /graph/keys` **不因读数创建图键** | 读数前后各取图桥 `GET /graphs`，断言键集合不变；再对清单外的键名断言不出现 |
++| [AC-E3] | `GET /graph/keys` 在图桥不可用时返回 `keys: []` 且 `degraded: true`，不影响其它端点 | 停桥后调用本端点与 `GET /graph/stats`、`GET /memories`，断言后者正常 |
++| [AC-E4] | 两个新端点要求鉴权（与既有端点同一依赖），未授权返回 401 | 不带凭据调用，断言 401 |
++
++## 11.6 不破坏与工程纪律
++
++| 编号 | 判定内容 | 判定方式 |
++| --- | --- | --- |
++| [AC-F1] | 既有 8 个页面逐页打开无报错、既有功能无缺失 | 在浏览器中逐页实测，列出每页的判定结论（页面清单见 §9 不变量 3） |
++| [AC-F2] | memories 列表**游标翻页**不破坏：实翻多页无重叠、无遗漏、顺序正确 | 连续翻到至少第 3 页，记录每页 id 集合，断言两两交集为空、页内 `created_at` 单调不增、（在与 API 对照时）无跳号；[AC-E1] 的翻页结论同时计入本项 |
++| [AC-F3] | 既有列（Content / Score / User / Agent / Created）的标签与取值语义不变 | 逐列核对（含检索模式 Score 列） |
++| [AC-F4] | 前端未暴露任何敏感值 | ① 对构建产物与服务端渲染输出检索 `ADMIN_API_KEY` / `JWT_SECRET` / `LLM_API_KEY` / `EMBEDDER_API_KEY` / `m0sk_` / `sk-` 等标识，结论为 0 命中；② 浏览器网络面板逐条核对页面自发请求，无凭据出现在 URL / 响应体；③ 确认前端源码不引用任何服务端密钥环境变量 |
++| [AC-F5] | TypeScript 检查零错误、构建成功 | 在 `server/dashboard/` 执行 `pnpm typecheck` 与 `pnpm build`（或 compose 构建）成功 |
++| [AC-F6] | 浏览器看到的是**重建镜像**里的新代码（非容器内手改） | `docker compose build mem0-dashboard` 后 `up -d`，核对容器镜像 ID / `CreatedAt` 晚于实现提交时间；页面出现新增页面与新增列 |
++| [AC-F7] | 三项特性开关仍为 `true`，且未被本次改动改默认 | `GET /configure` 的 `decay.enabled` / `dream.enabled` / `graph.enabled` 全为 true |
++| [AC-F8] | 未改动 `user_id=xue` 的记忆数据与 `mem0_xue` 图键 | 对比实现前后的 Qdrant 精确点数与 `mem0_xue` 规模（允许因正常运行写入而增加，须为单调上升而非下降）；核对无删除调用 |
++| [AC-F9] | 两个新增端点在 OpenAPI 文档中可见且描述准确 | 打开 `http://localhost:8888/docs`，核对两个端点的路径、参数、响应描述 |
++| [AC-F10] | 若后端有改动，`patches/mem0-local.patch` 已刷新且对 `upstream/main`（`0df3e4b8`）`git apply --check` 通过 | 按仓库惯例执行刷新与校验 |
++| [AC-F11] | 仓库工作区干净（改动已提交） | `git status --short` 为空；实现 commit 在本地 `main` 上（不推送） |
++
++## 11.7 判据的已知边界（核验时不得据此判失败）
++
++- **分值末位抖动**：同一 query 重复调用的 `score` 有 ~5e-5 抖动（向量检索自身），判定排序一律以 **id 序**为准（[AC-B4]）。
++- **机制条目在列表中的位置会漂移**：观察与失效条目的位置随写入量变化（F-9），[AC-A1]/[AC-A2] 用 API 取 id 再定位，不用固定页码。
++- **作用域列表不含失效条目**：这是后端既有读语义，不是前端缺陷（F-1）。
++- **图规模单调上升**：`mem0_xue` 的规模随正常运行增大（实测两次读数 63/108/130），只要不下降即合规。
++- **`graph_status` 的瞬态取值**：同一 query 在不同时刻可能分别读到 `ok` 与 `timeout`（实测两种取值都出现过），单次读数不作为稳定性判据。
++
++---
++
++# 12. 实现卡拆分建议
++
++四条线里 ②③④ 互不依赖、可并行；合并顺序建议 **① → ② → ③/④**。
++
++| 卡 | 内容 | 依赖 | 可并行 |
++| --- | --- | --- | --- |
++| ① 后端只读端点 | `GET /observations` + `GET /graph/keys`（§6），含刷新 `patches/mem0-local.patch` | 无 | 与 ②③ 并行 |
++| ② memories 页机制可见 | 列表新增 Status / Accesses 列与观察标记、详情段（bi-temporal / 足迹 / 双向追溯）、检索模式的 `explain` + 两个开关 + 图分支状态条 + 分量表（§4.1–4.3） | 无（只依赖既有端点）；其中「检索模式下含观察/含失效开关」不需要新端点 | 与 ①③ 并行 |
++| ③ Dream 页 | 运行列表、观察清单、dry-run 预览入口（§4.4） | **需要 ①** 的 `GET /observations` | 与 ② 并行；其观察清单部分需等 ① 合入 |
++| ④ Graph 页 | 计数区、图键与规模区、降级态（§4.5） | **需要 ①** 的 `GET /graph/keys` | 与 ③ 并行；其规模区需等 ① 合入 |
++
++- **文件冲突面**：②③④ 都会改 `types/api.ts` 与 `utils/api-endpoints.ts`（追加类型与常量），合并时按追加合并；③④ 都会改 `components/main-nav.tsx`（各加一个条目），冲突小但需人工核对分组标签只加一次。
++- **建议合并顺序**：先合 ①（它解掉 ③④ 的外部依赖，也是唯一会动后端的卡）→ 再合 ②（无外部依赖，改动面与 ③④ 的重叠最小）→ 最后合 ③ 与 ④。
++- **不建议再拆**：② 内部（列表列 / 详情 / 检索）共用同一份类型与同一个 Sheet，拆开会产生三次同文件改动；③④ 各含一个页面加一个取数封装，拆开后协调成本大于收益。
++
++---
++
++# 附录 A：术语
++
++| 术语 | 含义 |
++| --- | --- |
++| 管理面列表 | `GET /memories` 不带 `user_id` / `agent_id` / `run_id` 时的列表：raw 全量、含已失效与观察、有 `total` 与游标（要求 admin 权限） |
++| 作用域列表 | 同上带作用域参数时的列表：不含已失效条目、无游标无总数 |
++| 观察 | Dream 产出的合成信念条目（`memory_kind = "observation"`），带 `observation_key` / `source_memory_ids` / `evidence_count` / `dream_run_id` |
++| 图键 | Graphiti/FalkorDB 的图名，由作用域派生（`user_id` 优先 ⇒ `mem0_<value>`） |
++| 分量 | `score_details` 中的一个可解释输入（语义 / 关键词 / 实体 / 图 / 时间因子） |
++| 图分支状态 | `graph_status`：`ok` / `skipped` / `timeout` / `error` / `disabled` |
++
++# 附录 B：证据复跑
++
++```bash
++cd /Users/xuelingkang/Documents/Containers/mem0/server
++EV=../docs/design/dashboard-mechanism-visibility-evidence
++
++# 管理员 token（30 分钟有效）
++docker compose exec -T mem0 python -c "
++import sys; sys.path.insert(0,'/app')
++from auth import create_access_token
++print(create_access_token('<users.id>','admin'))" | tr -d '\r' > /tmp/mem0_token.txt
++
++# A. payload 清单
++docker compose cp $EV/probe_payload_inventory.py mem0:/tmp/
++docker compose exec -T mem0 python /tmp/probe_payload_inventory.py
++
++# B. REST 读面
++python3 $EV/probe_rest_readings.py
++
++# C. dry-run 零写入（会在容器内写一份报告并自行删除）
++docker compose cp $EV/probe_dream_dryrun.py mem0:/tmp/
++docker compose exec -T mem0 python /tmp/probe_dream_dryrun.py
++
++# D. 观察清单取数成本
++docker compose cp $EV/probe_observation_cost.py mem0:/tmp/
++docker compose exec -T mem0 python /tmp/probe_observation_cost.py
++
++# E. 图桥与「读即建键」（读多写一：删除的是探针键，末尾核对键集合复原）
++docker compose cp $EV/probe_graph_bridge.py graph-bridge:/tmp/
++docker compose exec -T graph-bridge python /tmp/probe_graph_bridge.py
++
++# F. 计数器归属实例
++docker compose cp $EV/probe_graph_counters.py mem0:/tmp/
++docker compose exec -T mem0 python /tmp/probe_graph_counters.py
++```
 diff --git a/docs/design/graph-memory-evidence/README.md b/docs/design/graph-memory-evidence/README.md
 new file mode 100644
 index 00000000..00eff796
@@ -8915,10 +11016,10 @@ index 39cc979e..00000000
 -  );
 -}
 diff --git a/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx b/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
-index d577de6e..4f9e2708 100644
+index d577de6e..ae2d5a8a 100644
 --- a/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
 +++ b/server/dashboard/src/app/(root)/dashboard/components/main-nav.tsx
-@@ -5,24 +5,15 @@ import Link from "next/link";
+@@ -5,24 +5,17 @@ import Link from "next/link";
  import {
    Activity,
    ChartLine,
@@ -8928,8 +11029,10 @@ index d577de6e..4f9e2708 100644
    KeyRound,
    Settings,
 -  Tags,
++  Sparkles,
    Users,
 -  WebhookIcon,
++  Waypoints,
    Wrench,
  } from "lucide-react";
  import { useSelector } from "react-redux";
@@ -8943,7 +11046,7 @@ index d577de6e..4f9e2708 100644
  import {
    Sidebar,
    SidebarContent,
-@@ -44,7 +35,6 @@ export function MainNav({
+@@ -44,7 +37,6 @@ export function MainNav({
    const isSidebarCollapsed = useSelector(
      (state: RootState) => state.layout.isSidebarCollapsed,
    );
@@ -8951,7 +11054,7 @@ index d577de6e..4f9e2708 100644
  
    return (
      <Sidebar
-@@ -81,6 +71,18 @@ export function MainNav({
+@@ -81,6 +73,18 @@ export function MainNav({
                      icon: Users,
                      active: pathname === "/dashboard/entities",
                    },
@@ -8970,24 +11073,60 @@ index d577de6e..4f9e2708 100644
                  ].map((item) => (
                    <SidebarMenuItem key={item.title}>
                      <SidebarMenuButton
-@@ -110,86 +112,6 @@ export function MainNav({
-                 <div className="h-[1px] w-full bg-memBorder-primary my-2" />
-               )}
+@@ -106,85 +110,49 @@ export function MainNav({
+                 ))}
+               </div>
  
+-              {isSidebarCollapsed && (
+-                <div className="h-[1px] w-full bg-memBorder-primary my-2" />
+-              )}
+-
 -              <Collapsible
 -                open={isCloudOpen}
 -                onOpenChange={setIsCloudOpen}
 -                className="flex flex-col gap-0"
 -              >
--                {!isSidebarCollapsed && (
++              <div className="flex flex-col gap-0">
+                 {!isSidebarCollapsed && (
 -                  <CollapsibleTrigger asChild>
 -                    <SidebarGroupLabel className="cursor-pointer mb-0">
 -                      CLOUD FEATURES
 -                      <ChevronDown
--                        className={cn(
++                  <SidebarGroupLabel className="mb-0">
++                    MECHANISMS
++                  </SidebarGroupLabel>
++                )}
++                {[
++                  {
++                    title: "Dream",
++                    url: "/dashboard/dream",
++                    icon: Sparkles,
++                    active: pathname === "/dashboard/dream",
++                  },
++                  {
++                    title: "Graph",
++                    url: "/dashboard/graph",
++                    icon: Waypoints,
++                    active: pathname === "/dashboard/graph",
++                  },
++                ].map((item) => (
++                  <SidebarMenuItem key={item.title}>
++                    <SidebarMenuButton
++                      asChild
++                      collapsed={isSidebarCollapsed}
++                      active={item.active}
++                      tooltip={isSidebarCollapsed ? item.title : undefined}
++                    >
++                      <Link
++                        href={item.url}
+                         className={cn(
 -                          "size-3 transition-transform duration-200",
 -                          isCloudOpen ? "" : "-rotate-90",
--                        )}
++                          "flex items-center w-full",
++                          isSidebarCollapsed
++                            ? "justify-center mx-auto"
++                            : "gap-1.5",
+                         )}
 -                      />
 -                    </SidebarGroupLabel>
 -                  </CollapsibleTrigger>
@@ -9021,7 +11160,7 @@ index d577de6e..4f9e2708 100644
 -                        collapsed={isSidebarCollapsed}
 -                        active={pathname === item.url}
 -                        tooltip={isSidebarCollapsed ? item.title : undefined}
--                      >
+                       >
 -                        <Link
 -                          href={item.url}
 -                          className={cn(
@@ -9049,14 +11188,16 @@ index d577de6e..4f9e2708 100644
 -                  ))}
 -                </CollapsibleContent>
 -              </Collapsible>
--
--              {isSidebarCollapsed && (
--                <div className="h-[1px] w-full bg-memBorder-primary my-2" />
--              )}
--
-               <div className="flex flex-col gap-0">
-                 {!isSidebarCollapsed && (
-                   <SidebarGroupLabel className="mb-0">
++                        <item.icon className="size-4 shrink-0" />
++                        {!isSidebarCollapsed && <span>{item.title}</span>}
++                      </Link>
++                    </SidebarMenuButton>
++                  </SidebarMenuItem>
++                ))}
++              </div>
+ 
+               {isSidebarCollapsed && (
+                 <div className="h-[1px] w-full bg-memBorder-primary my-2" />
 diff --git a/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx b/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx
 index 7429f09e..d9f5a079 100644
 --- a/server/dashboard/src/app/(root)/dashboard/configuration/page.tsx
@@ -9084,6 +11225,652 @@ index 7429f09e..d9f5a079 100644
      </div>
    );
  }
+diff --git a/server/dashboard/src/app/(root)/dashboard/dream/page.tsx b/server/dashboard/src/app/(root)/dashboard/dream/page.tsx
+new file mode 100644
+index 00000000..eace10cb
+--- /dev/null
++++ b/server/dashboard/src/app/(root)/dashboard/dream/page.tsx
+@@ -0,0 +1,640 @@
++"use client";
++
++import { useCallback, useEffect, useState } from "react";
++import { format, formatDistanceToNow } from "date-fns";
++import { RefreshCw, Sparkles, Loader2, Copy as CopyIcon } from "lucide-react";
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { DataTable } from "@/components/shared/data-table";
++import { TableSkeleton } from "@/components/shared/table-skeleton";
++import { EmptyState } from "@/components/self-hosted/empty-state";
++import { TruncatedText } from "@/components/misc/truncated-text";
++import { toast } from "@/components/ui/use-toast";
++import { getErrorMessage } from "@/lib/error-message";
++import { api } from "@/utils/api";
++import { DREAM_ENDPOINTS, OBSERVATION_ENDPOINTS } from "@/utils/api-endpoints";
++import {
++  DreamPreviewReport,
++  DreamRun,
++  DreamRunsResponse,
++  Memory,
++  ObservationListResponse,
++} from "@/types/api";
++import { formatCount, formatDate, formatTimestamp } from "@/utils/mechanism";
++import { MemoryDetailSheet } from "@/components/self-hosted/memory-detail-sheet";
++
++const RUNS_PAGE_SIZE = 10;
++const OBSERVATIONS_PAGE_SIZE = 10;
++
++const statusClass = (status: string) => {
++  switch (status) {
++    case "completed":
++      return "border-memGreen-200 bg-memGreen-50 text-onSurface-positive-primary";
++    case "failed":
++      return "border-memRed-200 bg-memRed-50 text-onSurface-danger-primary";
++    case "timeout":
++      return "border-memGold-200 bg-memGold-50 text-memGold-800";
++    default:
++      return "border-memBorder-primary bg-surface-default-tertiary text-onSurface-default-secondary";
++  }
++};
++
++/**
++ * Dream 页：运行审计 + 观察清单 + dry-run 预览。
++ *
++ * 三个分区共用一页，因为观察是运行的产物、`dream_run_id` 是它们之间的连接字段；
++ * 分两页会让「这次运行产出了什么」需要两次跳转。
++ *
++ * 本页没有任何写路径：不提供「一键实跑」（`POST /dream/run` 会真正写入观察并可能取代
++ * 既有事实，属于控制面），唯一的动作是 dry-run 预览——它零写入，唯一产物是一份报告文件。
++ */
++export default function DreamPage() {
++  const [runs, setRuns] = useState<DreamRun[]>([]);
++  const [runsTotal, setRunsTotal] = useState(0);
++  const [runsPage, setRunsPage] = useState(0);
++  const [isLoadingRuns, setIsLoadingRuns] = useState(true);
++
++  const [observations, setObservations] = useState<Memory[]>([]);
++  const [observationsTotal, setObservationsTotal] = useState<number | null>(
++    null,
++  );
++  const [observationCursor, setObservationCursor] = useState<string | null>(
++    null,
++  );
++  const [observationPage, setObservationPage] = useState(0);
++  const [isLoadingObservations, setIsLoadingObservations] = useState(true);
++  const [selectedObservation, setSelectedObservation] = useState<Memory | null>(
++    null,
++  );
++
++  const [previewOpen, setPreviewOpen] = useState(false);
++  const [isPreviewing, setIsPreviewing] = useState(false);
++  const [preview, setPreview] = useState<DreamPreviewReport | null>(null);
++
++  const runsTotalPages = Math.max(1, Math.ceil(runsTotal / RUNS_PAGE_SIZE));
++  const observationTotalPages = Math.max(
++    1,
++    Math.ceil(observations.length / OBSERVATIONS_PAGE_SIZE),
++  );
++  const paginatedObservations = observations.slice(
++    observationPage * OBSERVATIONS_PAGE_SIZE,
++    (observationPage + 1) * OBSERVATIONS_PAGE_SIZE,
++  );
++
++  const fetchRuns = useCallback(async (page: number) => {
++    setIsLoadingRuns(true);
++    try {
++      const res = await api.get<DreamRunsResponse>(DREAM_ENDPOINTS.RUNS, {
++        params: { limit: RUNS_PAGE_SIZE, offset: page * RUNS_PAGE_SIZE },
++      });
++      setRuns(res.data?.results ?? []);
++      setRunsTotal(res.data?.total ?? 0);
++    } catch (error) {
++      toast({
++        title: "Failed to load dream runs",
++        description: getErrorMessage(error),
++        variant: "destructive",
++      });
++    } finally {
++      setIsLoadingRuns(false);
++    }
++  }, []);
++
++  const fetchObservations = useCallback(
++    async (cursor: string | null, append: boolean) => {
++      setIsLoadingObservations(true);
++      try {
++        const params: Record<string, string | number> = {
++          top_k: OBSERVATIONS_PAGE_SIZE,
++        };
++        if (cursor) params.cursor = cursor;
++        const res = await api.get<ObservationListResponse>(
++          OBSERVATION_ENDPOINTS.BASE,
++          { params },
++        );
++        const rows = res.data?.results ?? [];
++        setObservationCursor(res.data?.next_cursor ?? null);
++        if (typeof res.data?.total === "number")
++          setObservationsTotal(res.data.total);
++        setObservations((prev) => (append ? [...prev, ...rows] : rows));
++      } catch (error) {
++        toast({
++          title: "Failed to load observations",
++          description: getErrorMessage(error),
++          variant: "destructive",
++        });
++      } finally {
++        setIsLoadingObservations(false);
++      }
++    },
++    [],
++  );
++
++  useEffect(() => {
++    void fetchRuns(0);
++    void fetchObservations(null, false);
++  }, [fetchRuns, fetchObservations]);
++
++  const runPreview = async () => {
++    setIsPreviewing(true);
++    try {
++      const res = await api.post<DreamPreviewReport>(
++        DREAM_ENDPOINTS.PREVIEW,
++        {},
++      );
++      setPreview(res.data ?? null);
++      toast({
++        title: "Preview complete (no data written)",
++        variant: "success",
++      });
++    } catch (error) {
++      // 409 的 detail 原文即是两种拒绝语义（另一轮整合进行中 / Dream 已关闭）。
++      toast({
++        title: "Preview rejected",
++        description: getErrorMessage(error),
++        variant: "destructive",
++      });
++      setPreviewOpen(false);
++    } finally {
++      setIsPreviewing(false);
++    }
++  };
++
++  const runsColumns = [
++    {
++      key: "started_at" as keyof DreamRun,
++      label: "Started",
++      width: 150,
++      render: (value: string | null) =>
++        value ? format(new Date(value), "MMM d, HH:mm:ss") : "--",
++    },
++    {
++      key: "finished_at" as keyof DreamRun,
++      label: "Finished",
++      width: 150,
++      render: (value: string | null) =>
++        value ? format(new Date(value), "MMM d, HH:mm:ss") : "--",
++    },
++    {
++      key: "duration_seconds" as keyof DreamRun,
++      label: "Duration",
++      width: 90,
++      align: "right" as const,
++      render: (value: number | null) =>
++        typeof value === "number" ? `${value.toFixed(1)}s` : "--",
++    },
++    {
++      key: "mode" as keyof DreamRun,
++      label: "Mode",
++      width: 80,
++      render: (value: string) => (
++        <Badge variant="outline" className="capitalize">
++          {value}
++        </Badge>
++      ),
++    },
++    {
++      key: "status" as keyof DreamRun,
++      label: "Status",
++      width: 100,
++      render: (value: string) => (
++        <span
++          className={`inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium ${statusClass(
++            value,
++          )}`}
++        >
++          {value}
++        </span>
++      ),
++    },
++    {
++      key: "scopes" as keyof DreamRun,
++      label: "Scopes",
++      width: 70,
++      align: "right" as const,
++    },
++    {
++      key: "clusters" as keyof DreamRun,
++      label: "Clusters",
++      width: 80,
++      align: "right" as const,
++    },
++    {
++      key: "observations_written" as keyof DreamRun,
++      label: "Written",
++      width: 80,
++      align: "right" as const,
++    },
++    {
++      key: "observations_superseded" as keyof DreamRun,
++      label: "Superseded",
++      width: 90,
++      align: "right" as const,
++    },
++    {
++      key: "failed_clusters" as keyof DreamRun,
++      label: "Failed",
++      width: 70,
++      align: "right" as const,
++      render: (value: number) => (
++        <span className={value > 0 ? "text-onSurface-danger-primary" : ""}>
++          {value}
++        </span>
++      ),
++    },
++    {
++      key: "llm_calls" as keyof DreamRun,
++      label: "LLM calls",
++      width: 80,
++      align: "right" as const,
++    },
++    {
++      key: "report_path" as keyof DreamRun,
++      label: "Report",
++      width: 240,
++      render: (value: string | null) =>
++        value ? (
++          <span className="flex items-center gap-2">
++            <span className="truncate font-mono text-[10px]" title={value}>
++              {value}
++            </span>
++            <button
++              type="button"
++              className="shrink-0 text-onSurface-default-tertiary hover:text-onSurface-default-secondary"
++              onClick={(event) => {
++                event.stopPropagation();
++                void navigator.clipboard?.writeText(value);
++                toast({ title: "Report path copied", variant: "success" });
++              }}
++              aria-label="Copy report path"
++            >
++              <CopyIcon className="size-3" />
++            </button>
++          </span>
++        ) : (
++          "--"
++        ),
++    },
++  ];
++
++  const observationColumns = [
++    {
++      key: "memory" as keyof Memory,
++      label: "Observation",
++      width: 420,
++      render: (value: string) => <TruncatedText text={value} limit={90} />,
++    },
++    {
++      key: "evidence_count" as keyof Memory,
++      label: "Evidence",
++      width: 80,
++      align: "right" as const,
++      render: (value: number | null | undefined) => formatCount(value),
++    },
++    {
++      key: "source_memory_ids" as keyof Memory,
++      label: "Sources",
++      width: 80,
++      align: "right" as const,
++      render: (value: string[] | null | undefined) =>
++        formatCount(value?.length),
++    },
++    {
++      key: "dream_run_id" as keyof Memory,
++      label: "Run",
++      width: 120,
++      render: (value: string | null | undefined) => (
++        <span className="truncate font-mono text-[10px]">{value ?? "--"}</span>
++      ),
++    },
++    {
++      key: "valid_at" as keyof Memory,
++      label: "Valid at",
++      width: 100,
++      render: (value: string | null | undefined) => formatDate(value),
++    },
++    {
++      key: "invalid_at" as keyof Memory,
++      label: "Status",
++      width: 100,
++      render: (value: string | null | undefined, row: Memory) => (
++        <span
++          className={
++            row.invalid_at
++              ? "text-xs text-onSurface-default-tertiary"
++              : "text-xs text-onSurface-default-secondary"
++          }
++        >
++          {row.invalid_at ? "已失效" : "有效"}
++        </span>
++      ),
++    },
++  ];
++
++  const skipReasons = (preview?.candidates ?? []).reduce<
++    Record<string, number>
++  >((acc, candidate) => {
++    if (candidate.decision === "would_write") return acc;
++    const reason = candidate.skip_reason || "unspecified";
++    acc[reason] = (acc[reason] ?? 0) + 1;
++    return acc;
++  }, {});
++
++  return (
++    <div className="space-y-6">
++      <div className="flex flex-wrap items-start justify-between gap-4">
++        <div className="space-y-1">
++          <h1 className="text-xl font-semibold font-fustat">Dream</h1>
++          <p className="text-sm text-onSurface-default-secondary">
++            Background memory consolidation: run audit, synthesized observations
++            and their evidence chains.
++          </p>
++        </div>
++        <div className="flex items-center gap-2">
++          <Button
++            variant="outline"
++            onClick={() => {
++              void fetchRuns(runsPage);
++              void fetchObservations(null, false);
++              setObservationPage(0);
++            }}
++          >
++            <RefreshCw className="size-4 mr-2" />
++            Refresh
++          </Button>
++          <Button onClick={() => setPreviewOpen(true)} disabled={isPreviewing}>
++            <Sparkles className="size-4 mr-2" />
++            预览整合（dry-run）
++          </Button>
++        </div>
++      </div>
++
++      <Card className="border-memBorder-primary">
++        <CardHeader className="pb-2">
++          <CardTitle className="text-sm">Runs</CardTitle>
++        </CardHeader>
++        <CardContent className="p-0">
++          {isLoadingRuns ? (
++            <div className="p-4">
++              <TableSkeleton rows={3} columns={6} />
++            </div>
++          ) : runs.length === 0 ? (
++            <EmptyState
++              title="No dream runs yet"
++              description="A run record appears after the first live consolidation. The dry-run preview below never adds a row."
++              image="requests"
++            />
++          ) : (
++            <>
++              <DataTable
++                data={runs}
++                columns={runsColumns}
++                getRowKey={(row) => row.id}
++              />
++              <div className="flex items-center justify-between px-4 py-3 text-sm text-onSurface-default-tertiary">
++                <span>
++                  {runsPage * RUNS_PAGE_SIZE + 1}–
++                  {Math.min((runsPage + 1) * RUNS_PAGE_SIZE, runsTotal)} of{" "}
++                  {runsTotal}
++                </span>
++                <div className="flex gap-2">
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    disabled={runsPage === 0}
++                    onClick={() => {
++                      const next = runsPage - 1;
++                      setRunsPage(next);
++                      void fetchRuns(next);
++                    }}
++                  >
++                    Previous
++                  </Button>
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    disabled={runsPage >= runsTotalPages - 1}
++                    onClick={() => {
++                      const next = runsPage + 1;
++                      setRunsPage(next);
++                      void fetchRuns(next);
++                    }}
++                  >
++                    Next
++                  </Button>
++                </div>
++              </div>
++            </>
++          )}
++        </CardContent>
++      </Card>
++
++      <Card className="border-memBorderPrimary">
++        <CardHeader className="pb-2">
++          <CardTitle className="text-sm">
++            Observations
++            {observationsTotal !== null && (
++              <span className="ml-2 text-xs font-normal text-onSurface-default-tertiary">
++                {formatCount(observationsTotal)} total
++              </span>
++            )}
++          </CardTitle>
++        </CardHeader>
++        <CardContent className="p-0">
++          {isLoadingObservations && observations.length === 0 ? (
++            <div className="p-4">
++              <TableSkeleton rows={3} columns={5} />
++            </div>
++          ) : observations.length === 0 ? (
++            <EmptyState
++              title="No observations yet"
++              description="Observations appear once a live consolidation writes synthesized beliefs."
++            />
++          ) : (
++            <>
++              <DataTable
++                data={paginatedObservations}
++                columns={observationColumns}
++                getRowKey={(row) => row.id}
++                onRowClick={(row) => setSelectedObservation(row)}
++              />
++              <div className="flex items-center justify-between px-4 py-3 text-sm text-onSurface-default-tertiary">
++                <span>
++                  {observationPage * OBSERVATIONS_PAGE_SIZE + 1}–
++                  {Math.min(
++                    (observationPage + 1) * OBSERVATIONS_PAGE_SIZE,
++                    observations.length,
++                  )}{" "}
++                  of {observationsTotal ?? `${observations.length}+`}
++                </span>
++                <div className="flex gap-2">
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    disabled={observationPage === 0}
++                    onClick={() => setObservationPage((p) => p - 1)}
++                  >
++                    Previous
++                  </Button>
++                  <Button
++                    variant="outline"
++                    size="sm"
++                    disabled={
++                      observationPage >= observationTotalPages - 1 &&
++                      !observationCursor
++                    }
++                    onClick={() => {
++                      if (observationPage < observationTotalPages - 1) {
++                        setObservationPage((p) => p + 1);
++                      } else if (observationCursor) {
++                        void fetchObservations(observationCursor, true);
++                        setObservationPage((p) => p + 1);
++                      }
++                    }}
++                  >
++                    Next
++                  </Button>
++                </div>
++              </div>
++            </>
++          )}
++        </CardContent>
++      </Card>
++
++      <MemoryDetailSheet
++        memory={selectedObservation}
++        open={!!selectedObservation}
++        onOpenChange={(open) => {
++          if (!open) setSelectedObservation(null);
++        }}
++        onSelectMemory={(row) => setSelectedObservation(row)}
++      />
++
++      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
++        <DialogContent className="sm:max-w-lg">
++          <DialogTitle>预览整合（dry-run）</DialogTitle>
++          <DialogDescription className="mb-4">
++            {`本轮会走完整四阶段判定，但不写入任何数据：不落 dream_runs 行、不写 Qdrant、不写状态表。它唯一的产物是一份报告文件，并且与实跑共用同一把锁。`}
++          </DialogDescription>
++          <div className="flex justify-end gap-2">
++            <Button variant="outline" onClick={() => setPreviewOpen(false)}>
++              Cancel
++            </Button>
++            <Button onClick={() => void runPreview()} disabled={isPreviewing}>
++              {isPreviewing && <Loader2 className="size-4 mr-2 animate-spin" />}
++              {isPreviewing ? "预览中…" : "开始预览"}
++            </Button>
++          </div>
++        </DialogContent>
++      </Dialog>
++
++      {preview && (
++        <Card className="border-memBorderPrimary">
++          <CardHeader className="pb-2">
++            <CardTitle className="text-sm">
++              预览报告
++              <span className="ml-2 text-xs font-normal text-onSurface-default-tertiary">
++                {preview.run_id}
++              </span>
++            </CardTitle>
++          </CardHeader>
++          <CardContent className="space-y-3 p-4 pt-0">
++            <p className="text-xs text-onSurface-positive-primary">
++              本轮预览未写入任何数据。
++            </p>
++            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
++              {[
++                {
++                  label: "候选簇",
++                  value: formatCount(preview.totals.clusters),
++                },
++                {
++                  label: "会写入",
++                  value: formatCount(preview.would_write?.length ?? 0),
++                },
++                {
++                  label: "跳过簇",
++                  value: formatCount(preview.totals.clusters_skipped),
++                },
++                {
++                  label: "延后簇",
++                  value: formatCount(preview.totals.clusters_deferred),
++                },
++                {
++                  label: "LLM 调用",
++                  value: formatCount(preview.totals.llm_calls),
++                },
++                {
++                  label: "失败簇",
++                  value: formatCount(preview.totals.failed_clusters),
++                },
++                {
++                  label: "耗时",
++                  value: `${preview.duration_seconds.toFixed(1)}s`,
++                },
++                {
++                  label: "tokens",
++                  value: formatCount(
++                    preview.totals.prompt_tokens +
++                      preview.totals.completion_tokens,
++                  ),
++                },
++              ].map((card) => (
++                <div
++                  key={card.label}
++                  className="rounded-md border border-memBorder-primary p-3"
++                >
++                  <p className="text-xs text-onSurface-default-tertiary">
++                    {card.label}
++                  </p>
++                  <p className="mt-1 text-lg font-semibold">{card.value}</p>
++                </div>
++              ))}
++            </div>
++            {Object.keys(skipReasons).length > 0 && (
++              <div className="space-y-1">
++                <p className="text-xs text-onSurface-default-secondary">
++                  跳过原因分布
++                </p>
++                <div className="divide-y divide-memBorder-primary rounded-md border border-memBorder-primary">
++                  {Object.entries(skipReasons).map(([reason, count]) => (
++                    <div
++                      key={reason}
++                      className="flex items-center justify-between px-3 py-1.5 text-xs"
++                    >
++                      <span className="font-mono">{reason}</span>
++                      <span>{formatCount(count)}</span>
++                    </div>
++                  ))}
++                </div>
++              </div>
++            )}
++            <p className="text-xs text-onSurface-default-tertiary">
++              完成于{" "}
++              {formatDistanceToNow(
++                new Date(preview.finished_at ?? preview.started_at),
++                {
++                  addSuffix: true,
++                },
++              )}
++              ；报告路径：
++              <span className="font-mono">{preview.report_path ?? "--"}</span>
++            </p>
++            {preview.errors.length > 0 && (
++              <p className="text-xs text-onSurface-danger-primary">
++                {preview.errors.length} 个簇判定失败（见报告）
++              </p>
++            )}
++          </CardContent>
++        </Card>
++      )}
++    </div>
++  );
++}
 diff --git a/server/dashboard/src/app/(root)/dashboard/export/page.tsx b/server/dashboard/src/app/(root)/dashboard/export/page.tsx
 index 26f8423c..5719e23a 100644
 --- a/server/dashboard/src/app/(root)/dashboard/export/page.tsx
@@ -9287,11 +12074,321 @@ index 26f8423c..5719e23a 100644
 -    />
 -  );
 -}
+diff --git a/server/dashboard/src/app/(root)/dashboard/graph/page.tsx b/server/dashboard/src/app/(root)/dashboard/graph/page.tsx
+new file mode 100644
+index 00000000..24cd81e6
+--- /dev/null
++++ b/server/dashboard/src/app/(root)/dashboard/graph/page.tsx
+@@ -0,0 +1,304 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { RefreshCw } from "lucide-react";
++import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { DataTable } from "@/components/shared/data-table";
++import { TableSkeleton } from "@/components/shared/table-skeleton";
++import { EmptyState } from "@/components/self-hosted/empty-state";
++import { toast } from "@/components/ui/use-toast";
++import { getErrorMessage } from "@/lib/error-message";
++import { api } from "@/utils/api";
++import { GRAPH_ENDPOINTS } from "@/utils/api-endpoints";
++import { GraphKeysResponse, GraphKeyScale, GraphStats } from "@/types/api";
++import { formatCount, PROCESS_COUNTER_NOTE } from "@/utils/mechanism";
++
++// 进程内计数的五个字段：派发 / 入图成功 / 幂等跳过 / 失败 / 丢弃。
++const COUNTER_FIELDS: { key: keyof GraphStats; label: string }[] = [
++  { key: "graph_dispatched", label: "派发 dispatched" },
++  { key: "graph_synced", label: "入图成功 synced" },
++  { key: "graph_already_synced", label: "幂等跳过 already_synced" },
++  { key: "graph_failed", label: "失败 failed" },
++  { key: "graph_dropped", label: "丢弃 dropped" },
++];
++
++const isEmptyGraphKey = (key: GraphKeyScale): boolean =>
++  key.episodes === 0 && key.entity_nodes === 0 && key.entity_edges === 0;
++
++/**
++ * Graph 页：图能力的派发计数与图键规模。
++ *
++ * 两个分区来自**两个不同的存储**：计数是 mem0 进程内的累计值（换进程即归零，因此必须
++ * 标注「自本进程启动以来」，否则「重启归零」会被读成数据丢失）；图键规模只能由图桥提供，
++ * 经 mem0 侧的只读代理取得（图桥无鉴权且未映射宿主端口，前端不得直连）。
++ *
++ * 本页不提供任何写入口：不删图键、不派发、不建键。
++ */
++export default function GraphPage() {
++  const [stats, setStats] = useState<GraphStats | null>(null);
++  const [isLoadingStats, setIsLoadingStats] = useState(true);
++  const [statsError, setStatsError] = useState("");
++
++  const [keys, setKeys] = useState<GraphKeyScale[]>([]);
++  const [degraded, setDegraded] = useState(false);
++  const [isLoadingKeys, setIsLoadingKeys] = useState(true);
++  const [isRefreshing, setIsRefreshing] = useState(false);
++
++  const fetchStats = async () => {
++    setIsLoadingStats(true);
++    setStatsError("");
++    try {
++      const res = await api.get<GraphStats>(GRAPH_ENDPOINTS.STATS);
++      setStats(res.data ?? null);
++    } catch (error) {
++      setStatsError(getErrorMessage(error));
++    } finally {
++      setIsLoadingStats(false);
++    }
++  };
++
++  const fetchKeys = async () => {
++    setIsLoadingKeys(true);
++    try {
++      const res = await api.get<GraphKeysResponse>(GRAPH_ENDPOINTS.KEYS);
++      setKeys(res.data?.keys ?? []);
++      setDegraded(res.data?.degraded ?? false);
++    } catch (error) {
++      // 代理端点本身失败：与「图桥不可用」同义——读数失败，而不是规模为 0。
++      setKeys([]);
++      setDegraded(true);
++      toast({
++        title: "Failed to load graph keys",
++        description: getErrorMessage(error),
++        variant: "destructive",
++      });
++    } finally {
++      setIsLoadingKeys(false);
++    }
++  };
++
++  useEffect(() => {
++    void fetchStats();
++    void fetchKeys();
++  }, []);
++
++  const refresh = async () => {
++    setIsRefreshing(true);
++    await Promise.all([fetchStats(), fetchKeys()]);
++    setIsRefreshing(false);
++  };
++
++  const keysColumns = [
++    {
++      key: "group_id" as keyof GraphKeyScale,
++      label: "Graph key",
++      width: 220,
++      render: (value: string) => (
++        <span className="font-mono text-xs">{value}</span>
++      ),
++    },
++    {
++      key: "episodes" as keyof GraphKeyScale,
++      label: "Memories (episodes)",
++      width: 140,
++      align: "right" as const,
++    },
++    {
++      key: "entity_nodes" as keyof GraphKeyScale,
++      label: "Entity nodes",
++      width: 120,
++      align: "right" as const,
++    },
++    {
++      key: "entity_edges" as keyof GraphKeyScale,
++      label: "Entity edges",
++      width: 120,
++      align: "right" as const,
++    },
++    {
++      key: "group_id" as keyof GraphKeyScale,
++      label: "判定",
++      width: 110,
++      render: (_value: string, row: GraphKeyScale) =>
++        isEmptyGraphKey(row) ? (
++          <span className="text-xs text-onSurface-default-tertiary">
++            空图键（三项规模均为 0）
++          </span>
++        ) : (
++          <span className="text-xs text-onSurface-default-secondary">
++            有规模
++          </span>
++        ),
++    },
++  ];
++
++  return (
++    <div className="space-y-6">
++      <div className="flex flex-wrap items-start justify-between gap-4">
++        <div className="space-y-1">
++          <h1 className="text-xl font-semibold font-fustat">Graph</h1>
++          <p className="text-sm text-onSurface-default-secondary">
++            Graph side-path: dispatch counters (this process) and per-graph-key
++            size.
++          </p>
++        </div>
++        <Button
++          variant="outline"
++          onClick={() => void refresh()}
++          disabled={isRefreshing}
++        >
++          <RefreshCw className="size-4 mr-2" />
++          Refresh
++        </Button>
++      </div>
++
++      {statsError && (
++        <Card className="border-memBorderPrimary">
++          <CardContent className="p-4 text-sm text-onSurface-danger-primary">
++            {statsError}
++          </CardContent>
++        </Card>
++      )}
++
++      {isLoadingStats && !stats ? (
++        <TableSkeleton rows={4} columns={4} />
++      ) : stats ? (
++        <>
++          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
++            <Card className="border-memBorderPrimary">
++              <CardContent className="p-5">
++                <p className="text-xs text-onSurface-default-tertiary">
++                  图能力 enabled
++                </p>
++                <p className="mt-1 text-2xl font-semibold">
++                  {stats.enabled ? "true" : "false"}
++                </p>
++              </CardContent>
++            </Card>
++            <Card className="border-memBorderPrimary">
++              <CardContent className="p-5">
++                <p className="text-xs text-onSurface-default-tertiary">
++                  检索预算 timeout_seconds
++                </p>
++                <p className="mt-1 text-2xl font-semibold">
++                  {stats.timeout_seconds ?? "--"}
++                </p>
++                <p className="mt-1 text-[10px] text-onSurface-default-tertiary">
++                  超出预算的图检索会被记为 timeout
++                </p>
++              </CardContent>
++            </Card>
++            <Card className="border-memBorderPrimary">
++              <CardContent className="p-5">
++                <p className="text-xs text-onSurface-default-tertiary">
++                  队列长度 queue_size（瞬时值）
++                </p>
++                <p className="mt-1 text-2xl font-semibold">
++                  {formatCount(stats.queue_size)}
++                </p>
++              </CardContent>
++            </Card>
++            <Card
++              className={
++                stats.circuit_open
++                  ? "border-memRed-200 bg-memRed-50"
++                  : "border-memBorderPrimary"
++              }
++            >
++              <CardContent className="p-5">
++                <p className="text-xs text-onSurface-default-tertiary">
++                  熔断 circuit_open / 连续失败
++                </p>
++                <p className="mt-1 text-2xl font-semibold">
++                  {stats.circuit_open ? "open" : "closed"}
++                  <span className="ml-2 text-base font-normal text-onSurface-default-secondary">
++                    {formatCount(stats.consecutive_failures)}
++                  </span>
++                </p>
++              </CardContent>
++            </Card>
++          </div>
++
++          <Card className="border-memBorderPrimary">
++            <CardHeader className="pb-2">
++              <CardTitle className="text-sm">
++                派发计数
++                <span className="ml-2 text-xs font-normal text-onSurface-default-tertiary">
++                  {PROCESS_COUNTER_NOTE}
++                </span>
++              </CardTitle>
++            </CardHeader>
++            <CardContent className="p-4 pt-0">
++              <div className="divide-y divide-memBorder-primary rounded-md border border-memBorderPrimary">
++                {COUNTER_FIELDS.map((field) => (
++                  <div
++                    key={field.key}
++                    className="flex items-center justify-between px-3 py-2 text-sm"
++                  >
++                    <span className="text-onSurface-default-secondary">
++                      {field.label}
++                    </span>
++                    <span className="font-mono">
++                      {formatCount(stats[field.key] as number)}
++                    </span>
++                  </div>
++                ))}
++              </div>
++              <p className="mt-2 text-[10px] text-onSurface-default-tertiary">
++                计数是进程内累计值：换一个进程实例即从 0
++                起（不是数据丢失，也不是全库口径）。
++              </p>
++            </CardContent>
++          </Card>
++        </>
++      ) : null}
++
++      <Card className="border-memBorderPrimary">
++        <CardHeader className="pb-2">
++          <CardTitle className="text-sm">图键与规模</CardTitle>
++        </CardHeader>
++        <CardContent className="p-0">
++          {isLoadingKeys && keys.length === 0 && !degraded ? (
++            <div className="p-4">
++              <TableSkeleton rows={3} columns={5} />
++            </div>
++          ) : degraded ? (
++            <div className="p-4">
++              <Alert
++                variant="destructive"
++                className="border-memGold-200 bg-memGold-50"
++              >
++                <AlertTitle>图桥无响应</AlertTitle>
++                <AlertDescription>
++                  规模读数失败（连线失败 / 非 2xx /
++                  单个键读失败）。这不是「规模为 0」，
++                  两者语义不同；恢复图桥后刷新即可。
++                </AlertDescription>
++              </Alert>
++            </div>
++          ) : keys.length === 0 ? (
++            <EmptyState
++              title="No graph keys"
++              description="Graph keys appear once facts are dispatched into the graph."
++            />
++          ) : (
++            <DataTable
++              data={keys}
++              columns={keysColumns}
++              getRowKey={(row) => row.group_id}
++            />
++          )}
++          <p className="px-4 pb-4 pt-2 text-[10px] text-onSurface-default-tertiary">
++            图键由作用域派生（user_id 优先 ⇒ mem0_&lt;user_id&gt;），同一
++            user_id 的不同 agent_id 共用一个图键——因此规模不是「按
++            agent」的维度。检索模式下 graph_boost = 0
++            只有在候选池里没有任何条目被图事实引用时出现，需与本次检索的图键
++            一起读。
++          </p>
++        </CardContent>
++      </Card>
++    </div>
++  );
++}
 diff --git a/server/dashboard/src/app/(root)/dashboard/memories/page.tsx b/server/dashboard/src/app/(root)/dashboard/memories/page.tsx
-index a7419ca5..435033af 100644
+index a7419ca5..6e03326d 100644
 --- a/server/dashboard/src/app/(root)/dashboard/memories/page.tsx
 +++ b/server/dashboard/src/app/(root)/dashboard/memories/page.tsx
-@@ -1,7 +1,7 @@
+@@ -1,59 +1,171 @@
  "use client";
  
 -import { useState } from "react";
@@ -9301,17 +12398,42 @@ index a7419ca5..435033af 100644
  import { format } from "date-fns";
  import { Button } from "@/components/ui/button";
  import { Input } from "@/components/ui/input";
-@@ -18,42 +18,114 @@ import {
-   SheetTitle,
-   SheetDescription,
- } from "@/components/ui/sheet";
+-import { Label } from "@/components/ui/label";
+ import { Card } from "@/components/ui/card";
++import { Switch } from "@/components/ui/switch";
+ import { DataTable } from "@/components/shared/data-table";
+ import { TableSkeleton } from "@/components/shared/table-skeleton";
+ import { EmptyState } from "@/components/self-hosted/empty-state";
+ import DeleteConfirmationModal from "@/components/ui/delete-confirmation-modal";
+-import {
+-  Sheet,
+-  SheetContent,
+-  SheetHeader,
+-  SheetTitle,
+-  SheetDescription,
+-} from "@/components/ui/sheet";
 -import { UpgradeBanner } from "@/components/self-hosted/upgrade-banner";
  import { toast } from "@/components/ui/use-toast";
  import { getErrorMessage } from "@/lib/error-message";
  import { api } from "@/utils/api";
- import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
+-import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
 -import { useApiQuery } from "@/hooks/use-api-query";
- import { Memory } from "@/types/api";
+-import { Memory } from "@/types/api";
++import { GRAPH_ENDPOINTS, MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
++import {
++  GraphStats,
++  GraphStatus,
++  Memory,
++  MemoryListResponse,
++} from "@/types/api";
++import { formatCount, formatScore, isObservation } from "@/utils/mechanism";
++import { deriveGraphKey } from "@/utils/graph-key";
++import {
++  GraphStatusBar,
++  ObservationBadge,
++  ValidityBadge,
++} from "@/components/self-hosted/mechanism-badges";
++import { MemoryDetailSheet } from "@/components/self-hosted/memory-detail-sheet";
  
 -const PAGE_SIZE = 20;
 -// Keep in sync with ALL_MEMORIES_LIMIT in server/main.py.
@@ -9320,6 +12442,8 @@ index a7419ca5..435033af 100644
 +// we keep a page buffer and append further pages as the user navigates.
 +const PAGE_SIZE = 10;
 +const CURSOR_FETCH_LIMIT = 10;
++// 检索模式的作用域：通配（管理面检索），与既有行为一致。图键即由它派生出 mem0__。
++const SEARCH_FILTERS = { user_id: "*" };
  
  export default function MemoriesPage() {
 -  const [userId, setUserId] = useState("");
@@ -9336,7 +12460,15 @@ index a7419ca5..435033af 100644
 +  const [isLoading, setIsLoading] = useState(false);
 +  const [isLoadingMore, setIsLoadingMore] = useState(false);
    const [page, setPage] = useState(0);
++  // 检索模式的机制透明：两个既有请求参数 + 图分支状态 + 生效预算。
++  const [includeObservations, setIncludeObservations] = useState(false);
++  const [includeInvalidated, setIncludeInvalidated] = useState(false);
++  const [graphStatus, setGraphStatus] = useState<GraphStatus | null>(null);
++  const [graphBudgetSeconds, setGraphBudgetSeconds] = useState<number | null>(
++    null,
++  );
    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
++  const searchGraphKey = deriveGraphKey(SEARCH_FILTERS);
  
 -  const {
 -    data: memories = [],
@@ -9359,7 +12491,9 @@ index a7419ca5..435033af 100644
 +      top_k: CURSOR_FETCH_LIMIT,
 +    };
 +    if (cursor) params.cursor = cursor;
-+    const res = await api.get(MEMORY_ENDPOINTS.BASE, { params });
++    const res = await api.get<MemoryListResponse>(MEMORY_ENDPOINTS.BASE, {
++      params,
++    });
 +    const raw = res.data?.results ?? res.data ?? [];
 +    const rows: Memory[] = Array.isArray(raw) ? raw : [];
 +    setNextCursor(res.data?.next_cursor ?? null);
@@ -9369,14 +12503,34 @@ index a7419ca5..435033af 100644
 +  };
 +
 +  // Search mode: semantic (vector) recall via POST /search over the whole collection.
-+  const fetchSearchPage = async (q: string) => {
++  // 恒定带 explain=true：分量透明是本次必做项，做成开关会让默认视图没有分量。
++  const fetchSearchPage = async (
++    q: string,
++    options?: { includeObservations?: boolean; includeInvalidated?: boolean },
++  ) => {
 +    const res = await api.post(MEMORY_ENDPOINTS.SEARCH, {
 +      query: q,
 +      top_k: 50,
-+      filters: { user_id: "*" },
++      filters: SEARCH_FILTERS,
++      explain: true,
++      include_observations: options?.includeObservations ?? includeObservations,
++      include_invalidated: options?.includeInvalidated ?? includeInvalidated,
 +    });
 +    const raw = res.data?.results ?? res.data ?? [];
-+    return (Array.isArray(raw) ? raw : []) as Memory[];
++    const rows = (Array.isArray(raw) ? raw : []) as Memory[];
++    // graph_status 在同一响应内恒定；取首条即整次检索的图分支状态。
++    setGraphStatus(rows[0]?.graph_status ?? null);
++    return rows;
++  };
++
++  // 生效的图检索预算用于解释「为什么这次是 timeout」，来自既有计数端点。
++  const fetchGraphBudget = async () => {
++    try {
++      const res = await api.get<GraphStats>(GRAPH_ENDPOINTS.STATS);
++      setGraphBudgetSeconds(res.data?.timeout_seconds ?? null);
++    } catch {
++      setGraphBudgetSeconds(null);
++    }
 +  };
 +
 +  const loadInitial = async () => {
@@ -9391,7 +12545,9 @@ index a7419ca5..435033af 100644
 +        // Search results are a one-shot ranked list — no server-side pagination.
 +        setNextCursor(null);
 +        setHasMore(false);
++        void fetchGraphBudget();
 +      } else {
++        setGraphStatus(null);
 +        setMemories(await fetchBrowsePage(null));
 +      }
 +      setPage(0);
@@ -9438,7 +12594,7 @@ index a7419ca5..435033af 100644
    const paginatedMemories = memories.slice(
      page * PAGE_SIZE,
      (page + 1) * PAGE_SIZE,
-@@ -66,7 +138,7 @@ export default function MemoriesPage() {
+@@ -66,7 +178,7 @@ export default function MemoriesPage() {
        toast({ title: "Memory deleted", variant: "success" });
        if (selectedMemory?.id === memoryToDelete.id) setSelectedMemory(null);
        setMemoryToDelete(null);
@@ -9447,8 +12603,54 @@ index a7419ca5..435033af 100644
      } catch (error) {
        toast({
          title: "Failed to delete memory",
-@@ -85,6 +157,17 @@ export default function MemoriesPage() {
-         <span className="line-clamp-2 text-sm">{value}</span>
+@@ -76,15 +188,74 @@ export default function MemoriesPage() {
+     }
+   };
+ 
++  // 开关切换即重跑同一 query：两个开关直接对应既有请求参数，不是新造过滤。
++  const toggleMechanismFilter = async (
++    key: "observations" | "invalidated",
++    next: boolean,
++  ) => {
++    const nextObservations =
++      key === "observations" ? next : includeObservations;
++    const nextInvalidated = key === "invalidated" ? next : includeInvalidated;
++    if (key === "observations") setIncludeObservations(next);
++    else setIncludeInvalidated(next);
++
++    const q = query.trim();
++    if (!q || !searchMode) return;
++    setIsLoading(true);
++    try {
++      const rows = await fetchSearchPage(q, {
++        includeObservations: nextObservations,
++        includeInvalidated: nextInvalidated,
++      });
++      setMemories(rows);
++      setPage(0);
++    } catch (error) {
++      toast({
++        title: "Failed to re-run search",
++        description: getErrorMessage(error),
++        variant: "destructive",
++      });
++    } finally {
++      setIsLoading(false);
++    }
++  };
++
+   const columns = [
+     {
+       key: "memory" as keyof Memory,
+       label: "Content",
+       width: 400,
+-      render: (value: string) => (
+-        <span className="line-clamp-2 text-sm">{value}</span>
++      render: (value: string, row: Memory) => (
++        <div className="flex items-center gap-2">
++          <span className="line-clamp-2 text-sm">{value}</span>
++          {isObservation(row) && <ObservationBadge />}
++        </div>
        ),
      },
 +    ...(searchMode
@@ -9462,10 +12664,23 @@ index a7419ca5..435033af 100644
 +          },
 +        ]
 +      : []),
++    {
++      key: "invalid_at" as keyof Memory,
++      label: "Status",
++      width: 100,
++      render: (_value: unknown, row: Memory) => <ValidityBadge memory={row} />,
++    },
++    {
++      key: "access_count" as keyof Memory,
++      label: "Accesses",
++      width: 90,
++      align: "right" as const,
++      render: (value: number | null | undefined) => formatCount(value),
++    },
      { key: "user_id" as keyof Memory, label: "User", width: 100 },
      { key: "agent_id" as keyof Memory, label: "Agent", width: 100 },
      {
-@@ -100,42 +183,47 @@ export default function MemoriesPage() {
+@@ -100,42 +271,79 @@ export default function MemoriesPage() {
      <div className="space-y-4">
        <h1 className="text-xl font-semibold font-fustat">Memories</h1>
  
@@ -9515,6 +12730,38 @@ index a7419ca5..435033af 100644
 +        )}
        </div>
  
++      {searchMode && !isLoading && (
++        <div className="space-y-2">
++          <div className="flex flex-wrap items-center gap-6">
++            <label className="flex items-center gap-2 text-xs text-onSurface-default-secondary">
++              <Switch
++                checked={includeObservations}
++                onCheckedChange={(checked) =>
++                  void toggleMechanismFilter("observations", checked)
++                }
++              />
++              含观察（include_observations）
++            </label>
++            <label className="flex items-center gap-2 text-xs text-onSurface-default-secondary">
++              <Switch
++                checked={includeInvalidated}
++                onCheckedChange={(checked) =>
++                  void toggleMechanismFilter("invalidated", checked)
++                }
++              />
++              含已失效（include_invalidated）
++            </label>
++          </div>
++          {graphStatus && (
++            <GraphStatusBar
++              status={graphStatus}
++              budgetSeconds={graphBudgetSeconds}
++              graphKey={searchGraphKey}
++            />
++          )}
++        </div>
++      )}
++
        {isLoading ? (
          <TableSkeleton rows={5} columns={4} />
        ) : memories.length === 0 ? (
@@ -9538,7 +12785,7 @@ index a7419ca5..435033af 100644
    -d '{"messages": [{"role": "user", "content": "I like hiking"}], "user_id": "alice"}'`}
            </pre>
            <a
-@@ -162,12 +250,15 @@ export default function MemoriesPage() {
+@@ -162,12 +370,15 @@ export default function MemoriesPage() {
                }
              />
            </Card>
@@ -9558,7 +12805,7 @@ index a7419ca5..435033af 100644
                </span>
                <div className="flex gap-2">
                  <Button
-@@ -181,10 +272,17 @@ export default function MemoriesPage() {
+@@ -181,10 +392,17 @@ export default function MemoriesPage() {
                  <Button
                    variant="outline"
                    size="sm"
@@ -9579,6 +12826,89 @@ index a7419ca5..435033af 100644
                  </Button>
                </div>
              </div>
+@@ -192,76 +410,16 @@ export default function MemoriesPage() {
+         </>
+       )}
+ 
+-      <Sheet
++      <MemoryDetailSheet
++        memory={selectedMemory}
+         open={!!selectedMemory}
+         onOpenChange={(open) => {
+           if (!open) setSelectedMemory(null);
+         }}
+-      >
+-        <SheetContent className="sm:max-w-md">
+-          <SheetHeader>
+-            <SheetTitle>Memory Detail</SheetTitle>
+-            <SheetDescription className="sr-only">
+-              View memory content and metadata
+-            </SheetDescription>
+-          </SheetHeader>
+-          {selectedMemory && (
+-            <div className="mt-6 space-y-4">
+-              <div className="space-y-1">
+-                <Label className="text-xs text-onSurface-default-tertiary">
+-                  Content
+-                </Label>
+-                <p className="text-sm">{selectedMemory.memory}</p>
+-              </div>
+-              <div className="grid grid-cols-2 gap-4">
+-                <div className="space-y-1">
+-                  <Label className="text-xs text-onSurface-default-tertiary">
+-                    ID
+-                  </Label>
+-                  <p className="text-xs font-mono break-all">
+-                    {selectedMemory.id}
+-                  </p>
+-                </div>
+-                {selectedMemory.user_id && (
+-                  <div className="space-y-1">
+-                    <Label className="text-xs text-onSurface-default-tertiary">
+-                      User
+-                    </Label>
+-                    <p className="text-sm">{selectedMemory.user_id}</p>
+-                  </div>
+-                )}
+-                {selectedMemory.agent_id && (
+-                  <div className="space-y-1">
+-                    <Label className="text-xs text-onSurface-default-tertiary">
+-                      Agent
+-                    </Label>
+-                    <p className="text-sm">{selectedMemory.agent_id}</p>
+-                  </div>
+-                )}
+-                {selectedMemory.created_at && (
+-                  <div className="space-y-1">
+-                    <Label className="text-xs text-onSurface-default-tertiary">
+-                      Created
+-                    </Label>
+-                    <p className="text-sm">
+-                      {new Date(selectedMemory.created_at).toLocaleString()}
+-                    </p>
+-                  </div>
+-                )}
+-              </div>
+-              <Button
+-                variant="outline"
+-                size="sm"
+-                className="text-onSurface-danger-primary"
+-                onClick={() => setMemoryToDelete(selectedMemory)}
+-              >
+-                <Trash2 className="size-3.5 mr-1" />
+-                Delete memory
+-              </Button>
+-            </div>
+-          )}
+-        </SheetContent>
+-      </Sheet>
++        onSelectMemory={(row) => setSelectedMemory(row)}
++        onDelete={(row) => setMemoryToDelete(row)}
++        graphKey={searchMode ? searchGraphKey : null}
++      />
+ 
+       <DeleteConfirmationModal
+         isOpen={!!memoryToDelete}
 diff --git a/server/dashboard/src/app/(root)/dashboard/webhooks/page.tsx b/server/dashboard/src/app/(root)/dashboard/webhooks/page.tsx
 deleted file mode 100644
 index 25ce6aa5..00000000
@@ -9707,6 +13037,687 @@ index f4e26826..00000000
 -    </div>
 -  );
 -}
+diff --git a/server/dashboard/src/components/self-hosted/mechanism-badges.tsx b/server/dashboard/src/components/self-hosted/mechanism-badges.tsx
+new file mode 100644
+index 00000000..801fed6a
+--- /dev/null
++++ b/server/dashboard/src/components/self-hosted/mechanism-badges.tsx
+@@ -0,0 +1,102 @@
++"use client";
++
++import { Badge } from "@/components/ui/badge";
++import {
++  Tooltip,
++  TooltipContent,
++  TooltipTrigger,
++} from "@/components/ui/tooltip";
++import { GraphStatus, Memory } from "@/types/api";
++import {
++  GRAPH_STATUS_TEXT,
++  GRAPH_KEY_NOTE,
++  graphStatusClass,
++  isInvalidated,
++} from "@/utils/mechanism";
++
++/**
++ * 机制状态徽章与图分支状态条。
++ *
++ * 取值一律直译自响应字段：有效/失效只看 `invalid_at`，观察只看 `memory_kind`。
++ */
++
++/** 有效 / 已失效（+ 被取代）。判定只由 `invalid_at` 决定。 */
++export function ValidityBadge({ memory }: { memory: Memory }) {
++  if (!isInvalidated(memory)) {
++    return (
++      <span className="text-xs text-onSurface-default-secondary">有效</span>
++    );
++  }
++  return (
++    <span className="inline-flex items-center gap-1">
++      <span className="text-xs font-medium text-onSurface-default-tertiary">
++        已失效
++      </span>
++      {memory.superseded_by && (
++        <span className="text-xs text-onSurface-danger-primary">被取代</span>
++      )}
++    </span>
++  );
++}
++
++/** 观察标记：Dream 合成的信念条目，不是用户事实。 */
++export function ObservationBadge() {
++  return (
++    <Tooltip>
++      <TooltipTrigger asChild>
++        <Badge
++          variant="outline"
++          className="border-memPurple-200 bg-memPurple-50 text-memPurple-800 text-[10px]"
++        >
++          observation
++        </Badge>
++      </TooltipTrigger>
++      <TooltipContent>
++        由 Dream 后台整合合成的信念条目（memory_kind = observation）
++      </TooltipContent>
++    </Tooltip>
++  );
++}
++
++/**
++ * 检索模式的图分支状态条：一次检索一条汇总。
++ *
++ * 为什么不做逐行徽章：实测同一响应内所有条目的 `graph_status` 同值，逐行重复同一状态
++ * 只是噪声；它回答的问题（这次图分支答没答上来）本来就是整次检索的问题。
++ */
++export function GraphStatusBar({
++  status,
++  budgetSeconds,
++  graphKey,
++}: {
++  status: GraphStatus;
++  budgetSeconds?: number | null;
++  graphKey?: string | null;
++}) {
++  const text =
++    status === "timeout" && typeof budgetSeconds === "number"
++      ? `${GRAPH_STATUS_TEXT.timeout}（本次预算 ${budgetSeconds}s）`
++      : GRAPH_STATUS_TEXT[status];
++
++  return (
++    <div className="flex flex-wrap items-center gap-2 rounded-md border border-memBorder-primary bg-surface-default-secondary px-3 py-2 text-xs">
++      <span className="text-onSurface-default-tertiary">图分支</span>
++      <span className={graphStatusClass(status)}>{status}</span>
++      <span className="text-onSurface-default-secondary">{text}</span>
++      <span className="text-onSurface-default-tertiary">
++        图键{" "}
++        <span className="font-mono text-onSurface-default-secondary">
++          {graphKey ?? "--"}
++        </span>
++      </span>
++      <Tooltip>
++        <TooltipTrigger asChild>
++          <span className="cursor-help text-onSurface-default-tertiary underline decoration-dotted underline-offset-2">
++            口径
++          </span>
++        </TooltipTrigger>
++        <TooltipContent className="max-w-xs">{GRAPH_KEY_NOTE}</TooltipContent>
++      </Tooltip>
++    </div>
++  );
++}
+diff --git a/server/dashboard/src/components/self-hosted/memory-detail-sheet.tsx b/server/dashboard/src/components/self-hosted/memory-detail-sheet.tsx
+new file mode 100644
+index 00000000..9efb6707
+--- /dev/null
++++ b/server/dashboard/src/components/self-hosted/memory-detail-sheet.tsx
+@@ -0,0 +1,419 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import Link from "next/link";
++import { Trash2 } from "lucide-react";
++import { Button } from "@/components/ui/button";
++import { Label } from "@/components/ui/label";
++import {
++  Sheet,
++  SheetContent,
++  SheetDescription,
++  SheetHeader,
++  SheetTitle,
++} from "@/components/ui/sheet";
++import { toast } from "@/components/ui/use-toast";
++import { getErrorMessage } from "@/lib/error-message";
++import { api } from "@/utils/api";
++import { MEMORY_ENDPOINTS } from "@/utils/api-endpoints";
++import {
++  Memory,
++  MemoryObservationsResponse,
++  MemorySourcesResponse,
++} from "@/types/api";
++import {
++  formatCount,
++  formatDate,
++  formatTimestamp,
++  isObservation,
++} from "@/utils/mechanism";
++import { ScoreBreakdown } from "@/components/self-hosted/score-breakdown";
++import { ValidityBadge } from "@/components/self-hosted/mechanism-badges";
++
++interface MemoryDetailSheetProps {
++  memory: Memory | null;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  /** 打开关联记忆（被取代方 / 派生观察 / 源事实），沿用同一个 Sheet。 */
++  onSelectMemory: (memory: Memory) => void;
++  /** 删除入口：只有 memories 页传入；不传即本 Sheet 不提供写路径。 */
++  onDelete?: (memory: Memory) => void;
++  /** 检索模式下的本次图键（口径说明与分值构成同屏）。 */
++  graphKey?: string | null;
++}
++
++/** 定义列表的一行。值为空时显示 `--`，不做任何推断。 */
++function DetailRow({
++  label,
++  value,
++}: {
++  label: string;
++  value: React.ReactNode;
++}) {
++  return (
++    <div className="flex items-start justify-between gap-3 py-1.5">
++      <span className="shrink-0 text-xs text-onSurface-default-tertiary">
++        {label}
++      </span>
++      <span className="min-w-0 break-all text-right text-xs text-onSurface-default-primary">
++        {value}
++      </span>
++    </div>
++  );
++}
++
++function Section({
++  title,
++  hint,
++  children,
++}: {
++  title: string;
++  hint?: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div className="space-y-1">
++      <p className="text-xs font-medium text-onSurface-default-secondary">
++        {title}
++      </p>
++      {hint && (
++        <p className="text-[10px] text-onSurface-default-tertiary">{hint}</p>
++      )}
++      <div className="divide-y divide-memBorder-primary rounded-md border border-memBorder-primary px-3">
++        {children}
++      </div>
++    </div>
++  );
++}
++
++/**
++ * 记忆 / 观察详情（右侧 Sheet）。
++ *
++ * 三段扩展到既有字段（Content / ID / User / Agent / Created）之后：bi-temporal、
++ * 衰减足迹、双向证据链。既有字段位置与行为不动；本组件不发起任何写请求（删除按钮由
++ * 调用方决定是否提供）。
++ *
++ * 双向追溯的两个端点都是**点击后**才发起（列表区不做逐行请求），且派生观察区只做
++ * 定位与跳转——反向端点返回的观察行没有正文（只 6 个字段），就地展开也渲染不出内容。
++ */
++export function MemoryDetailSheet({
++  memory,
++  open,
++  onOpenChange,
++  onSelectMemory,
++  onDelete,
++  graphKey,
++}: MemoryDetailSheetProps) {
++  const [observedBy, setObservedBy] = useState<Memory[]>([]);
++  const [observedTotal, setObservedTotal] = useState<number | null>(null);
++  const [sources, setSources] = useState<Memory[]>([]);
++  const [sourcesMeta, setSourcesMeta] = useState<{
++    total: number;
++    missing: number;
++  } | null>(null);
++  const [isLoadingLinks, setIsLoadingLinks] = useState(false);
++
++  const memoryId = memory?.id ?? null;
++  const observation = memory ? isObservation(memory) : false;
++
++  useEffect(() => {
++    if (!memoryId || !open) return;
++    let active = true;
++    setIsLoadingLinks(true);
++    setObservedBy([]);
++    setObservedTotal(null);
++    setSources([]);
++    setSourcesMeta(null);
++
++    (async () => {
++      try {
++        if (observation) {
++          const res = await api.get<MemorySourcesResponse>(
++            MEMORY_ENDPOINTS.SOURCES_OF(memoryId),
++          );
++          if (!active) return;
++          setSources(res.data?.results ?? []);
++          setSourcesMeta({
++            total: res.data?.total ?? 0,
++            missing: res.data?.missing ?? 0,
++          });
++        } else {
++          const res = await api.get<MemoryObservationsResponse>(
++            MEMORY_ENDPOINTS.OBSERVATIONS_OF(memoryId),
++          );
++          if (!active) return;
++          setObservedBy(res.data?.results ?? []);
++          setObservedTotal(res.data?.total ?? 0);
++        }
++      } catch (error) {
++        if (!active) return;
++        toast({
++          title: "Failed to load evidence chain",
++          description: getErrorMessage(error),
++          variant: "destructive",
++        });
++      } finally {
++        if (active) setIsLoadingLinks(false);
++      }
++    })();
++
++    return () => {
++      active = false;
++    };
++  }, [memoryId, observation, open]);
++
++  const openMemoryById = async (id: string) => {
++    try {
++      const res = await api.get<Memory>(MEMORY_ENDPOINTS.BY_ID(id));
++      if (res.data) onSelectMemory(res.data);
++    } catch (error) {
++      toast({
++        title: "Failed to open memory",
++        description: getErrorMessage(error),
++        variant: "destructive",
++      });
++    }
++  };
++
++  return (
++    <Sheet open={open} onOpenChange={onOpenChange}>
++      <SheetContent className="sm:max-w-md overflow-y-auto">
++        <SheetHeader>
++          <SheetTitle>Memory Detail</SheetTitle>
++          <SheetDescription className="sr-only">
++            View memory content, mechanism attributes and evidence chain
++          </SheetDescription>
++        </SheetHeader>
++        {memory && (
++          <div className="mt-6 space-y-4">
++            <div className="space-y-1">
++              <Label className="text-xs text-onSurface-default-tertiary">
++                Content
++              </Label>
++              <p className="text-sm">{memory.memory}</p>
++            </div>
++
++            <div className="grid grid-cols-2 gap-4">
++              <div className="space-y-1">
++                <Label className="text-xs text-onSurface-default-tertiary">
++                  ID
++                </Label>
++                <p className="text-xs font-mono break-all">{memory.id}</p>
++              </div>
++              <div className="space-y-1">
++                <Label className="text-xs text-onSurface-default-tertiary">
++                  Status
++                </Label>
++                <div>
++                  <ValidityBadge memory={memory} />
++                </div>
++              </div>
++              {memory.user_id && (
++                <div className="space-y-1">
++                  <Label className="text-xs text-onSurface-default-tertiary">
++                    User
++                  </Label>
++                  <p className="text-sm">{memory.user_id}</p>
++                </div>
++              )}
++              {memory.agent_id && (
++                <div className="space-y-1">
++                  <Label className="text-xs text-onSurface-default-tertiary">
++                    Agent
++                  </Label>
++                  <p className="text-sm">{memory.agent_id}</p>
++                </div>
++              )}
++              {memory.created_at && (
++                <div className="space-y-1">
++                  <Label className="text-xs text-onSurface-default-tertiary">
++                    Created
++                  </Label>
++                  <p className="text-sm">
++                    {new Date(memory.created_at).toLocaleString()}
++                  </p>
++                </div>
++              )}
++            </div>
++
++            <Section
++              title="bi-temporal"
++              hint="生效 / 失效四字段直译自响应；缺失即显示 --，不做推断。"
++            >
++              <DetailRow label="valid_at" value={formatDate(memory.valid_at)} />
++              <DetailRow
++                label="invalid_at"
++                value={formatDate(memory.invalid_at)}
++              />
++              <DetailRow
++                label="invalid_reason"
++                value={memory.invalid_reason ?? "--"}
++              />
++              <DetailRow
++                label="superseded_by"
++                value={
++                  memory.superseded_by ? (
++                    <Button
++                      variant="link"
++                      className="h-auto p-0 font-mono text-xs"
++                      onClick={() => void openMemoryById(memory.superseded_by!)}
++                    >
++                      {memory.superseded_by}
++                    </Button>
++                  ) : (
++                    "--"
++                  )
++                }
++              />
++            </Section>
++
++            <Section
++              title="召回足迹（衰减输入）"
++              hint="从未被检索返回过时两项均为 --。"
++            >
++              <DetailRow
++                label="access_count"
++                value={
++                  memory.access_count == null
++                    ? `${formatCount(memory.access_count)}（从未被检索返回过）`
++                    : formatCount(memory.access_count)
++                }
++              />
++              <DetailRow
++                label="last_accessed"
++                value={formatTimestamp(memory.last_accessed)}
++              />
++            </Section>
++
++            {memory.score_details && (
++              <ScoreBreakdown memory={memory} graphKey={graphKey} />
++            )}
++
++            {observation && (
++              <Section title="观察身份">
++                <DetailRow
++                  label="observation_key"
++                  value={
++                    <span className="font-mono">
++                      {memory.observation_key ?? "--"}
++                    </span>
++                  }
++                />
++                <DetailRow
++                  label="evidence_count"
++                  value={formatCount(memory.evidence_count)}
++                />
++                <DetailRow
++                  label="dream_run_id"
++                  value={
++                    memory.dream_run_id ? (
++                      <Link
++                        href="/dashboard/dream"
++                        className="font-mono text-xs underline underline-offset-4"
++                      >
++                        {memory.dream_run_id}
++                      </Link>
++                    ) : (
++                      "--"
++                    )
++                  }
++                />
++                <DetailRow
++                  label="source_memory_ids"
++                  value={formatCount(memory.source_memory_ids?.length ?? null)}
++                />
++              </Section>
++            )}
++
++            {observation ? (
++              <Section
++                title="源事实（观察 → 事实）"
++                hint={
++                  sourcesMeta
++                    ? `共 ${sourcesMeta.total} 条，缺失 ${sourcesMeta.missing} 条（缺失按端点口径原样呈现）`
++                    : undefined
++                }
++              >
++                {isLoadingLinks ? (
++                  <p className="py-2 text-xs text-onSurface-default-tertiary">
++                    Loading…
++                  </p>
++                ) : sources.length === 0 ? (
++                  <p className="py-2 text-xs text-onSurface-default-tertiary">
++                    没有可解析的源事实。
++                  </p>
++                ) : (
++                  sources.map((source) => (
++                    <button
++                      key={source.id}
++                      type="button"
++                      className="flex w-full flex-col items-start gap-0.5 py-2 text-left"
++                      onClick={() => onSelectMemory(source)}
++                    >
++                      <span className="font-mono text-[10px] text-onSurface-default-tertiary">
++                        {source.id}
++                      </span>
++                      <span className="line-clamp-2 text-xs">
++                        {source.memory}
++                      </span>
++                    </button>
++                  ))
++                )}
++              </Section>
++            ) : (
++              <Section
++                title="派生观察（事实 → 观察）"
++                hint={
++                  observedTotal !== null
++                    ? `共 ${observedTotal} 条`
++                    : "反向端点只返回观察的定位字段，点击后取全量再展开。"
++                }
++              >
++                {isLoadingLinks ? (
++                  <p className="py-2 text-xs text-onSurface-default-tertiary">
++                    Loading…
++                  </p>
++                ) : observedBy.length === 0 ? (
++                  <p className="py-2 text-xs text-onSurface-default-tertiary">
++                    这条记忆没有派生出观察。
++                  </p>
++                ) : (
++                  observedBy.map((row) => (
++                    <button
++                      key={row.id}
++                      type="button"
++                      className="flex w-full flex-col items-start gap-0.5 py-2 text-left"
++                      onClick={() => void openMemoryById(row.id)}
++                    >
++                      <span className="font-mono text-[10px] text-onSurface-default-tertiary">
++                        {row.observation_key ?? row.id}
++                      </span>
++                      <span className="text-xs">
++                        证据 {formatCount(row.evidence_count)} 条 · 运行{" "}
++                        <span className="font-mono">
++                          {row.dream_run_id ?? "--"}
++                        </span>
++                      </span>
++                    </button>
++                  ))
++                )}
++              </Section>
++            )}
++
++            {onDelete && (
++              <Button
++                variant="outline"
++                size="sm"
++                className="text-onSurface-danger-primary"
++                onClick={() => onDelete(memory)}
++              >
++                <Trash2 className="size-3.5 mr-1" />
++                Delete memory
++              </Button>
++            )}
++          </div>
++        )}
++      </SheetContent>
++    </Sheet>
++  );
++}
+diff --git a/server/dashboard/src/components/self-hosted/score-breakdown.tsx b/server/dashboard/src/components/self-hosted/score-breakdown.tsx
+new file mode 100644
+index 00000000..e49bbfea
+--- /dev/null
++++ b/server/dashboard/src/components/self-hosted/score-breakdown.tsx
+@@ -0,0 +1,142 @@
++"use client";
++
++import { Memory, ScoreDetails } from "@/types/api";
++import {
++  DECAY_NOTE,
++  formatCount,
++  formatDays,
++  formatScore,
++} from "@/utils/mechanism";
++
++/**
++ * 检索分量的逐条明细（`explain=true` 的 `score_details`）。
++ *
++ * 三条硬口径：
++ * - **分母必须显示**（`max_possible_score`）：没有它用户拿不到复算口径。
++ * - **键缺失即隐藏**：衰减分量与图分量只在对应能力开启时由后端发布，关闭态不得用
++ *   0.0 占位（那会把「没参与打分」读成「贡献为 0」）。
++ * - **图分量与图键、`graph_facts` 同屏**：`graph_boost = 0` 只在候选池里没有任何条目被
++ *   图事实引用时出现，与「图键为空」在响应上同形，必须靠这两个读数区分。
++ */
++export function ScoreBreakdown({
++  memory,
++  graphKey,
++}: {
++  memory: Memory;
++  graphKey?: string | null;
++}) {
++  const details: ScoreDetails | undefined = memory.score_details;
++  if (!details) return null;
++
++  const hasDecay = details.decay_weight !== undefined;
++  const hasGraph = details.graph_boost !== undefined;
++
++  const rows: { label: string; value: string; hint?: string }[] = [
++    {
++      label: "语义 semantic_score",
++      value: formatScore(details.semantic_score),
++    },
++    { label: "关键词 bm25_score", value: formatScore(details.bm25_score) },
++    { label: "实体 entity_boost", value: formatScore(details.entity_boost) },
++  ];
++
++  if (hasGraph) {
++    rows.push({
++      label: "图 graph_boost",
++      value: formatScore(details.graph_boost),
++      hint: `被图事实引用的事实条数 graph_facts = ${formatCount(
++        details.graph_facts,
++      )}；0 只表示候选池里没有条目被图引用`,
++    });
++  }
++
++  rows.push(
++    { label: "合计 raw_score", value: formatScore(details.raw_score) },
++    {
++      label: "分母 max_possible_score",
++      value: formatScore(details.max_possible_score),
++      hint: "四信号全开时为 3.0；只有候选池里确有图加分时才计入 0.5",
++    },
++    { label: "阈值 threshold", value: formatScore(details.threshold) },
++    { label: "最终 final_score", value: formatScore(details.final_score) },
++  );
++
++  const decayRows: { label: string; value: string }[] = hasDecay
++    ? [
++        {
++          label: "时间因子 decay_weight",
++          value: formatScore(details.decay_weight),
++        },
++        { label: "保留率 retention", value: formatScore(details.retention) },
++        {
++          label: "记忆强度 memory_strength_days",
++          value: formatDays(details.memory_strength_days),
++        },
++        { label: "经过 elapsed_days", value: formatDays(details.elapsed_days) },
++        {
++          label: "召回次数 access_count",
++          value: formatCount(details.access_count),
++        },
++      ]
++    : [];
++
++  return (
++    <div className="space-y-2">
++      <p className="text-xs text-onSurface-default-tertiary">分值构成</p>
++      <div className="divide-y divide-memBorder-primary rounded-md border border-memBorder-primary">
++        {rows.map((row) => (
++          <div
++            key={row.label}
++            className="flex items-start justify-between gap-3 px-3 py-1.5"
++          >
++            <div className="min-w-0">
++              <span className="text-xs text-onSurface-default-secondary">
++                {row.label}
++              </span>
++              {row.hint && (
++                <p className="text-[10px] text-onSurface-default-tertiary">
++                  {row.hint}
++                </p>
++              )}
++            </div>
++            <span className="shrink-0 font-mono text-xs">{row.value}</span>
++          </div>
++        ))}
++      </div>
++
++      {hasGraph && (
++        <p className="text-[10px] text-onSurface-default-tertiary">
++          本次检索所用的图键：
++          <span className="font-mono">{graphKey ?? "--"}</span>
++          。图键为空或图未命中都表现为 graph_boost = 0，需与上方 graph_status
++          一起读。
++        </p>
++      )}
++
++      {hasDecay ? (
++        <div className="space-y-1">
++          <div className="divide-y divide-memBorder-primary rounded-md border border-memBorder-primary">
++            {decayRows.map((row) => (
++              <div
++                key={row.label}
++                className="flex items-center justify-between gap-3 px-3 py-1.5"
++              >
++                <span className="text-xs text-onSurface-default-secondary">
++                  {row.label}
++                </span>
++                <span className="shrink-0 font-mono text-xs">{row.value}</span>
++              </div>
++            ))}
++          </div>
++          <p className="text-[10px] text-onSurface-default-tertiary">
++            {DECAY_NOTE}
++          </p>
++        </div>
++      ) : (
++        <p className="text-[10px] text-onSurface-default-tertiary">
++          本次打分未包含时间因子（衰减关闭时后端不发布这些分量）。
++        </p>
++      )}
++    </div>
++  );
++}
 diff --git a/server/dashboard/src/components/self-hosted/upgrade-banner.tsx b/server/dashboard/src/components/self-hosted/upgrade-banner.tsx
 deleted file mode 100644
 index a8d76343..00000000
@@ -9784,18 +13795,209 @@ index a8d76343..00000000
 -  );
 -}
 diff --git a/server/dashboard/src/types/api.ts b/server/dashboard/src/types/api.ts
-index b8cd415b..f799e367 100644
+index b8cd415b..00d58602 100644
 --- a/server/dashboard/src/types/api.ts
 +++ b/server/dashboard/src/types/api.ts
-@@ -5,6 +5,7 @@ export interface Memory {
-   agent_id?: string;
-   created_at?: string;
-   updated_at?: string;
+@@ -1,10 +1,194 @@
++/** 图分支状态：一次检索一次汇总（`graph_status`）。 */
++export type GraphStatus = "ok" | "skipped" | "timeout" | "error" | "disabled";
++
++/**
++ * `explain=true` 时的分值构成。
++ *
++ * 语义 / 关键词 / 实体三分量恒定出现；衰减分量与图分量只在对应能力开启时出现，
++ * 因此都标为可选——键缺失即「该机制未参与本次打分」，而不是 0。
++ */
++export interface ScoreDetails {
++  semantic_score: number;
++  bm25_score: number;
++  entity_boost: number;
++  raw_score: number;
++  /** 分母：四信号全开时为 3.0。没有它就复算不出最终分。 */
++  max_possible_score: number;
++  final_score: number;
++  threshold: number;
++  // 时间因子（衰减开启时出现）
++  decay_weight?: number;
++  retention?: number;
++  memory_strength_days?: number;
++  elapsed_days?: number;
++  access_count?: number | null;
++  // 图信号（图能力开启时出现，未命中为 0）
++  graph_boost?: number;
++  graph_facts?: number;
++}
++
++/**
++ * 记忆 / 观察条目。机制字段（bi-temporal、衰减足迹、观察身份）都由 `GET /memories`
++ * 与 `POST /search` 作为一等字段返回，仅在观察条目上取非空值。
++ */
+ export interface Memory {
+   id: string;
+   memory: string;
+-  user_id?: string;
+-  agent_id?: string;
+-  created_at?: string;
+-  updated_at?: string;
++  user_id?: string | null;
++  agent_id?: string | null;
++  run_id?: string | null;
++  hash?: string | null;
++  created_at?: string | null;
++  updated_at?: string | null;
++  expiration_date?: string | null;
++  /** 生效时刻；存量记忆可能为 null。 */
++  valid_at?: string | null;
++  /** 失效时刻；非空即「已失效」。 */
++  invalid_at?: string | null;
++  /** 失效时取代它的那条记忆 id。 */
++  superseded_by?: string | null;
++  invalid_reason?: string | null;
++  /** 上次被检索返回的时刻；从未召回时为 null。 */
++  last_accessed?: string | null;
++  /** 召回次数；从未召回时为 null。 */
++  access_count?: number | null;
++  /** `observation` 表示 Dream 合成的信念条目。 */
++  memory_kind?: string | null;
++  observation_key?: string | null;
++  source_memory_ids?: string[] | null;
++  evidence_count?: number | null;
++  dream_run_id?: string | null;
 +  score?: number;
++  score_details?: ScoreDetails;
++  graph_status?: GraphStatus;
++  metadata?: Record<string, unknown>;
++}
++
++/** `GET /observations` 的响应（与 `GET /memories` 同口径的游标分页）。 */
++export interface ObservationListResponse {
++  results: Memory[];
++  next_cursor: string | null;
++  total: number | null;
++}
++
++/** `GET /memories`（管理面列表）的响应。 */
++export interface MemoryListResponse {
++  results: Memory[];
++  next_cursor?: string | null;
++  has_more?: boolean;
++  total?: number | null;
++}
++
++/** `GET /memories/{id}/observations`：反向追溯（事实 → 它派生的观察）。 */
++export interface MemoryObservationsResponse {
++  memory_id: string;
++  total: number;
++  results: Memory[];
++}
++
++/** `GET /memories/{id}/sources`：正向追溯（观察 → 它的源事实）。 */
++export interface MemorySourcesResponse {
++  observation_id: string;
++  total: number;
++  /** 源事实已不存在（被删除 / 被取代后清理）的条数，原样呈现。 */
++  missing: number;
++  results: Memory[];
++}
++
++/** `GET /graph/stats`：进程内计数 + 熔断状态。计数归当前进程实例。 */
++export interface GraphStats {
++  enabled: boolean;
++  timeout_seconds: number | null;
++  circuit_open: boolean;
++  consecutive_failures: number;
++  queue_size: number;
++  graph_dispatched: number;
++  graph_synced: number;
++  graph_already_synced: number;
++  graph_failed: number;
++  graph_dropped: number;
++}
++
++/** 一个图键的规模；三者全为 0 即空图键。 */
++export interface GraphKeyScale {
++  group_id: string;
++  episodes: number;
++  entity_nodes: number;
++  entity_edges: number;
++}
++
++/** `GET /graph/keys`：`degraded` 表示读数失败（≠ 规模为 0）。 */
++export interface GraphKeysResponse {
++  keys: GraphKeyScale[];
++  degraded: boolean;
++}
++
++/** 一轮 Dream 整合的运行审计（`GET /dream/runs`）。 */
++export interface DreamRun {
++  id: string;
++  mode: string;
++  status: string;
++  started_at: string | null;
++  finished_at: string | null;
++  scopes: number;
++  clusters: number;
++  llm_calls: number;
++  failed_clusters: number;
++  observations_written: number;
++  observations_superseded: number;
++  prompt_tokens: number;
++  completion_tokens: number;
++  duration_seconds: number | null;
++  report_path: string | null;
++}
++
++export interface DreamRunsResponse {
++  total: number;
++  limit: number;
++  offset: number;
++  results: DreamRun[];
++}
++
++/** dry-run 报告的候选簇（`POST /dream/preview`）。 */
++export interface DreamPreviewCandidate {
++  observation_key: string;
++  members: string[];
++  text: string;
++  source_memory_ids: string[];
++  evidence_count: number;
++  counterexample: unknown[];
++  decision: string;
++  skip_reason: string | null;
++}
++
++export interface DreamPreviewTotals {
++  facts: number;
++  observations: number;
++  clusters: number;
++  llm_calls: number;
++  failed_clusters: number;
++  prompt_tokens: number;
++  completion_tokens: number;
++  clusters_skipped: number;
++  clusters_deferred: number;
++}
++
++/** dry-run 报告：零写入，唯一产物是一份报告文件。 */
++export interface DreamPreviewReport {
++  run_id: string;
++  mode: string;
++  status: string;
++  started_at: string;
++  finished_at: string | null;
++  duration_seconds: number;
++  totals: DreamPreviewTotals;
++  candidates: DreamPreviewCandidate[];
++  supersede_preview: unknown[];
++  would_write: string[];
++  observations_written: number;
++  observations_superseded: number;
++  errors: string[];
++  report_path?: string;
  }
  
  export interface ApiKey {
-@@ -33,6 +34,35 @@ export interface ApiRequestLog {
+@@ -33,6 +217,35 @@ export interface ApiRequestLog {
    auth_type: string;
  }
  
@@ -9832,10 +14034,10 @@ index b8cd415b..f799e367 100644
  
  export interface Entity {
 diff --git a/server/dashboard/src/utils/api-endpoints.ts b/server/dashboard/src/utils/api-endpoints.ts
-index 6db543ff..1175631c 100644
+index 6db543ff..0a2d186b 100644
 --- a/server/dashboard/src/utils/api-endpoints.ts
 +++ b/server/dashboard/src/utils/api-endpoints.ts
-@@ -12,6 +12,8 @@ export const MEMORY_ENDPOINTS = {
+@@ -12,10 +12,34 @@ export const MEMORY_ENDPOINTS = {
    BASE: "/memories",
    BY_ID: (memoryId: string) => `/memories/${memoryId}`,
    HISTORY: (memoryId: string) => `/memories/${memoryId}/history`,
@@ -9844,7 +14046,33 @@ index 6db543ff..1175631c 100644
    CONFIGURE: "/configure",
    CONFIGURE_PROVIDERS: "/configure/providers",
    RESET: "/reset",
-@@ -25,6 +27,7 @@ export const API_KEY_ENDPOINTS = {
+   GENERATE_INSTRUCTIONS: "/generate-instructions",
++  /** 反向追溯：某条事实派生的观察（只读）。 */
++  OBSERVATIONS_OF: (memoryId: string) => `/memories/${memoryId}/observations`,
++  /** 正向追溯：某条观察的源事实（只读）。 */
++  SOURCES_OF: (memoryId: string) => `/memories/${memoryId}/sources`,
++} as const;
++
++/** Dream 观察清单（新增只读端点，服务端按 `memory_kind` 索引过滤）。 */
++export const OBSERVATION_ENDPOINTS = {
++  BASE: "/observations",
++} as const;
++
++/** Dream 运行审计与 dry-run 预览。 */
++export const DREAM_ENDPOINTS = {
++  RUNS: "/dream/runs",
++  RUN_BY_ID: (runId: string) => `/dream/runs/${runId}`,
++  PREVIEW: "/dream/preview",
++} as const;
++
++/** 图能力观测（计数来自进程内派发器；图键规模经 mem0 侧代理图桥）。 */
++export const GRAPH_ENDPOINTS = {
++  STATS: "/graph/stats",
++  KEYS: "/graph/keys",
+ } as const;
+ 
+ export const API_KEY_ENDPOINTS = {
+@@ -25,6 +49,7 @@ export const API_KEY_ENDPOINTS = {
  
  export const REQUEST_ENDPOINTS = {
    BASE: "/requests",
@@ -9852,6 +14080,151 @@ index 6db543ff..1175631c 100644
  } as const;
  
  export const ENTITY_ENDPOINTS = {
+diff --git a/server/dashboard/src/utils/graph-key.ts b/server/dashboard/src/utils/graph-key.ts
+new file mode 100644
+index 00000000..9e6f25a5
+--- /dev/null
++++ b/server/dashboard/src/utils/graph-key.ts
+@@ -0,0 +1,37 @@
++/**
++ * 图键（FalkorDB graph key）的前端派生。
++ *
++ * 与后端 `mem0/memory/graph_sync.py` 的 `derive_group_id` 同规则：作用域优先级
++ * `user_id` → `agent_id` → `run_id`，取第一个非空值，非法字符归一为下划线，前缀
++ * `mem0_`，最长 96 字符。页面展示这个派生值，只是为了把「本次检索用的是哪个图」与
++ * `graph_facts` 同屏摆出来：`graph_boost = 0` 只有在候选池里没有任何条目被图事实引用
++ * 时才出现，它与「图键为空 / 图没答上来」在响应上同形，必须靠图键 + `graph_status`
++ * 才能区分。
++ */
++
++const GROUP_ID_PREFIX = "mem0";
++const GROUP_ID_MAX_LENGTH = 96;
++const GROUP_ID_INVALID = /[^0-9A-Za-z_-]/g;
++const SCOPE_KEYS = ["user_id", "agent_id", "run_id"] as const;
++
++/** 把作用域值归一为图键片段（与后端 `sanitize_group_id` 同规则）。 */
++export function sanitizeGroupId(value: unknown): string {
++  const text = String(value ?? "")
++    .trim()
++    .replace(GROUP_ID_INVALID, "_");
++  return text.length > GROUP_ID_MAX_LENGTH
++    ? text.slice(0, GROUP_ID_MAX_LENGTH)
++    : text;
++}
++
++/** 由检索作用域派生图键；派生不出作用域时返回 null（该次检索不会发起图调用）。 */
++export function deriveGraphKey(
++  filters?: Record<string, unknown> | null,
++): string | null {
++  if (!filters) return null;
++  for (const key of SCOPE_KEYS) {
++    const value = filters[key];
++    if (value) return `${GROUP_ID_PREFIX}_${sanitizeGroupId(value)}`;
++  }
++  return null;
++}
+diff --git a/server/dashboard/src/utils/mechanism.ts b/server/dashboard/src/utils/mechanism.ts
+new file mode 100644
+index 00000000..73ada02c
+--- /dev/null
++++ b/server/dashboard/src/utils/mechanism.ts
+@@ -0,0 +1,96 @@
++import { GraphStatus, Memory, ScoreDetails } from "@/types/api";
++
++/**
++ * 四项记忆机制在 UI 上的取值 → 文案映射与格式化口径。
++ *
++ * 这里的每个函数都只做「响应值到显示值」的直译，不做二次推断：机制字段缺失时一律
++ * 显示 `--`（而不是 0 或「无」这类会被读成结论的值）。
++ */
++
++/** 生效/失效判定：只由 `invalid_at` 决定（存量记忆可能没有 `valid_at`）。 */
++export const isInvalidated = (memory: Memory): boolean =>
++  memory.invalid_at != null;
++
++export const isObservation = (memory: Memory): boolean =>
++  memory.memory_kind === "observation";
++
++/** 图分支状态 → 文案。五种取值的文案两两不同，且都不把 0 加分表述为「图没命中」。 */
++export const GRAPH_STATUS_TEXT: Record<GraphStatus, string> = {
++  ok: "图分支已返回（命中数为 0 时也不代表图没答上来）",
++  skipped: "图分支未发起调用（本次无作用域键或候选池为空）",
++  timeout: "图分支超时，本次按无图信号处理",
++  error: "图分支失败（图桥不可达或返回错误），本次按无图信号处理",
++  disabled: "图能力已关闭（未发起任何图调用）",
++};
++
++export const GRAPH_STATUS_TONE: Record<
++  GraphStatus,
++  "positive" | "muted" | "warn" | "danger"
++> = {
++  ok: "positive",
++  skipped: "muted",
++  timeout: "warn",
++  error: "danger",
++  disabled: "muted",
++};
++
++const TONE_CLASS = {
++  positive:
++    "border-memGreen-200 bg-memGreen-50 text-onSurface-positive-primary",
++  muted:
++    "border-memBorder-primary bg-surface-default-tertiary text-onSurface-default-tertiary",
++  warn: "border-memGold-200 bg-memGold-50 text-memGold-800",
++  danger: "border-memRed-200 bg-memRed-50 text-onSurface-danger-primary",
++} as const;
++
++/** 状态条统一排版：状态徽章与图分支状态条共用同一套视觉。 */
++export const STATUS_BADGE_BASE =
++  "inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium";
++
++export const graphStatusClass = (status: GraphStatus): string =>
++  `${STATUS_BADGE_BASE} ${TONE_CLASS[GRAPH_STATUS_TONE[status]]}`;
++
++/** 数值格式化：分值 3 位（沿用既有 `toFixed(3)`），计数千分位，天数 1 位并标单位。 */
++export const formatScore = (value: number | null | undefined): string =>
++  typeof value === "number" ? value.toFixed(3) : "--";
++
++export const formatCount = (value: number | null | undefined): string =>
++  typeof value === "number" ? value.toLocaleString() : "--";
++
++export const formatDays = (value: number | null | undefined): string =>
++  typeof value === "number" ? `${value.toFixed(1)} 天` : "--";
++
++export const formatTimestamp = (value: string | null | undefined): string =>
++  value ? new Date(value).toLocaleString() : "--";
++
++/** 日期（`YYYY-MM-DD`）按原样显示：它是 payload 里的日期口径，不额外加时刻。 */
++export const formatDate = (value: string | null | undefined): string =>
++  value ? String(value) : "--";
++
++/** 分值构成中恒定出现的三分量 + 合计，用于逐行渲染分量表。 */
++export const SCORE_BASE_ROWS: {
++  key: keyof ScoreDetails;
++  label: string;
++  scale: number;
++}[] = [
++  { key: "semantic_score", label: "语义", scale: 3 },
++  { key: "bm25_score", label: "关键词", scale: 3 },
++  { key: "entity_boost", label: "实体", scale: 3 },
++  { key: "graph_boost", label: "图", scale: 3 },
++];
++
++/**
++ * 图键口径说明（与后端 `derive_group_id` 同规则）。
++ *
++ * 之所以必须把它与 `graph_facts` 一起摆出来：`graph_boost = 0` 只有当候选池里没有任何
++ * 条目被图事实引用时才出现，它与「图键为空」在响应上同形，两者都表现为
++ * `graph_boost = 0` 且 `graph_status = ok`。
++ */
++export const GRAPH_KEY_NOTE =
++  "图键由作用域派生（user_id 优先 ⇒ mem0_<user_id>）；同一 user_id 的不同 agent_id 共用一个图键。";
++
++/** 时间因子口径说明（与 `mem0/utils/scoring.py` 一致：只下调，上界 1）。 */
++export const DECAY_NOTE = "时间因子 = 0.90 + 0.10 × 保留率，只下调、不放大。";
++
++/** 进程内计数口径说明：换进程即归零。 */
++export const PROCESS_COUNTER_NOTE = "自本进程启动以来";
 diff --git a/server/docker-compose.yaml b/server/docker-compose.yaml
 index 7e382f7c..5f14ce3b 100644
 --- a/server/docker-compose.yaml
@@ -10964,7 +15337,7 @@ index 00000000..9c4bff10
 +fastapi>=0.115.0
 +uvicorn[standard]>=0.30.0
 diff --git a/server/main.py b/server/main.py
-index 20059fb8..d6ca26f5 100644
+index 20059fb8..71d4aca5 100644
 --- a/server/main.py
 +++ b/server/main.py
 @@ -1,13 +1,18 @@
@@ -11327,10 +15700,92 @@ index 20059fb8..d6ca26f5 100644
          return get_memory_instance().get_all(**params)
      except HTTPException:
          raise
-@@ -440,6 +647,82 @@ def get_all_memories(
+@@ -440,6 +647,164 @@ def get_all_memories(
          raise upstream_error()
  
  
++# Dream 观察条目标记。与 `mem0.configs.prompts.MEMORY_KIND_OBSERVATION` / `routers/dream.py`
++# 同值；此处不 import SDK 常量，避免为取一个字符串而依赖整合内核。
++OBSERVATION_KIND = "observation"
++_OBSERVATION_FILTER = {"memory_kind": {"eq": OBSERVATION_KIND}}
++
++
++def _count_with_filter(filters: Dict[str, Any]) -> Optional[int]:
++    """按与 `vector_store.list()` 相同的过滤口径取集合内精确条数。
++
++    取不到时返回 None（前端按既有约定回落为「已加载 N+」），绝不因计数失败而让清单
++    接口 5xx。仅 Qdrant 实现有 `_create_filter`；其它实现直接跳过精确总数。
++    """
++    try:
++        vs = get_memory_instance().vector_store
++        build_filter = getattr(vs, "_create_filter", None)
++        if build_filter is None:
++            return None
++        count_filter = build_filter(filters)
++        if count_filter is None:
++            return None
++        counted = vs.client.count(collection_name=vs.collection_name, count_filter=count_filter, exact=True)
++        return int(counted.count)
++    except Exception:
++        return None
++
++
++def _list_observations(limit: int = ALL_MEMORIES_LIMIT, cursor: Optional[str] = None) -> Dict[str, Any]:
++    """列全部 Dream 观察（最新优先 + keyset 游标）。
++
++    排序与游标口径取自管理面列表：`created_at` 最新优先，`cursor` 取上一页最后一行的
++    `created_at`，服务端 `created_at < cursor` 严格递减续读，因此页间永不重叠。
++
++    与 `GET /memories` 的唯一差别是**末页判定**：本页不足 `limit` 行时显式返回
++    `next_cursor = null`（`GET /memories` 在该情形仍回一个游标，由客户端再请求一次
++    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返。
++    """
++    filters = _OBSERVATION_FILTER
++    results = get_memory_instance().vector_store.list(filters=filters, top_k=limit, cursor=cursor)
++    rows = results[0] if results and isinstance(results, (list, tuple)) and isinstance(results[0], list) else results or []
++    rows = list(rows)
++    rows.sort(
++        key=lambda r: (getattr(r, "payload", None) or {}).get("created_at") or "",
++        reverse=True,
++    )
++    next_cursor = None
++    if rows and len(rows) == limit:
++        last = (getattr(rows[-1], "payload", None) or {}).get("created_at")
++        if last:
++            next_cursor = str(last)
++    return {
++        "results": [_serialize_memory(row) for row in rows],
++        "next_cursor": next_cursor,
++        "total": _count_with_filter(filters),
++    }
++
++
++@app.get("/observations", summary="List Dream observations")
++def get_observations(
++    top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
++    cursor: Optional[str] = Query(None),
++    _auth=Depends(verify_auth),
++):
++    """列出全部 Dream 观察条目（`memory_kind == "observation"`），只读。
++
++    行口径与 `GET /memories` 完全一致（同一序列化器），因此观察的正文、证据链与
++    bi-temporal 字段一并返回；分页用 `top_k` + `cursor`（上一页响应的 `next_cursor`）。
++
++    为什么另开端点而不复用 `GET /memories`：管理面列表是 raw 全量，观察在其中按
++    `created_at` 位置漂移，客户端只能在自己已加载的页里过滤，写入量一涨就会误报空集；
++    这里由服务端按 `memory_kind` 的 keyword 索引过滤（一次请求即可拿全量清单）。
++    """
++    try:
++        return _list_observations(
++            limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT,
++            cursor=cursor,
++        )
++    except HTTPException:
++        raise
++    except Exception:
++        raise upstream_error()
++
++
 +MAX_EXPORT_PAGES = 200
 +EXPORT_CSV_COLUMNS = [
 +    "id",
@@ -11410,7 +15865,7 @@ index 20059fb8..d6ca26f5 100644
  @app.get("/memories/{memory_id}", summary="Get a memory")
  def get_memory(memory_id: str, _auth=Depends(verify_auth)):
      """Retrieve a specific memory by ID."""
-@@ -475,6 +758,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+@@ -475,6 +840,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
              params["explain"] = search_req.explain
          if search_req.show_expired is not None:
              params["show_expired"] = search_req.show_expired
@@ -11561,6 +16016,22 @@ index ad9e8af3..5408176c 100644
 +    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 +    last_evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 +    evaluations: Mapped[int] = mapped_column(Integer, default=1)
+diff --git a/server/requirements.txt b/server/requirements.txt
+index 33a11c55..8c6785d9 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -11,6 +11,11 @@ psycopg-pool>=3.2.6,<4.0.0
+ anthropic>=0.39,<1.0
+ google-generativeai>=0.8,<1.0
+ 
++# Read-only graph observability proxy: `GET /graph/keys` reads the graph bridge's
++# `/graphs` and `/stats`. httpx is already pulled in by the mem0 SDK; listed here
++# because the server now imports it directly.
++httpx>=0.28.0
++
+ # Auth & database (Phase 1)
+ sqlalchemy>=2.0,<3.0
+ alembic>=1.13,<2.0
 diff --git a/server/routers/dream.py b/server/routers/dream.py
 new file mode 100644
 index 00000000..2ee901b4
@@ -11802,25 +16273,32 @@ index 621b67d4..65c3537d 100644
  
 diff --git a/server/routers/graph.py b/server/routers/graph.py
 new file mode 100644
-index 00000000..a7248219
+index 00000000..a76dd923
 --- /dev/null
 +++ b/server/routers/graph.py
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,154 @@
 +"""图能力的只读观测端点（设计 `docs/design/graph-memory.md` §8）。
 +
-+一个端点：`GET /graph/stats` 返回图派发计数器与熔断状态的当前值，使「队列有界且可观测」
-+这类判据可以由实际读数判定，而不必拿图桥的访问日志当代理（日志里看不到冷却窗口内的
-+「跳过」）。
++两个端点：
 +
-+只读：不触发派发、不发起图调用、不改配置。计数来自进程内的 `GraphSync`（首次派发时
-+惰性创建），因此关闭态——以及开启但本进程尚未派发过任何事实时——全部读数为 0。
++* `GET /graph/stats` 返回图派发计数器与熔断状态的当前值，使「队列有界且可观测」
++  这类判据可以由实际读数判定，而不必拿图桥的访问日志当代理（日志里看不到冷却窗口内的
++  「跳过」）。
++* `GET /graph/keys` 代理图桥的图键清单与每个键的规模（设计
++  `dashboard-mechanism-visibility.md` §6.3）：图规模与图键只在图桥侧可得，而图桥未映射
++  宿主端口、且无鉴权，由 mem0 侧代理是唯一不新增前端可达面的通道。
++
++只读：不触发派发、不发起图调用、不改配置、不建图键、不删图键。计数来自进程内的
++`GraphSync`（首次派发时惰性创建），因此关闭态——以及开启但本进程尚未派发过任何事实
++时——全部读数为 0。
 +"""
 +
 +from __future__ import annotations
 +
 +import logging
-+from typing import Any, Dict
++from typing import Any, Dict, List
 +
++import httpx
 +from auth import verify_auth
 +from fastapi import APIRouter, Depends, HTTPException
 +from server_state import get_memory_instance
@@ -11841,6 +16319,15 @@ index 00000000..a7248219
 +# 能力开启但本进程尚未派发时，`GraphSync.stats()` 不存在，此时给出的零读数。
 +_EMPTY_STATS: Dict[str, Any] = {}
 +
++# 代理图桥的读超时：清单一次、每个已存在的键一次规模读数。两者都是毫秒级读数
++# （实测 `/graphs` 4ms、`/stats` 1–2ms），预算给足以覆盖图桥冷启动，又不至于把
++# dashboard 的这张卡片拖成漫长的等待。
++_BRIDGE_LIST_TIMEOUT_SECONDS = 5.0
++_BRIDGE_STATS_TIMEOUT_SECONDS = 10.0
++
++# 图规模的四个字段；顺序即响应里的字段顺序。
++KEY_SCALE_FIELDS = ("episodes", "entity_nodes", "entity_edges")
++
 +
 +def _stats_of(memory: Any) -> Dict[str, Any]:
 +    """取实例上图派发器的计数快照。
@@ -11858,6 +16345,19 @@ index 00000000..a7248219
 +        return _EMPTY_STATS
 +
 +
++def _require_memory() -> Any:
++    try:
++        return get_memory_instance()
++    except RuntimeError as exc:
++        raise HTTPException(status_code=503, detail="Mem0 runtime has not been initialized.") from exc
++
++
++def _bridge_endpoint(memory: Any) -> str:
++    """图桥根地址：与派发/检索共用同一份配置，不新增配置项。"""
++    config = getattr(getattr(memory, "config", None), "graph", None)
++    return str(getattr(config, "endpoint", "") or "").rstrip("/")
++
++
 +@router.get("/graph/stats", summary="Graph dispatch counters")
 +def graph_stats(_auth=Depends(verify_auth)) -> Dict[str, Any]:
 +    """图派发计数与熔断状态（只读快照）。
@@ -11865,10 +16365,7 @@ index 00000000..a7248219
 +    返回 `enabled`（总开关）、`timeout_seconds`（生效的图检索预算，超时因此可解释）、
 +    五项 `graph_*` 计数，以及熔断状态、连续失败数与队列当前长度。
 +    """
-+    try:
-+        memory = get_memory_instance()
-+    except RuntimeError as exc:
-+        raise HTTPException(status_code=503, detail="Mem0 runtime has not been initialized.") from exc
++    memory = _require_memory()
 +
 +    config = getattr(getattr(memory, "config", None), "graph", None)
 +    stats = _stats_of(memory)
@@ -11882,6 +16379,58 @@ index 00000000..a7248219
 +    }
 +    payload.update({key: int(stats.get(key, 0)) for key in COUNTER_KEYS})
 +    return payload
++
++
++@router.get("/graph/keys", summary="Graph keys and their sizes")
++def graph_keys(_auth=Depends(verify_auth)) -> Dict[str, Any]:
++    """图键清单与每个键的规模（只读代理）。
++
++    **硬约束**：规模读数**只对清单内已存在的键**发起。图桥的 `GET /stats?group_id=`
++    经 `registry.get()` 实例化 driver，FalkorDB 会惰性建出同名空图键——实测对一个不存在
++    的键读一次规模，它就以 `episodes 0` 重新出现在 `GRAPH.LIST` 里。因此必须先取
++    `GET /graphs`、再只对清单里的键逐个读规模；任何情况下都不得用试探键读数。
++
++    降级语义与图侧其余路径一致（图侧故障不外溢）：图桥不可用（连接失败 / 非 2xx /
++    畸形响应）时返回 `keys: []` 且 `degraded: true`；单个键的规模读失败时该键不进
++    响应，并同样置 `degraded: true`——读失败与「规模为 0」必须不同形。
++    """
++    memory = _require_memory()
++    endpoint = _bridge_endpoint(memory)
++    if not endpoint:
++        return {"keys": [], "degraded": True}
++
++    try:
++        with httpx.Client(base_url=endpoint, timeout=_BRIDGE_LIST_TIMEOUT_SECONDS) as client:
++            listed = client.get("/graphs")
++            listed.raise_for_status()
++            body = listed.json()
++            graph_keys_list: List[str] = [str(key) for key in (body.get("graphs") or []) if key]
++
++            keys: List[Dict[str, Any]] = []
++            degraded = False
++            for group_id in graph_keys_list:
++                try:
++                    scale = client.get(
++                        "/stats",
++                        params={"group_id": group_id},
++                        timeout=_BRIDGE_STATS_TIMEOUT_SECONDS,
++                    )
++                    scale.raise_for_status()
++                    scale_body = scale.json()
++                    keys.append(
++                        {
++                            "group_id": group_id,
++                            **{field: int(scale_body.get(field, 0) or 0) for field in KEY_SCALE_FIELDS},
++                        }
++                    )
++                except Exception as exc:  # noqa: BLE001 - 单个键读失败不得让整页读数失败
++                    logger.warning("Reading graph size for %s failed: %s", group_id, exc)
++                    degraded = True
++    except Exception as exc:  # noqa: BLE001 - 图桥故障按降级返回，不影响其它端点
++        logger.warning("Listing graph keys failed: %s", exc)
++        return {"keys": [], "degraded": True}
++
++    return {"keys": keys, "degraded": degraded}
 diff --git a/server/routers/requests.py b/server/routers/requests.py
 index 3e226e30..1b520063 100644
 --- a/server/routers/requests.py
