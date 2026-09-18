@@ -153,7 +153,7 @@ VM（lima `docker`，vz / aarch64）：
 
 写入侧的 LLM 成本由事实写入量决定：实测一条中文事实的图摄入 **14.24–36.65s**（中位 20.52s，LLM 主导，E6）。当前事实写入频率为近 7 天 520 条（74.3 条/天，见 memory-decay 文档 E10），折算图侧 LLM 负载约 **25–45 分钟/天**，由单 worker 串行吸收，远低于 2 vCPU 的容量。
 
-存量 3500+ 条事实按 20s/条串行回填约需 19 小时 LLM 占用，本阶段按增量同步交付（F1 只覆盖新写入）；存量回填作为独立后续卡（第 12 节），其触发点与限速方案在第 5.5 节预留。
+存量 3500+ 条事实按 20s/条串行回填约需 19 小时 LLM 占用，本阶段按增量同步交付（F1 只覆盖新写入）；存量回填由「独立后续卡 C」承载，**现已实现**于图桥 `POST /backfill`（限速 + 可中断续跑 + 进度可观测，见 §5.5）。
 
 ---
 
@@ -282,9 +282,89 @@ FalkorDB 后端的一处机制约束（E13）：`group_id` 即图键（database�
 
 ## 5.5 存量与回填
 
-本阶段同步范围为**新写入的事实**；图内 episode 数等于实施后新增事实数，与存量 3500+ 条无关（第 11.2 节可判定）。
+本阶段的增量同步范围为**新写入的事实**；存量靠回填补齐。覆盖度实测（第 11.2 节的判据）：
 
-存量回填不在本阶段范围，其接口形态在图桥侧预留：`POST /backfill {group_id, limit, rate}` —— 按 Qdrant 游标顺序取事实、限速入图、可中断续跑。触发条件为「新写入的图覆盖度不足以支撑检索增益」的观测结论（第 12 节列为独立卡）。
+```
+图内 episodes  116
+记忆库总数     4105
+覆盖率         2.8%
+```
+
+覆盖度不足以支撑检索增益（`graph_boost` 恒为 0），故触发条件成立，回填端点已实现：
+
+### 接口契约（实际形态）
+
+```
+POST /backfill  {group_id, limit, rate, cursor?, scan_limit?}
+GET  /backfill/status?group_id=
+```
+
+| 参数 | 默认 | 语义 |
+| --- | --- | --- |
+| `group_id` | 必填 | 图键（`mem0_<scope>`，SDK 侧 `derive_group_id` 的产物）；非该形态回 400，不建键 |
+| `limit` | 20 | 本次调用最多**新入图**的事实条数（已同步的跳过不计数）；到此即返回 |
+| `rate` | 0 | 入图速率上限，单位「条/分钟」；`0` = 不限速。实现为相邻两次入图的起始间隔 ≥ `60/rate` 秒 |
+| `cursor` | 无 | 续跑锚点：上一次响应的 `next_cursor`（`created_at` 原值）。缺省从最新一条起扫 |
+| `scan_limit` | 200 | 本次允许扫过的记录条数上限（含已同步与作用域不匹配的），防全已同步时无界扫描 |
+
+响应（`processed` / `already_synced` / `failed` / `out_of_scope` / `scanned` / `exhausted` /
+`next_cursor` / `elapsed_seconds` / `paced_wait_seconds` / `facts_per_minute` /
+`scope_total` / `graph_episodes` / `remaining` / `errors`）与 `GET /backfill/status`
+（进程内快照：`state`、计数器、`remaining` 估读、失败摘要）共同构成进度可观测面。
+
+### 四条语义（按方案 §5.5 落地）
+
+1. **按 Qdrant 游标顺序取事实**：`created_at` 降序 + keyset 游标（`created_at < cursor`，严格小于），与 mem0 侧 `vector_store.list()` 同一读面口径，批次之间不重叠、不遗漏。
+2. **限速入图**：`rate` 直接产生等待（响应里的 `paced_wait_seconds` 是限速生效的直接读数），避免长时间占满 LLM 通道、避免压垮 2 vCPU 的 VM。限速预算只由**实际入图**消耗——跳过（`already_synced`）不等待，否则重扫已入图区域会被人为压到 `rate` 的节奏（实测：6 条已入图在 `rate=1` 下 0.058s 扫完、`paced_wait_seconds = 0`）。
+3. **可中断续跑**：**复用 `/episodes` 的 `already_synced` 前置判定**（同一 `_sync_one` 实现），不另存进度表、不另造一套去重。进程重启 / 客户端放弃 / 批次结束都只留下「已入图的那部分」这一可续状态。
+4. **进度可观测**：响应字段 + `GET /backfill/status` 双向暴露；`remaining` 是估读（作用域事实数 − 图内 episode 数，抽取失败留下的空 episode 会被算作已完成）。已结束的调用在状态面给出其**自身耗时**（到达终态即冻结），不会随查询时间增长；被异常的调用留在读数里标成 `interrupted`，部分进度仍可读。
+
+**不做"一次调用跑到完"**：单次调用有 `limit` 与 `scan_limit` 双上界，调用方（编排者）分批次推进；
+推进到全量完成的条件是连续调用直到 `processed == 0` 且 `exhausted == true`。
+
+### 回填不入图的记录
+
+`memory_kind == "observation"` 的 Dream 观察条目被排除：增量派发路径只派发写入管道抽取出的事实，
+观察由 dream 直写 Qdrant、从不派发（`mem0/memory/dream.py`）。回填按同一口径，使「回填后的图内容」
+等于「若增量派发从头开启本该产生的内容」。
+
+### 中断后的一次已知行为：抽取中途被杀的事实会被重抽
+
+幂等判据沿用 `/episodes` 的既有语义——`Episodic.entity_edges` 非空才算「已入图」。因此：
+
+* **已抽取完成**（有边）的事实：重扫只花一次图内查询即跳过，不再消耗 LLM（实测重扫 2 条 13ms；6 条 0.058s）；
+* **抽取中途被杀**的事实：episode 节点已落库但无边，重扫时会被重新抽取（实测：硬中断后一个批次内
+  3 条落库、其中 2 条无边，续跑时这 2 条被重抽）。这正是增量路径在「抽取失败后重试」时依赖的形态
+  （`_sync_one` 不因失败而把 episode 标成已完成），代价是这类事实不省 LLM 调用；
+* 连带影响：`remaining` 估读把「有空 episode」的事实算作已完成，故中断频繁时它会偏乐观（估读口径见上表）。
+
+回填的续跑锚点（响应里的 `next_cursor`）与这条语义正交：游标只决定「从哪里开始扫」，是否入图
+一律由图侧的 `already_synced` 判定。
+
+### 实测速率、幂等与限速对照（隔离作用域 `bfprobe_*`）
+
+`seed` 直写 Qdrant 的候选事实（24 条），`POST /backfill` 累计新入图 20 条：
+
+| 观测 | 读数 | 口径 |
+| --- | --- | --- |
+| 小样本 20 条 | 总墙钟 277.0s（含 22.9s 限速等待）→ 单条 **12.7s**、4.33 条/分钟 | AC-5 的校准样本 |
+| 最快批次（`limit=14`、`rate=0`） | 14 条 / 133.2s → 6.30 条/分钟、单条 9.5s | 单条耗时随 LLM 负载在 9.5–26.5s 间波动 |
+| 限速对照（同作用域、同批量 `limit=3`） | `rate=0` → 79.6s / 2.26 条/分钟、`paced_wait=0`；`rate=1` → 138.9s / 1.30 条/分钟、`paced_wait=73.7s` | `rate` 直接改变入图节奏；差额落在等待上 |
+| 幂等重扫（6 条已入图、`rate=1`） | 0.058s、`paced_wait=0.0`、图规模 delta 0/0、`processed=0 / already_synced=6` | 零 LLM；同时是「跳过不占限速预算」的实证 |
+| 单条 LLM 调用量级 | 每条事实 ≈ **3.3 次 `/chat/completions` + 6.7 次 embeddings**（3 条实测 +10 / +20，按容器 httpx 日志计数） | 回填的 LLM 通道占用量的下界 |
+| 终态读数 | 完成后连读两次 `GET /backfill/status`，`elapsed_seconds` 均为 141.143、`facts_per_minute` 均为 1.275 | 终态即冻结，不随查询时间增长 |
+
+硬中断续跑见证据 `backfill_probe.txt`：`docker compose stop graph-bridge` 打断在飞批次后，被打断的 3 条只落了 episode 节点（其中 2 条无边），续跑时这 2 条被重抽，最终图内 episode 数恰等于「不同事实数」——无一条事实被入图两次。
+
+### 单条成本与全量估算
+
+单条入图的耗时由 LLM 抽取主导（E6：14.24–36.65s，中位 20.52s；核验实测峰值 101.0s；本轮小样本单条均值 12.7s）。因此：
+
+* 全量 4105 条 ≈ **15–23 小时**的串行 LLM 占用（按本轮实测均值 12.7s/条 ≈ 14.5h；按 E6 中位 20.5s/条 ≈ 23.4h；E6 的峰值 101s ≈ 115h 属尾部极端值，不作计划依据）；
+* 回填期间的主链路不受影响（写路径只入队；图检索按 `timeout_seconds` 预算降级），但图检索的
+  `graph_status` 在回填进行中更可能取 `timeout`——回填与图派发共用同一 LLM 通道，这是限速存在的理由；
+* 因此本端点按「编排者驱动的小批次」使用：`limit` 取 20–50、`rate` 视主链路负载取 0–6，观察
+  `paced_wait_seconds` / `facts_per_minute` 校准后续批次。
 
 ## 5.6 已知限制：`json_object` 兜底模式下的 `EdgeDuplicate` 校验失败
 
@@ -457,6 +537,8 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 | 图信号参与度 | `POST /search?explain=true` 的 `score_details` | 含 `graph_boost` / `graph_facts`；图命中为 0 时 `graph_boost = 0.0` |
 | 资源 | `docker stats` + VM `free -m` | 图桥 ≤ 512MiB、FalkorDB ≤ 384MiB；VM `available` ≥ 4GiB；swap 保持 0 |
 | 图键隔离 | 图桥 `GET /graphs` / FalkorDB `INFO memory` | 每个作用域一个图键；隔离 `user_id` 的键可单独删除 |
+| 回填进度 | 图桥 `POST /backfill` 的响应计数 + `GET /backfill/status`（进程内快照） | `processed / already_synced / failed / scanned / remaining` 可读；`exhausted` 标记作用域扫到底 |
+| 回填限速生效 | 响应/进度里的 `paced_wait_seconds` 与 `facts_per_minute` | `rate > 0` 时 `paced_wait_seconds > 0`（限速产生了真实等待）且 `facts_per_minute` 显著低于不限速基线；`rate = 0` 时 `paced_wait_seconds = 0`。注意 `facts_per_minute` 是**批次内均值**，首条不受限速延迟，故小批次可略高于 `rate`（实测 `rate=1`/`limit=2` → 1.914 条/分钟 > 1），长跑才收敛到 ≤ `rate` |
 
 ---
 
@@ -592,7 +674,7 @@ final_B = (s_B + g_B)/M × d_B ≤ (s_B + W_g)/M × 1.0
 
 | 卡 | 内容 | 触发条件 |
 | --- | --- | --- |
-| C 存量回填 | 图桥 `POST /backfill` 的限速、续跑与进度可观测；按 Qdrant 游标顺序回填 3500+ 条 | 图覆盖度不足以支撑检索增益的观测结论 |
+| C 存量回填 | **已实现**（§5.5）：图桥 `POST /backfill` + `GET /backfill/status` 的限速、续跑与进度可观测；按 Qdrant 游标顺序回填 3500+ 条（测试 `tests/test_graph_backfill.py`） | 图覆盖度不足以支撑检索增益的观测结论（已成立） |
 | D 图侧运维 | 图键清单、规模趋势、按作用域清理的例行任务 | 图键数量增长到需要例行巡检时 |
 
 ---

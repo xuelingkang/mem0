@@ -1,0 +1,212 @@
+# graph-bridge `POST /backfill` 实测原始输出
+
+采集于 2026-09-18，隔离作用域 `user_id=bfprobe_1423`（图键 `mem0_bfprobe_1423`），
+26 条种子事实直写 Qdrant（探针 `backfill_probe.py seed`）。主机 macOS + lima docker VM
+（aarch64，2 vCPU / 7922MiB），mem0 四服务在线，Qdrant 集合 `memories_2048`。
+
+复跑方式（见 `backfill_probe.py` 头部注释）：`docker cp` 进 `mem0-dev-mem0-1` 后按
+`seed / run / status / graph / concurrency / cleanup` 逐级执行；图桥不发布宿主端口，故
+`BRIDGE_URL=http://graph-bridge:8000`、`QDRANT_URL=http://qdrant:6333` 走容器网络。
+
+对账口径：每条 `run` 同时给出请求体、响应、调用前后的图规模与两个增量
+（`graph_episode_delta` / `graph_edge_delta`），使「计数」与「图内实际增量」可比。
+
+```
+== xue baseline (must not change) ==
+{"group_id": "mem0_xue", "episodes": 129, "entity_nodes": 223, "entity_edges": 307}
+== run 1: limit=2 rate=0 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 2, "rate": 0.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 28.925, "response": {"group_id": "mem0_bfprobe_1423", "processed": 2, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 2, "exhausted": false, "next_cursor": "2026-09-18T06:22:57.960351+00:00", "elapsed_seconds": 28.922, "paced_wait_seconds": 0.0, "facts_per_minute": 4.149, "scope_total": 26, "graph_episodes": 2, "remaining": 24, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 2, "entity_nodes": 3, "entity_edges": 2}, "graph_episode_delta": 2, "graph_edge_delta": 2}
+== run 2: 重扫同一批（scan_limit=2, limit=5, cursor=None）→ 期望 processed=0 且图规模零变化 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 5, "rate": 0.0, "scan_limit": 2}, "http_status": 200, "wall_seconds": 0.013, "response": {"group_id": "mem0_bfprobe_1423", "processed": 0, "already_synced": 2, "failed": 0, "out_of_scope": 0, "scanned": 2, "exhausted": false, "next_cursor": "2026-09-18T06:22:57.960351+00:00", "elapsed_seconds": 0.012, "paced_wait_seconds": 0.0, "facts_per_minute": 0.0, "scope_total": 26, "graph_episodes": 2, "remaining": 24, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 2, "entity_nodes": 3, "entity_edges": 2}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 2, "entity_nodes": 3, "entity_edges": 2}, "graph_episode_delta": 0, "graph_edge_delta": 0}
+== run 3: 再来一次（确定性） ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 5, "rate": 0.0, "scan_limit": 2}, "http_status": 200, "wall_seconds": 0.015, "response": {"group_id": "mem0_bfprobe_1423", "processed": 0, "already_synced": 2, "failed": 0, "out_of_scope": 0, "scanned": 2, "exhausted": false, "next_cursor": "2026-09-18T06:22:57.960351+00:00", "elapsed_seconds": 0.013, "paced_wait_seconds": 0.0, "facts_per_minute": 0.0, "scope_total": 26, "graph_episodes": 2, "remaining": 24, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 2, "entity_nodes": 3, "entity_edges": 2}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 2, "entity_nodes": 3, "entity_edges": 2}, "graph_episode_delta": 0, "graph_edge_delta": 0}
+== 中断：stop graph-bridge（客户端在飞） ==
+ Container mem0-dev-graph-bridge-1 Stopping
+ Container mem0-dev-graph-bridge-1 Stopped
+（客户端此刻收到硬断开，证明这是真中断而不是「跑完再看一眼」）
+http.client.RemoteDisconnected: Remote end closed connection without response
+client exit=1
+== 中断后的图规模（= 被中断前已完成的部分） ==
+{"stage": "graph", "stats": {"group_id": "mem0_bfprobe_1423", "episodes": 5, "entity_nodes": 4, "entity_edges": 3}, "keys": ["default_db", "mem0__", "mem0_bfprobe_1423", "mem0_xue"], "qdrant_scope_count": 26}
+== 重启后 status：进程内读数已丢（预期；续跑正确性不依赖它） ==
+{"stage": "status", "body": {"runs": [], "running": false}}
+== 重启后续跑（cursor=None 从头重扫）：已入图的不重复抽取、未处理的继续 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 4, "rate": 0.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 102.54, "response": {"group_id": "mem0_bfprobe_1423", "processed": 4, "already_synced": 3, "failed": 0, "out_of_scope": 0, "scanned": 7, "exhausted": false, "next_cursor": "2026-09-18T06:17:57.960351+00:00", "elapsed_seconds": 102.538, "paced_wait_seconds": 0.0, "facts_per_minute": 2.341, "scope_total": 26, "graph_episodes": 7, "remaining": 19, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 5, "entity_nodes": 4, "entity_edges": 3}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 7, "entity_nodes": 8, "entity_edges": 9}, "graph_episode_delta": 2, "graph_edge_delta": 6}
+== 回填进行中的主链路并发实测（POST /memories ×5 + /search ×5） ==
+{"stage": "concurrency", "scope": "bfprobe_1423", "writes": [{"http_status": 200, "elapsed_seconds": 1.597}, {"http_status": 200, "elapsed_seconds": 1.232}, {"http_status": 200, "elapsed_seconds": 0.565}, {"http_status": 200, "elapsed_seconds": 0.576}, {"http_status": 200, "elapsed_seconds": 0.548}], "searches": [{"http_status": 200, "elapsed_seconds": 1.51, "result_count": 5, "graph_status": "timeout"}, {"http_status": 200, "elapsed_seconds": 1.107, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 0.767, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 0.777, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 0.625, "result_count": 5, "graph_status": "ok"}], "backfill_status_while_running": {"runs": [{"group_id": "mem0_bfprobe_1423", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:28:09.028553+00:00", "state": "running", "processed": 0, "already_synced": 1, "failed": 0, "out_of_scope": 0, "scanned": 2, "paced_wait_seconds": 59.99948524299543, "current": "f6759ace-4d3f-407a-8755-e5f2f64b33a0", "next_cursor": "2026-09-18T06:22:57.960351+00:00", "exhausted": false, "scope_total": 26, "graph_episodes": 7, "errors": [], "elapsed_seconds": 37.579, "facts_per_minute": 0.0, "remaining": 19}], "running": true}}
+== 修复后复测：重扫已入图区域（rate=1，不应再被限速压住） ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 1, "rate": 1.0, "scan_limit": 6}, "http_status": 200, "wall_seconds": 3.627, "response": {"group_id": "mem0_bfprobe_1423", "processed": 1, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 1, "exhausted": false, "next_cursor": "2026-09-18T06:28:41.805762+00:00", "elapsed_seconds": 3.624, "paced_wait_seconds": 0.0, "facts_per_minute": 16.555, "scope_total": 31, "graph_episodes": 9, "remaining": 22, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 8, "entity_nodes": 8, "entity_edges": 9}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 9, "entity_nodes": 8, "entity_edges": 9}, "graph_episode_delta": 1, "graph_edge_delta": 0}
+== 增量派发器状态（主链路 worker 已排空→新写事实已入图，故上面的 scanned 头部记录已同步） ==
+{"enabled":true,"timeout_seconds":1.0,"circuit_open":false,"consecutive_failures":0,"queue_size":0,"graph_dispatched":20,"graph_synced":20,"graph_already_synced":0,"graph_failed":0,"graph_dropped":0}
+== rate=1（限速）vs rate=0（4.149 条/分钟）对照：limit=2 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_1423", "limit": 2, "rate": 1.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 62.682, "response": {"group_id": "mem0_bfprobe_1423", "processed": 2, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 2, "exhausted": false, "next_cursor": "2026-09-18T06:28:41.253969+00:00", "elapsed_seconds": 62.68, "paced_wait_seconds": 57.565, "facts_per_minute": 1.914, "scope_total": 31, "graph_episodes": 10, "remaining": 21, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_1423", "episodes": 9, "entity_nodes": 8, "entity_edges": 9}, "graph_after": {"group_id": "mem0_bfprobe_1423", "episodes": 10, "entity_nodes": 8, "entity_edges": 9}, "graph_episode_delta": 1, "graph_edge_delta": 0}
+== 清理隔离作用域（记忆 + 图键） ==
+{"stage": "cleanup", "delete_memories": {"http_status": 200, "body": {"message": "All relevant memories deleted"}}, "drop_graph": {"http_status": 200, "body": {"group_id": "mem0_bfprobe_1423", "dropped": true}}, "qdrant_scope_count_after": 0, "graph_key_present_after": false}
+== 边界核对：xue 图键与隔离残留 ==
+mem0_xue: {'group_id': 'mem0_xue', 'episodes': 133, 'entity_nodes': 228, 'entity_edges': 316}
+keys: {'graphs': ['default_db', 'mem0__', 'mem0_xue']}
+{"result":{"count":0,"status":"ok"}}          # user_id 前缀 bfprobe_ 的残留点：0
+{"result":{"count":4122,"status":"ok"}}       # user_id=xue 的存量：只读，未被触碰
+```
+
+## 读数说明（不是措辞，是口径）
+
+| 现象 | 口径 |
+| --- | --- |
+| run 1：`processed=2` 而 `graph_episode_delta=2`、`edge_delta=2` | 计数与图内实际增量一致 |
+| run 2/3：`processed=0 / already_synced=2`、两个 delta 均为 0、墙钟 13–15ms | 已入图的事实重复扫到时**零 LLM**（`/episodes` 的 `entity_edges` 判据），且确定性可复现 |
+| 中断批次：`episodes` 2→5 而 `edges` 2→3 | 落库 3 个 episode 中 1 个完成抽取（有边），2 个被停容器打断（无边） |
+| 续跑：`processed=4`、`already_synced=3`、`episodes` 5→7（delta 2） | 3 条有边的被跳过；4 条入图里 2 条是「空 episode 救援」（同 uuid 复用节点，故不新增 episode 节点），2 条是新事实。**episode 总数 7 = 7 条不同事实**，没有一条事实被入图两次 |
+| `scope_total=26` → 31 | 并发实测用 `POST /memories` 又写了 5 条隔离事实（主链路写入 + 派发），回填的候选集随之增长 |
+| `paced_wait_seconds=57.565`（rate=1）vs `0.0`（rate=0） | 限速生效：同样 2 条、同一作用域，墙钟 28.9s → 62.7s，差额几乎全在限速等待 |
+| `facts_per_minute=1.914`（rate=1，2 条） | 批次内平均速率可略高于 `rate`：**首条不受限速延迟**（起始间隔闸门只约束相邻入图），小批次的尾条耗时落在分子里。长跑时收敛到 ≤ rate |
+| `/search` 首测 `graph_status=timeout` | 回填与图派发共用同一 LLM 通道，图检索 1.0s 预算被占满时按设计降级（主链路仍 200、结果 5 条）；这正是限速存在的理由 |
+| 清理：`qdrant_scope_count_after=0`、`graph_key_present_after=false` | 隔离记忆与图键已全额清除 |
+| `mem0_xue` 129 → 133 episodes | 本探针未对 `xue` 发起任何回填；增长来自并发会话的正常增量写入（只读观测） |
+
+---
+
+## 复测（run 31）：限速对照、20 条小样本、终态耗时冻结
+
+同一台机器、同一隔离探针，三个周期：`bfprobe_r31`（20 条小样本 + 修复实证）、`bfprobe_r31b`
+（同作用域同批量的 rate 对照）、`bfprobe_r31c`（重建镜像后的现场复核，容器内 `/app/app.py` 的
+sha256 与工作区一致，故这一周期的读数出自受控的最终二进制）。三个作用域的图键与 Qdrant 点均已清除。
+
+采集口径：`docker exec mem0-dev-mem0-1 python backfill_probe.py <stage>`；`rate` 单位为「条/分钟」，
+`paced_wait_seconds` 是 `rate` 产生的真实等待；容器内 httpx 日志用于数 LLM 调用。
+
+```
+== 0 xue 基线（只读观测，必须不被本探针触碰） ==
+{"stage": "graph", "stats": {"group_id": "mem0_xue", "episodes": 135, "entity_nodes": 228, "entity_edges": 320}, "keys": ["default_db", "mem0__", "mem0_xue"], "qdrant_scope_count": 4124}
+== 1 seed 24 条隔离事实（直写 Qdrant） ==
+{"stage": "seed", "scope": "bfprobe_r31", "group_id": "mem0_bfprobe_r31", "seeded": 24, "upsert_status": 200, "qdrant_scope_count": 24, "graph_key_present_before": false}
+== 2 rate=0 / limit=3：不限速的自然节奏 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31", "limit": 3, "rate": 0.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 70.332, "response": {"group_id": "mem0_bfprobe_r31", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "exhausted": false, "next_cursor": "2026-09-18T06:38:37.098835+00:00", "elapsed_seconds": 70.33, "paced_wait_seconds": 0.0, "facts_per_minute": 2.559, "scope_total": 24, "graph_episodes": 3, "remaining": 21, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "graph_after": {"group_id": "mem0_bfprobe_r31", "episodes": 3, "entity_nodes": 3, "entity_edges": 5}, "graph_episode_delta": 3, "graph_edge_delta": 5}
+== 3 rate=2 / limit=3：同一批量、限速 30s 间隔 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31", "limit": 3, "rate": 2.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 73.425, "response": {"group_id": "mem0_bfprobe_r31", "processed": 3, "already_synced": 3, "failed": 0, "out_of_scope": 0, "scanned": 6, "exhausted": false, "next_cursor": "2026-09-18T06:35:37.098835+00:00", "elapsed_seconds": 73.424, "paced_wait_seconds": 22.93, "facts_per_minute": 2.452, "scope_total": 24, "graph_episodes": 6, "remaining": 18, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31", "episodes": 3, "entity_nodes": 3, "entity_edges": 5}, "graph_after": {"group_id": "mem0_bfprobe_r31", "episodes": 6, "entity_nodes": 7, "entity_edges": 9}, "graph_episode_delta": 3, "graph_edge_delta": 4}
+== 4 rate=0 / limit=14：AC-5 小样本（累计入图 20 条，单条耗时按 14 分摊） ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31", "limit": 14, "rate": 0.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 133.246, "response": {"group_id": "mem0_bfprobe_r31", "processed": 14, "already_synced": 6, "failed": 0, "out_of_scope": 0, "scanned": 20, "exhausted": false, "next_cursor": "2026-09-18T06:21:37.098835+00:00", "elapsed_seconds": 133.243, "paced_wait_seconds": 0.0, "facts_per_minute": 6.304, "scope_total": 24, "graph_episodes": 20, "remaining": 4, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31", "episodes": 6, "entity_nodes": 7, "entity_edges": 9}, "graph_after": {"group_id": "mem0_bfprobe_r31", "episodes": 20, "entity_nodes": 12, "entity_edges": 14}, "graph_episode_delta": 14, "graph_edge_delta": 5}
+== 5 限速预算修复实证：rate=1 重扫已入图区域，应零等待 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31", "limit": 5, "rate": 1.0, "scan_limit": 6}, "http_status": 200, "wall_seconds": 0.058, "response": {"group_id": "mem0_bfprobe_r31", "processed": 0, "already_synced": 6, "failed": 0, "out_of_scope": 0, "scanned": 6, "exhausted": false, "next_cursor": "2026-09-18T06:35:37.098835+00:00", "elapsed_seconds": 0.057, "paced_wait_seconds": 0.0, "facts_per_minute": 0.0, "scope_total": 24, "graph_episodes": 20, "remaining": 4, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31", "episodes": 20, "entity_nodes": 12, "entity_edges": 14}, "graph_after": {"group_id": "mem0_bfprobe_r31", "episodes": 20, "entity_nodes": 12, "entity_edges": 14}, "graph_episode_delta": 0, "graph_edge_delta": 0}
+== 6 进度读数（长跑观测面） ==
+usage: backfill_probe.py [-h] --scope SCOPE [--count COUNT] [--limit LIMIT]
+                         [--rate RATE] [--scan-limit SCAN_LIMIT]
+                         [--cursor CURSOR] [--timeout TIMEOUT]
+                         [--writes WRITES] [--searches SEARCHES]
+                         {seed,run,status,graph,concurrency,cleanup}
+backfill_probe.py: error: the following arguments are required: --scope
+== 7 图规模与作用域事实数 ==
+{"stage": "graph", "stats": {"group_id": "mem0_bfprobe_r31", "episodes": 20, "entity_nodes": 12, "entity_edges": 14}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_xue"], "qdrant_scope_count": 24}
+== 8 清理隔离作用域 ==
+{"stage": "cleanup", "delete_memories": {"http_status": 200, "body": {"message": "All relevant memories deleted"}}, "drop_graph": {"http_status": 200, "body": {"group_id": "mem0_bfprobe_r31", "dropped": true}}, "qdrant_scope_count_after": 0, "graph_key_present_after": false}
+== 9 边界核对：隔离残留必须为 0，xue 图键只读未动 ==
+{"stage": "graph", "stats": {"group_id": "mem0_bfprobe_r31", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_xue"], "qdrant_scope_count": 0}
+{"stage": "graph", "stats": {"group_id": "mem0_xue", "episodes": 135, "entity_nodes": 228, "entity_edges": 320}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_xue"], "qdrant_scope_count": 4124}
+DONE
+```
+
+```
+first probe done -> starting rate-contrast cycle
+-- 前一个探针周期结束，开始 rate 对照周期 --
+== R1 seed 6 条 ==
+{"stage": "seed", "scope": "bfprobe_r31b", "group_id": "mem0_bfprobe_r31b", "seeded": 6, "upsert_status": 200, "qdrant_scope_count": 6, "graph_key_present_before": false}
+== R2 rate=0 / limit=3：不限速基线（同批量的对照基准） ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31b", "limit": 3, "rate": 0.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 79.577, "response": {"group_id": "mem0_bfprobe_r31b", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "exhausted": false, "next_cursor": "2026-09-18T06:43:25.975143+00:00", "elapsed_seconds": 79.575, "paced_wait_seconds": 0.0, "facts_per_minute": 2.262, "scope_total": 6, "graph_episodes": 3, "remaining": 3, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31b", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "graph_after": {"group_id": "mem0_bfprobe_r31b", "episodes": 3, "entity_nodes": 4, "entity_edges": 4}, "graph_episode_delta": 3, "graph_edge_delta": 4}
+== R3 rate=1 / limit=3：限速 60s 间隔（头部 3 条已入图，先跳过、不占限速预算） ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31b", "limit": 3, "rate": 1.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 138.861, "response": {"group_id": "mem0_bfprobe_r31b", "processed": 3, "already_synced": 2, "failed": 0, "out_of_scope": 0, "scanned": 5, "exhausted": false, "next_cursor": "2026-09-18T06:41:25.975143+00:00", "elapsed_seconds": 138.859, "paced_wait_seconds": 73.702, "facts_per_minute": 1.296, "scope_total": 6, "graph_episodes": 5, "remaining": 1, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31b", "episodes": 3, "entity_nodes": 4, "entity_edges": 4}, "graph_after": {"group_id": "mem0_bfprobe_r31b", "episodes": 5, "entity_nodes": 7, "entity_edges": 9}, "graph_episode_delta": 2, "graph_edge_delta": 5}
+== R4 修复实证：rate=1 重扫已入图区域（scan_limit=6, limit=5）应零等待 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31b", "limit": 5, "rate": 1.0, "scan_limit": 6}, "http_status": 200, "wall_seconds": 13.834, "response": {"group_id": "mem0_bfprobe_r31b", "processed": 1, "already_synced": 5, "failed": 0, "out_of_scope": 0, "scanned": 6, "exhausted": false, "next_cursor": "2026-09-18T06:40:25.975143+00:00", "elapsed_seconds": 13.832, "paced_wait_seconds": 0.0, "facts_per_minute": 4.338, "scope_total": 6, "graph_episodes": 6, "remaining": 0, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31b", "episodes": 5, "entity_nodes": 7, "entity_edges": 9}, "graph_after": {"group_id": "mem0_bfprobe_r31b", "episodes": 6, "entity_nodes": 8, "entity_edges": 10}, "graph_episode_delta": 1, "graph_edge_delta": 1}
+== R5 图规模 ==
+{"stage": "graph", "stats": {"group_id": "mem0_bfprobe_r31b", "episodes": 6, "entity_nodes": 8, "entity_edges": 10}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_bfprobe_r31b", "mem0_xue"], "qdrant_scope_count": 6}
+== R6 cleanup ==
+{"stage": "cleanup", "delete_memories": {"http_status": 200, "body": {"message": "All relevant memories deleted"}}, "drop_graph": {"http_status": 200, "body": {"group_id": "mem0_bfprobe_r31b", "dropped": true}}, "qdrant_scope_count_after": 0, "graph_key_present_after": false}
+== R7 边界核对：隔离残留必须为 0 ==
+{"stage": "graph", "stats": {"group_id": "mem0_bfprobe_r31b", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_bfprobe_r31b", "mem0_xue"], "qdrant_scope_count": 0}
+DONE
+second probe exit=0
+```
+
+```
+== C0 容器内代码与工作区一致（重建生效自证） ==
+container e3486c3172af68b958efb5c168d040f2a9cac52d4e0e37e8e7c79ed2a729edb6
+worktree e3486c3172af68b958efb5c168d040f2a9cac52d4e0e37e8e7c79ed2a729edb6
+== C1 xue 基线（只读） ==
+{"stage": "graph", "stats": {"group_id": "mem0_xue", "episodes": 135, "entity_nodes": 228, "entity_edges": 320}, "keys": ["default_db", "mem0__", "mem0_bfprobe_r31", "mem0_bfprobe_r31b", "mem0_xue"], "qdrant_scope_count": 4124}
+== C2 seed 4 条 ==
+{"stage": "seed", "scope": "bfprobe_r31c", "group_id": "mem0_bfprobe_r31c", "seeded": 4, "upsert_status": 200, "qdrant_scope_count": 4, "graph_key_present_before": false}
+== C3 后台起 rate=1 / limit=3 的回填，飞行中轮询 /backfill/status ==
+-- 飞行中第 1 次 status（running=true，计数实时） --
+{"stage": "status", "body": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:49:54.904852+00:00", "state": "running", "processed": 0, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 1, "paced_wait_seconds": 0.0, "current": "308de812-75b3-4c36-a9e9-ecd1975c3e09", "next_cursor": "2026-09-18T06:49:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 0, "errors": [], "elapsed_seconds": 14.089, "facts_per_minute": 0.0, "remaining": 4}], "running": true}}
+-- 飞行中第 2 次 status --
+{"stage": "status", "body": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:49:54.904852+00:00", "state": "running", "processed": 1, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 2, "paced_wait_seconds": 34.23151785899245, "current": "308de812-75b3-4c36-a9e9-ecd1975c3e09", "next_cursor": "2026-09-18T06:48:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 0, "errors": [], "elapsed_seconds": 34.375, "facts_per_minute": 1.745, "remaining": 3}], "running": true}}
+-- 该次调用的响应 --
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31c", "limit": 3, "rate": 1.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 141.146, "response": {"group_id": "mem0_bfprobe_r31c", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "exhausted": false, "next_cursor": "2026-09-18T06:47:54.638152+00:00", "elapsed_seconds": 141.143, "paced_wait_seconds": 61.022, "facts_per_minute": 1.275, "scope_total": 4, "graph_episodes": 3, "remaining": 1, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31c", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "graph_after": {"group_id": "mem0_bfprobe_r31c", "episodes": 3, "entity_nodes": 3, "entity_edges": 4}, "graph_episode_delta": 3, "graph_edge_delta": 4}
+-- LLM 调用量级：本次入图 3 条，容器内 /chat/completions 增加 10 次、/embeddings 增加 20 次 --
+== C4 终态后连读两次 status：耗时读数必须冻结（两次相同） ==
+{"stage": "status", "body": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:49:54.904852+00:00", "state": "completed", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "paced_wait_seconds": 61.02245828798914, "current": "7e5ecae0-1e9c-43db-8597-a5284e5fb14f", "next_cursor": "2026-09-18T06:47:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 3, "errors": [], "elapsed_seconds": 141.143, "facts_per_minute": 1.275, "remaining": 0}], "running": false}}
+{"stage": "status", "body": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:49:54.904852+00:00", "state": "completed", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "paced_wait_seconds": 61.02245828798914, "current": "7e5ecae0-1e9c-43db-8597-a5284e5fb14f", "next_cursor": "2026-09-18T06:47:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 3, "errors": [], "elapsed_seconds": 141.143, "facts_per_minute": 1.275, "remaining": 0}], "running": false}}
+== C5 修复实证：rate=1 重扫已入图区域（scan_limit=3）应零等待 ==
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31c", "limit": 5, "rate": 1.0, "scan_limit": 3}, "http_status": 200, "wall_seconds": 0.056, "response": {"group_id": "mem0_bfprobe_r31c", "processed": 0, "already_synced": 3, "failed": 0, "out_of_scope": 0, "scanned": 3, "exhausted": false, "next_cursor": "2026-09-18T06:47:54.638152+00:00", "elapsed_seconds": 0.054, "paced_wait_seconds": 0.0, "facts_per_minute": 0.0, "scope_total": 4, "graph_episodes": 3, "remaining": 1, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31c", "episodes": 3, "entity_nodes": 3, "entity_edges": 4}, "graph_after": {"group_id": "mem0_bfprobe_r31c", "episodes": 3, "entity_nodes": 3, "entity_edges": 4}, "graph_episode_delta": 0, "graph_edge_delta": 0}
+== C6 cleanup ==
+{"stage": "cleanup", "delete_memories": {"http_status": 200, "body": {"message": "All relevant memories deleted"}}, "drop_graph": {"http_status": 200, "body": {"group_id": "mem0_bfprobe_r31c", "dropped": true}}, "qdrant_scope_count_after": 0, "graph_key_present_after": false}
+== C7 删除 /stats 惰性建出的空图键 ==
+mem0_bfprobe_r31 {"group_id":"mem0_bfprobe_r31","dropped":true}
+mem0_bfprobe_r31b {"group_id":"mem0_bfprobe_r31b","dropped":true}
+mem0_bfprobe_r31c {"group_id":"mem0_bfprobe_r31c","dropped":true}
+== C8 边界核对：图键清单 + 隔离残留 + xue 只读 ==
+default_db
+mem0_xue
+mem0__
+{"stage": "graph", "stats": {"group_id": "mem0_xue", "episodes": 135, "entity_nodes": 228, "entity_edges": 320}, "keys": ["default_db", "mem0__", "mem0_xue"], "qdrant_scope_count": 4124}
+DONE
+exit=0
+```
+
+### 读数说明（复测）
+
+| 现象 | 口径 |
+| --- | --- |
+| 20 条小样本：3 次调用墙钟 70.3 + 73.4 + 133.2 = 277.0s，其中 22.9s 为限速等待 | 单条 **12.7s**（不含限速等待）；最快批次（14 条）单条 9.5s → 单条耗时随 LLM 负载在 9.5–26.5s 间波动 |
+| `rate=0`/`limit=3` → 79.6s、2.262 条/分钟、`paced_wait=0`；`rate=1`/`limit=3` → 138.9s、1.296 条/分钟、`paced_wait=73.70s` | 同作用域同批量的对照：差额几乎全在等待上，限速确实改变入图节奏。注意批次均值**高于** `rate` 是首条不受限速延迟所致（长跑收敛到 ≤ `rate`） |
+| 重建后 `rate=1`/`limit=3` → 141.1s、1.275 条/分钟、`paced_wait=61.02s` | 与上一行的 138.9s 同阶，可复现 |
+| 飞行中 `GET /backfill/status`：`running=true`，`processed 0→1`、`scanned 1→2`、`paced_wait 0→34.2` | 长跑任务在调用进行中即可读，不必等响应返回 |
+| 终态后连读两次（间隔 6s）：`elapsed_seconds` 均为 141.143、`facts_per_minute` 均为 1.275 | 终态即冻结。**修复前**该读数会随查询时间增长（实测：一次 62.7s 的调用在约 6 分钟后被读成 379.5s / 0.316 条/分钟） |
+| `rate=1` 重扫已入图区域（6 条 / 3 条，两次独立实测） | 0.058s / 0.056s、`paced_wait=0.0`、图规模 delta 0/0、`already_synced` 逐条计数——零 LLM，且**跳过不占限速预算**（修复前重扫会被压到 `rate` 的节奏） |
+| 3 条事实 → 容器内 `/chat/completions` +10、`/embeddings` +20 | 单条 ≈ 3.3 次 chat + 6.7 次 embeddings，回填的 LLM 通道占用量级 |
+| 三个作用域 `cleanup` 后 `qdrant_scope_count_after=0`、`graph_key_present_after=false`；`/stats` 惰性建出的三个空图键用 `DELETE /graph/<k>` 删除 | 收尾清单回到 `default_db / mem0__ / mem0_xue` |
+| `mem0_xue` 全程 135 episodes / 228 实体 / 320 边（首尾两次读数一致） | 本组探针未对 `xue` 发起任何回填或写入（只读观测） |
+| 第一段原始输出里的 `backfill_probe.py: error: the following arguments are required: --scope` | 探针脚本自身的调用错误，不是端点行为：`status` 阶段当时仍要求 `--scope`（它只用进程内读数，与作用域无关）。脚本已改为 `status` 免 `--scope`；该段的飞行中/终态读数由 `bfprobe_r31c` 段的两次 `status` 承担 |
+
+### 回填在飞时的主链路（重建后复测）
+
+同一探针的 `concurrency` 阶段，在 `bfprobe_r31d` 的回填（`rate=1`/`limit=3`）在飞时打主链路：
+
+```
+== D1 seed 4 条 ==
+{"stage": "seed", "scope": "bfprobe_r31d", "group_id": "mem0_bfprobe_r31d", "seeded": 4, "upsert_status": 200, "qdrant_scope_count": 4, "graph_key_present_before": false}
+== D2 后台起回填（rate=1 / limit=3），在飞时打主链路 ==
+-- 回填在飞时的 /backfill/status --
+{"stage": "status", "body": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 5, "rate": 1.0, "scan_limit": 3, "cursor": null, "started_at": "2026-09-18T06:52:22.460387+00:00", "state": "completed", "processed": 0, "already_synced": 3, "failed": 0, "out_of_scope": 0, "scanned": 3, "paced_wait_seconds": 0.0, "current": "7e5ecae0-1e9c-43db-8597-a5284e5fb14f", "next_cursor": "2026-09-18T06:47:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 3, "errors": [], "elapsed_seconds": 0.054, "facts_per_minute": 0.0, "remaining": 1}, {"group_id": "mem0_bfprobe_r31d", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:54:15.648795+00:00", "state": "running", "processed": 0, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 1, "paced_wait_seconds": 0.0, "current": "c262b296-2745-47a9-99d7-3c1d6296d61d", "next_cursor": "2026-09-18T06:54:15.481682+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 0, "errors": [], "elapsed_seconds": 12.109, "facts_per_minute": 0.0, "remaining": 4}], "running": true}}
+-- 回填在飞时的 POST /memories ×5 与 /search ×5 --
+{"stage": "concurrency", "scope": "bfprobe_r31d", "writes": [{"http_status": 200, "elapsed_seconds": 0.825}, {"http_status": 200, "elapsed_seconds": 1.649}, {"http_status": 200, "elapsed_seconds": 0.504}, {"http_status": 200, "elapsed_seconds": 0.527}, {"http_status": 200, "elapsed_seconds": 0.525}], "searches": [{"http_status": 200, "elapsed_seconds": 0.759, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 1.964, "result_count": 5, "graph_status": "timeout"}, {"http_status": 200, "elapsed_seconds": 0.599, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 0.633, "result_count": 5, "graph_status": "ok"}, {"http_status": 200, "elapsed_seconds": 0.781, "result_count": 5, "graph_status": "ok"}], "backfill_status_while_running": {"runs": [{"group_id": "mem0_bfprobe_r31c", "limit": 5, "rate": 1.0, "scan_limit": 3, "cursor": null, "started_at": "2026-09-18T06:52:22.460387+00:00", "state": "completed", "processed": 0, "already_synced": 3, "failed": 0, "out_of_scope": 0, "scanned": 3, "paced_wait_seconds": 0.0, "current": "7e5ecae0-1e9c-43db-8597-a5284e5fb14f", "next_cursor": "2026-09-18T06:47:54.638152+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 3, "errors": [], "elapsed_seconds": 0.054, "facts_per_minute": 0.0, "remaining": 1}, {"group_id": "mem0_bfprobe_r31d", "limit": 3, "rate": 1.0, "scan_limit": 50, "cursor": null, "started_at": "2026-09-18T06:54:15.648795+00:00", "state": "running", "processed": 0, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 1, "paced_wait_seconds": 0.0, "current": "c262b296-2745-47a9-99d7-3c1d6296d61d", "next_cursor": "2026-09-18T06:54:15.481682+00:00", "exhausted": false, "scope_total": 4, "graph_episodes": 0, "errors": [], "elapsed_seconds": 20.99, "facts_per_minute": 0.0, "remaining": 4}], "running": true}}
+-- 回填本批响应 --
+{"stage": "run", "request": {"group_id": "mem0_bfprobe_r31d", "limit": 3, "rate": 1.0, "scan_limit": 50}, "http_status": 200, "wall_seconds": 147.905, "response": {"group_id": "mem0_bfprobe_r31d", "processed": 3, "already_synced": 0, "failed": 0, "out_of_scope": 0, "scanned": 3, "exhausted": false, "next_cursor": "2026-09-18T06:52:15.481682+00:00", "elapsed_seconds": 147.904, "paced_wait_seconds": 50.905, "facts_per_minute": 1.217, "scope_total": 9, "graph_episodes": 3, "remaining": 6, "errors": []}, "graph_before": {"group_id": "mem0_bfprobe_r31d", "episodes": 0, "entity_nodes": 0, "entity_edges": 0}, "graph_after": {"group_id": "mem0_bfprobe_r31d", "episodes": 3, "entity_nodes": 3, "entity_edges": 4}, "graph_episode_delta": 3, "graph_edge_delta": 4}
+== D3 cleanup ==
+{"stage": "cleanup", "delete_memories": {"http_status": 200, "body": {"message": "All relevant memories deleted"}}, "drop_graph": {"http_status": 200, "body": {"group_id": "mem0_bfprobe_r31d", "dropped": true}}, "qdrant_scope_count_after": 0, "graph_key_present_after": false}
+== D4 删除空图键并核对边界 ==
+mem0_bfprobe_r31d {"group_id":"mem0_bfprobe_r31d","dropped":true}
+default_db
+mem0_xue
+mem0__
+{"stage": "graph", "stats": {"group_id": "mem0_xue", "episodes": 135, "entity_nodes": 228, "entity_edges": 320}, "keys": ["default_db", "mem0__", "mem0_xue"], "qdrant_scope_count": 4124}
+DONE
+exit=0
+```
+
+| 现象 | 口径 |
+| --- | --- |
+| 回填在飞时 `POST /memories` ×5 全 200（0.504–1.649s）、`/search` ×5 全 200（0.599–1.964s，各 5 条结果） | 回填不阻塞主链路：写路径只入队，检索在图分支超时预算内降级返回 |
+| `/search` 5 次里 `graph_status` 为 4 次 `ok` + 1 次 `timeout` | 回填与图派发共用同一 LLM 通道，检索的 1.0s 图预算偶尔被占满——按设计降级，主链路仍 200 且有结果 |
+| 该批最终 `wall_seconds=147.9`、`paced_wait_seconds=50.9`、`processed=3`、1.217 条/分钟 | 在飞期间的 `status` 读数（`running=true`、`scanned 1`、`elapsed 12.1→21.0`）与该批响应一致 |
+| 同一次 `status` 里另一条已结束的调用读数仍为 `elapsed_seconds=0.054` | 终态冻结在跨批次、跨分钟的重读下同样成立 |
+| `cleanup` 后 `qdrant_scope_count_after=0`；`mem0_bfprobe_r31d` 空图键删除后清单回到 `default_db / mem0__ / mem0_xue`；`mem0_xue` 仍 135/228/320 | 收尾无残留，`xue` 全程只读 |
