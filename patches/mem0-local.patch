@@ -2016,10 +2016,10 @@ index 00000000..1dd2c226
 +}
 diff --git a/docs/design/dashboard-mechanism-visibility-evidence/verify-2026-09-18.md b/docs/design/dashboard-mechanism-visibility-evidence/verify-2026-09-18.md
 new file mode 100644
-index 00000000..ae39bfd8
+index 00000000..2848e331
 --- /dev/null
 +++ b/docs/design/dashboard-mechanism-visibility-evidence/verify-2026-09-18.md
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,107 @@
 +# dashboard-mechanism-visibility 实现卡验收实测（2026-09-18）
 +
 +本文件是卡 `t_018e94e4`「实现：dashboard 机制可视化」的实现方实测证据。
@@ -2101,6 +2101,9 @@ index 00000000..ae39bfd8
 +  与 Qdrant 精确计数一致；`created_at` 单调不增、全部 `memory_kind=observation`。
 +  **口径差异（实测）**：本端点分页参数是 `top_k`（与 `GET /memories` 一致），`page_size` 不被识别
 +  （传 `page_size=1` 仍返回全量 79 条），前端新页面用的正是 `top_k`，无实际影响。
++  **后续更正（收尾卡 `t_7d9677ed`）**：本行记录的是实现提交 `9d0a65b4` 时点的实测。此后按收尾卡的
++  [AC-1] 把本端点分页参数改名为 `page_size`（`GET /memories` 保持上游契约的 `top_k` 不动），
++  故「与 `GET /memories` 一致」只对该提交时点成立；现行口径见 `dashboard-mechanism-visibility.md` §6.2。
 +- `GET /graph/keys`：读数前后 `GRAPH.LIST` 键集合**完全相同**（`default_db` / `mem0__` / `mem0_xue`），
 +  未因读数建键；图桥不可用时返回 `{"keys":[],"degraded":true}`（HTTP 200），且同窗口
 +  `GET /graph/stats`、`GET /memories` 均正常 200；停止图桥期间 `POST /search` 返回 `graph_status="error"`（200，不失败）。
@@ -2121,15 +2124,15 @@ index 00000000..ae39bfd8
 +- 重建生效：`cd server && docker compose build mem0-dashboard && docker compose up -d --no-deps mem0-dashboard`
 +  （build 型容器，`restart` 不生效），随后核对 `docker image inspect mem0-dev-mem0-dashboard --format '{{.Id}} {{.Created}}'`
 +  与容器 `.Image` 相等。
-+- 后端只读端点回归：`curl -H "X-API-Key: $KEY" localhost:8888/observations?top_k=3`、
++- 后端只读端点回归：`curl -H "X-API-Key: $KEY" localhost:8888/observations?page_size=3`（参数名 2026-09-18 起由 `top_k` 改为 `page_size`）、
 +  `curl -H "X-API-Key: $KEY" localhost:8888/graph/keys`、`curl -o /dev/null -w '%{http_code}' localhost:8888/observations`（应 401）。
 +- 图键无副作用：`docker exec mem0-dev-falkordb-1 redis-cli GRAPH.LIST` 读数前后 diff 为空。
 diff --git a/docs/design/dashboard-mechanism-visibility.md b/docs/design/dashboard-mechanism-visibility.md
 new file mode 100644
-index 00000000..56f04ead
+index 00000000..9dc284d1
 --- /dev/null
 +++ b/docs/design/dashboard-mechanism-visibility.md
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,638 @@
 +# dashboard 机制可视化设计（mem0 自托管：bi-temporal / 衰减 / Dream / Graph 的可见面）
 +
 +| 项 | 值 |
@@ -2461,11 +2464,14 @@ index 00000000..56f04ead
 +**契约（新增，只读）**
 +
 +```
-+GET /observations?top_k=<默认 1000，上限沿用既有 ALL_MEMORIES_LIMIT>&cursor=<不透明游标>
++GET /observations?page_size=<默认 1000，上限沿用既有 ALL_MEMORIES_LIMIT>&cursor=<不透明游标>
 +→ { "results": [ <与 GET /memories 同口径的完整记忆行> ], "next_cursor": <string|null>, "total": <int> }
 +```
 +
-+- 排序与游标口径与 `GET /memories`（无作用域）完全一致：`created_at` 最新优先，`cursor` 取上一页最后一行的 `created_at`。
++- **排序口径与 `GET /memories`（无作用域）一致**（实测 2026-09-18）：`created_at` 最新优先，页内 `created_at` 单调不增；两端点对同一批观察的**相对序也一致**——79 条观察在 `GET /memories?top_k=1000` 首页里的位置为 98–176，位置随观察的返回序单调递增。`cursor` 取上一页最后一行的 `created_at`，服务端按 `created_at < cursor` 严格递减续读，因此页间永不重叠（`page_size=25` 翻完全库实测 25/25/25/4、79 条 79 唯一、0 重复，`total=79` 与 Qdrant 精确计数一致）。
++- **末页判定与 `GET /memories` 不同，是本端点有意为之的口径**：本页不足 `page_size` 行时即返回 `next_cursor = null`（实测 `page_size=100` 返回 79 行 ⇒ `null`；`page_size=79` 恰好满页 ⇒ 仍返回游标，说明判据是「不足一页」而不是「少于总数」）。`GET /memories` 只要本页有行就返回游标——实测 `top_k=1000` 第 5 页 101 行仍返回游标，第 6 页 0 行才 `null`，客户端需要多请求一次空页才收敛。两者各自服务自己的读法：观察清单是会被反复打开的页面，一次说清「已到末页」省掉那次空往返；管理面列表是游标驱动的全量浏览，收敛点交给调用方。
++  依据：**游标分页在「无更多数据」时返回 `null` 是标准做法**（客户端据此停止取数），实现方的口径更标准，故以实现的语义为准回写本节，而不是为了迁就本节旧稿的字面去改实现。
++- **分页参数名与 `GET /memories` 不同（实测）**：本端点为 `page_size`，`GET /memories` 沿用上游既有的 `top_k`（`upstream/main:server/main.py` 即如此，属既有对外契约，本批不改）。两端点的 `cursor` 语义与页上限（`ALL_MEMORIES_LIMIT = 1000`）一致。`GET /observations` 是本批新增、无既有调用方，故直接取列表接口更通用的 `page_size`；该差异已在 `server/main.py` 的 `get_observations` docstring 中声明。
 +- 观察判定沿用既有口径：`memory_kind == "observation"`（`server/routers/dream.py` 已有同一常量与同一只读遍历逻辑）。
 +- 需要 `memory_kind` 的 payload 过滤；该字段的 keyword 索引已存在（实测 payload_schema）。
 +
@@ -11337,7 +11343,7 @@ index 7429f09e..d9f5a079 100644
  }
 diff --git a/server/dashboard/src/app/(root)/dashboard/dream/page.tsx b/server/dashboard/src/app/(root)/dashboard/dream/page.tsx
 new file mode 100644
-index 00000000..eace10cb
+index 00000000..e61b20fd
 --- /dev/null
 +++ b/server/dashboard/src/app/(root)/dashboard/dream/page.tsx
 @@ -0,0 +1,640 @@
@@ -11455,7 +11461,7 @@ index 00000000..eace10cb
 +      setIsLoadingObservations(true);
 +      try {
 +        const params: Record<string, string | number> = {
-+          top_k: OBSERVATIONS_PAGE_SIZE,
++          page_size: OBSERVATIONS_PAGE_SIZE,
 +        };
 +        if (cursor) params.cursor = cursor;
 +        const res = await api.get<ObservationListResponse>(
@@ -15447,7 +15453,7 @@ index 00000000..9c4bff10
 +fastapi>=0.115.0
 +uvicorn[standard]>=0.30.0
 diff --git a/server/main.py b/server/main.py
-index 20059fb8..71d4aca5 100644
+index 20059fb8..ec8017d9 100644
 --- a/server/main.py
 +++ b/server/main.py
 @@ -1,13 +1,18 @@
@@ -15810,7 +15816,7 @@ index 20059fb8..71d4aca5 100644
          return get_memory_instance().get_all(**params)
      except HTTPException:
          raise
-@@ -440,6 +647,164 @@ def get_all_memories(
+@@ -440,6 +647,170 @@ def get_all_memories(
          raise upstream_error()
  
  
@@ -15846,9 +15852,10 @@ index 20059fb8..71d4aca5 100644
 +    排序与游标口径取自管理面列表：`created_at` 最新优先，`cursor` 取上一页最后一行的
 +    `created_at`，服务端 `created_at < cursor` 严格递减续读，因此页间永不重叠。
 +
-+    与 `GET /memories` 的唯一差别是**末页判定**：本页不足 `limit` 行时显式返回
++    行为上与 `GET /memories` 的差别只有**末页判定**：本页不足 `limit` 行时显式返回
 +    `next_cursor = null`（`GET /memories` 在该情形仍回一个游标，由客户端再请求一次
-+    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返。
++    空页才收敛）。清单是会反复打开的页面，直接给出「已到末页」省掉那次空往返；
++    分页参数名的差别见 `get_observations` 的说明。
 +    """
 +    filters = _OBSERVATION_FILTER
 +    results = get_memory_instance().vector_store.list(filters=filters, top_k=limit, cursor=cursor)
@@ -15872,14 +15879,19 @@ index 20059fb8..71d4aca5 100644
 +
 +@app.get("/observations", summary="List Dream observations")
 +def get_observations(
-+    top_k: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
++    page_size: Optional[int] = Query(None, ge=0, le=ALL_MEMORIES_LIMIT),
 +    cursor: Optional[str] = Query(None),
 +    _auth=Depends(verify_auth),
 +):
 +    """列出全部 Dream 观察条目（`memory_kind == "observation"`），只读。
 +
 +    行口径与 `GET /memories` 完全一致（同一序列化器），因此观察的正文、证据链与
-+    bi-temporal 字段一并返回；分页用 `top_k` + `cursor`（上一页响应的 `next_cursor`）。
++    bi-temporal 字段一并返回；分页用 `page_size` + `cursor`（上一页响应的 `next_cursor`）。
++
++    分页参数名与 `GET /memories` 不同是**有意**的：`GET /memories` 的 `top_k` 是上游既有
++    对外契约（`upstream/main` 即如此），本批不改名；而本端点为本批新增、无既有调用方，
++    故取列表接口更通用的 `page_size`，不复用 `top_k` 这个语义偏「检索条数」的拼法。
++    页上限（`ALL_MEMORIES_LIMIT`）与 `cursor` 语义两端点一致。
 +
 +    为什么另开端点而不复用 `GET /memories`：管理面列表是 raw 全量，观察在其中按
 +    `created_at` 位置漂移，客户端只能在自己已加载的页里过滤，写入量一涨就会误报空集；
@@ -15887,7 +15899,7 @@ index 20059fb8..71d4aca5 100644
 +    """
 +    try:
 +        return _list_observations(
-+            limit=top_k if top_k is not None else ALL_MEMORIES_LIMIT,
++            limit=page_size if page_size is not None else ALL_MEMORIES_LIMIT,
 +            cursor=cursor,
 +        )
 +    except HTTPException:
@@ -15975,7 +15987,7 @@ index 20059fb8..71d4aca5 100644
  @app.get("/memories/{memory_id}", summary="Get a memory")
  def get_memory(memory_id: str, _auth=Depends(verify_auth)):
      """Retrieve a specific memory by ID."""
-@@ -475,6 +840,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
+@@ -475,6 +846,12 @@ def search_memories(search_req: SearchRequest, _auth=Depends(verify_auth)):
              params["explain"] = search_req.explain
          if search_req.show_expired is not None:
              params["show_expired"] = search_req.show_expired
